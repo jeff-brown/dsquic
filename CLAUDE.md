@@ -105,6 +105,13 @@ it exists to teach QUIC.
   writes of any kind: no `git push`, no remote branch or tag operations, no
   PR creation. Stage the work, report what is staged, and stop; the human
   makes every commit.
+- Staging and committing are asynchronous: the agent stages, the human
+  commits and pushes on their own schedule. Periodically verify the actual
+  git state (`git status`, `git log`, `git fetch` plus `origin/main`), at
+  minimum at session start, before staging new work, and before updating
+  `STATE.md`. Previously staged changes may since have been committed,
+  pushed, or modified; reconcile against what git reports, never against
+  the last remembered state.
 
 ## Session state and context retrieval
 
