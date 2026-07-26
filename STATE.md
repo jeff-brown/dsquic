@@ -12,10 +12,10 @@ origin/main. No protocol logic implemented yet.
   src and tests, pytest. All checks pass: `uv run pytest -q`,
   `uv run ruff check`, `uv run ruff format --check .`, `uv run mypy`.
 - Layout: flat modules under `src/dsquic/` (buffer, packet, frames, streams,
-  connection, tls, protection, recovery, h3, qpack, masque, qlog), each a
-  docstring stub with RFC mapping, plus the reference endpoints (client,
-  server), the only modules permitted I/O. `tests/` mirrors the modules;
-  `tests/test_scaffold.py` enforces the mirror.
+  connection, tls, protection, recovery, congestion, new_reno, h3, qpack,
+  masque, qlog), each a docstring stub with RFC mapping, plus the reference
+  endpoints (client, server), the only modules permitted I/O. `tests/`
+  mirrors the modules; `tests/test_scaffold.py` enforces the mirror.
 - Docs: `README.md` (public overview), `docs/design.md` (rationale and open
   questions), `CLAUDE.md` (working rules), `interop/README.md` (Interop
   Runner shim placeholder).
@@ -35,5 +35,9 @@ None.
 ## Open decisions
 
 See design.md §7. Settled this session: module layout (flat), tooling,
-Python 3.12+, and the edge-case convention (state inline, validation
-quarantined, design.md §4.8); recorded in the design.md appendix.
+Python 3.12+, the edge-case convention (state inline, validation
+quarantined, design.md §4.8), and pluggable congestion control (interface
+in congestion.py, NewReno baseline in new_reno.py, loss detection fixed);
+recorded in the design.md appendix. MVP scoping discussion in progress:
+still to settle are hq-interop placement, client cert validation
+strictness, and milestone ordering.

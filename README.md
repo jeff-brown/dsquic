@@ -58,7 +58,9 @@ Flat modules under `src/dsquic/`, one concern per module:
 | `connection.py` | Connection state machine                        | 9000 §5, §7, §10     |
 | `tls.py`        | TLS 1.3 handshake, scoped to QUIC               | 8446, 9001 §4        |
 | `protection.py` | Packet protection keys, AEAD, header protection | 9001                 |
-| `recovery.py`   | Loss detection and congestion control           | 9002                 |
+| `recovery.py`   | Loss detection, RTT estimation, PTO             | 9002 §5-§6           |
+| `congestion.py` | Congestion controller interface (pluggable)     | 9002 §7              |
+| `new_reno.py`   | NewReno congestion controller                   | 9002 §7, Appendix B  |
 | `h3.py`         | HTTP/3                                          | 9114, 9220           |
 | `qpack.py`      | QPACK field compression                         | 9204                 |
 | `masque.py`     | CONNECT-UDP proxying                            | 9298, 9297, 9221     |

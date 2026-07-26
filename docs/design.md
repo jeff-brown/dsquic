@@ -198,3 +198,10 @@ Recorded here so the open questions above stay honest:
   `interop/` shim wraps them rather than implementing its own endpoints.
 - **Edge-case convention settled (2026-07-26)**: state inline, validation
   quarantined (§4.8), chosen over fully-inline and fully-quarantined.
+- **Congestion control is pluggable (2026-07-26)**: `congestion.py` defines
+  the controller interface using the RFC 9002 §7 event vocabulary (packet
+  sent, packets acked, packets lost, persistent congestion) plus congestion
+  window and pacing rate (per §4.7). Implementations get one module each,
+  `new_reno.py` (RFC 9002 §7, Appendix B) being the baseline and the MVP
+  implementation; no stub controllers. Loss detection (§5-§6, `recovery.py`)
+  is fixed and not pluggable.
