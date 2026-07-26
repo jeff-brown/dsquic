@@ -50,7 +50,48 @@ The first question anyone will ask. Defensible differentiators:
 4. **qlog as a first-class output**, not an afterthought. This is what buys the tooling and dashboard story later.
 5. **Explicit RFC citation in code.** Section references in docstrings/comments; the mapping is part of the pedagogy.
 6. **Reference client and server are part of the deliverable.** The library alone is not the product; `client.py` and `server.py` are reference endpoints that exercise every protocol code path and interop cleanly with other QUIC implementations. They are the only I/O code in the package, kept synchronous and readable, and they are the surface the Interop Runner drives. A protocol feature is not done until it is reachable from both endpoints.
-7. **Decide the edge-case convention once, up front.** The spec's complexity lives in loss recovery, ACK range coalescing, flow control accounting, key update, stateless reset, and ECN validation: exactly the parts that turn readable code into a thicket. Every edge case is either handled *inline* (readable but noisy) or *quarantined behind a well-named boundary* (clean but hides what the reader came for). Pick one convention and apply it consistently; this is worth more than any individual module.
+7. **Don't optimize, but don't foreclose optimization.** Performance is a non-goal; unoptimizability is not. Optimizing makes the code worse: keep refusing it. Not foreclosing optimization is nearly free at the type and interface level. The rule: if it determines the bytes, or when they are due, it is core; if it determines how those bytes reach the kernel, it is I/O. Expanded in §4.7 below.
+8. **Decide the edge-case convention once, up front.** The spec's complexity lives in loss recovery, ACK range coalescing, flow control accounting, key update, stateless reset, and ECN validation: exactly the parts that turn readable code into a thicket. Every edge case is either handled *inline* (readable but noisy) or *quarantined behind a well-named boundary* (clean but hides what the reader came for). Pick one convention and apply it consistently; this is worth more than any individual module.
+
+### 4.7 Don't optimize, but don't foreclose optimization
+
+There is a difference between optimizing (makes code worse: keep refusing) and not foreclosing optimization (nearly free at the type and interface level). The distinction that matters:
+
+> If it determines the bytes, or when they're due, it's core. If it determines how those bytes reach the kernel, it's I/O.
+
+The structural reason: AEAD sealing plus header protection make a datagram byte-final. Once the core emits it, the transport cannot repack, resize, split, or coalesce it, unlike TCP, where the kernel is free to re-segment whatever you write. So every decision affecting batchability is unavoidably a core decision.
+
+Core / library design decisions:
+
+| Decision | Why it can't be deferred |
+|---|---|
+| Packet sizing and padding policy | Byte-final datagrams; transport can't resize. UDP GSO needs N segments of identical size plus optionally a smaller tail; a natural mix of sizes makes GSO unusable no matter how clever the transport is |
+| Packet coalescing into datagrams | Decided at build time or not at all |
+| ECN codepoint on send; per-datagram ECN on receive | Correctness, not performance. ECN is per-datagram on send and arrives via cmsg on receive; QUIC's ECN validation logic is core. Without it in the interface from commit one, dsquic can say nothing about L4S |
+| Send output as an extensible record | Adding dataclass fields is backward compatible; changing tuple arity is a refactor across every call site |
+| Receive input as a list of datagrams, each independently marked | Lets a GRO-capable transport split a coalesced buffer without the core knowing GRO exists |
+| Timer deadline API (`next_timer() -> float \| None`) | A deadline lets the transport coalesce timers across connections and sleep properly. A polling model burns syscalls no transport can claw back |
+| Pacing rate from the CC | Core computes it; transport chooses sleeps vs. `SO_TXTIME` |
+| CID parsing exposed for demux | Transport needs it to route; the sharding itself is I/O |
+| Buffer ownership seam | Only item with a real readability cost. Allocate freely for now, but do it in one place so the seam exists even if never used |
+
+Minimum viable shape for the send record:
+
+```python
+@dataclass
+class OutgoingDatagram:
+    data: bytes
+    destination: Address
+    ecn: ECNCodepoint                # required from day one
+    txtime: int | None = None        # SO_TXTIME / pacing offload
+    segment_size: int | None = None  # GSO hint
+```
+
+Safe to leave entirely in the I/O layer: socket setup and sockopts (`UDP_SEGMENT`, `IP_TOS` / `IPV6_TCLASS`, GRO, `SO_TXTIME`); `sendmmsg` / `recvmmsg` batching; io_uring, SQPOLL, registered buffers; buffer pooling and recycling; thread/process model and `SO_REUSEPORT` sharding; kernel feature detection and fallback.
+
+None of that should ever appear in a file with "frame" or "packet" in the name. If it starts to, that's a design smell rather than an optimization.
+
+Note on Python io_uring options (should a fast transport ever be wanted): no stdlib support; CPython GH-88901, proposing an io_uring backend for selectors/asyncio, has been open since 2021 and gone nowhere; uvloop doesn't help (libuv uses io_uring for filesystem ops, not sockets). Available: `liburing` on PyPI (CFFI wrapper, low-level, stable since 2020) and `uringcore` (Rust/PyO3 drop-in asyncio loop, Linux 5.11+, but 0.9.x and very new). Note also that for QUIC the bigger syscall wins are usually UDP GSO/GRO and `sendmmsg`/`recvmmsg`, reachable from plain `socket.sendmsg` with cmsgs, and that io_uring has a poor kernel-security record (disabled on Android/ChromeOS, restricted on GKE), which is likely a conversation before it's a deployment.
 
 ---
 
@@ -124,7 +165,7 @@ Also note ECN validation is one of QUIC's more commonly botched corners: a trust
 
 ## 7. Open questions
 
-- [ ] Edge-case convention: inline vs. quarantined behind a boundary (§4.7); decide before writing loss recovery
+- [ ] Edge-case convention: inline vs. quarantined behind a boundary (§4.8); decide before writing loss recovery
 - [ ] Module layout, specifically the line between the TLS shim and the packet protection layer; hardest decision to walk back
 - [ ] 0-RTT: in the MVP scope, or deferred?
 - [ ] When (and whether) to add an asyncio transport layer over the sans-IO core

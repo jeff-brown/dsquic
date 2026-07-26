@@ -26,7 +26,7 @@ None.
 
 ## Next steps
 
-1. Decide the edge-case convention (design.md §4.7); required before
+1. Decide the edge-case convention (design.md §4.8); required before
    `recovery.py`.
 2. Implement `buffer.py` (varints, RFC 9000 §16) with real tests.
 3. Then `packet.py` header parsing and `protection.py` Initial keys, toward

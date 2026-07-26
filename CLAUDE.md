@@ -52,6 +52,15 @@ it exists to teach QUIC.
   endpoints. State machines take bytes and clock readings in, return bytes,
   deadlines, and events out; the endpoints own the sockets and the clock and
   contain no protocol logic.
+- Don't optimize, but don't foreclose optimization (design.md §4.7). If it
+  determines the bytes or when they are due, it is core; if it determines
+  how bytes reach the kernel, it is I/O. Packet sizing, coalescing,
+  per-datagram ECN, timer deadlines, and pacing rate are core interface
+  concerns from the start; send output is an extensible record
+  (`OutgoingDatagram`), never a bare tuple. Socket mechanics (GSO/GRO,
+  `sendmmsg`/`recvmmsg`, io_uring, sockopts, buffer pooling) never appear
+  in protocol modules; their presence in a file with "frame" or "packet"
+  in the name is a design smell.
 - Reference endpoints are deliverables, not demos. `client.py` and
   `server.py` must exercise every protocol code path and interop cleanly
   with other QUIC implementations. A protocol feature is not done until it

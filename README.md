@@ -78,7 +78,13 @@ QUIC stack; use it if you want to ship something. dsquic differs on purpose:
 - MASQUE is designed in from the start.
 - State machines are explicit tables.
 
-An order of magnitude in performance is the accepted price.
+An order of magnitude in performance is the accepted price. Slow and
+unoptimizable are different claims, and dsquic is only the former: the
+sans-IO boundary makes the transport a swappable backend, so plain sockets,
+asyncio, io_uring, or anything else can move the bytes without touching
+protocol logic, and the core's interfaces (extensible send records,
+per-datagram ECN, deadline-based timers, pacing rates from the congestion
+controller) are shaped so a fast transport is never foreclosed.
 
 ## Interoperability
 
