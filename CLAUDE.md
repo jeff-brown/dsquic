@@ -47,6 +47,12 @@ it exists to teach QUIC.
   interop validation, run it for real (interop shim, real peer, real vectors).
   Never mock the result of an end-to-end check and call it done. Unit tests
   may stub internals; interop and conformance claims may not.
+- Verification ladder (design.md §6.2). Every protocol feature is verified,
+  in order, by: unit tests (spec vectors where the RFC provides them),
+  loopback through the reference endpoints over real UDP, and the feature's
+  Interop Runner test case in both directions. A rung is skippable only
+  while it is not yet applicable, never for convenience. Report results by
+  the rung reached: loopback success is never reported as interop.
 - Sans-IO core. No sockets, threads, files, or asyncio anywhere in
   `src/dsquic/` except the `endpoints/` subpackage, the package's only I/O
   boundary. State machines take bytes and clock readings in, return bytes,

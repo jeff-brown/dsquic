@@ -161,6 +161,24 @@ Wire into the runner's client/server interface early (a thin shim). Every milest
 
 Also note ECN validation is one of QUIC's more commonly botched corners: a trustworthy reference for correct ECN counting has value well beyond the pedagogical case.
 
+### 6.2 Verification ladder
+
+Every protocol milestone climbs three rungs, in order:
+
+1. **Unit tests**, including spec-derived vectors wherever the RFC provides them (varint examples in RFC 9000 Appendix A; the complete packet protection vectors in RFC 9001 Appendix A).
+2. **Loopback**: dsquic against dsquic through `endpoints/client.py` and `endpoints/server.py` over real UDP. In-memory driving of the sans-IO core is a permitted half-step for state machines that predate the working transport (the TLS handshake).
+3. **Interop, in both directions**: dsquic client against another stack's server and that stack's client against the dsquic server, via the Interop Runner test case for the feature.
+
+A rung is skippable only while it is not yet applicable (wire encoding has no loopback story; nothing interops before the stack can complete a handshake), never because it is inconvenient. Once applicable, a rung is mandatory, and results are reported by the rung they reached: loopback success is loopback success, never interop.
+
+### 6.3 MVP sequence
+
+1. `buffer.py` varints (RFC 9000 §16, Appendix A vectors)
+2. `packet.py` header parse/serialize plus `protection.py` Initial keys, verified byte-exact against RFC 9001 Appendix A
+3. `tls.py` handshake, dsquic against dsquic in memory
+4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file transfer over real UDP via the endpoints
+5. Interop gate, the definition of MVP done: `handshake` and `transfer` against quic-go, both directions
+
 ---
 
 ## 7. Open questions
@@ -203,6 +221,12 @@ Recorded here so the open questions above stay honest:
   lineage, no RFC). Endpoints select the application protocol by negotiated
   ALPN (`hq.py` now, `h3.py` later); file and socket handling stay in
   `endpoints/`.
+- **Client certificate validation is strict by default (2026-07-26)**: full
+  X.509 path validation plus hostname verification (RFC 9525 DNS-ID
+  matching against SNI), both delegated to `cryptography`'s verification
+  API per §5.1. An explicit insecure flag on the client endpoint disables
+  validation for debugging; it is never the default and never used in
+  interop or conformance claims.
 - **Edge-case convention settled (2026-07-26)**: state inline, validation
   quarantined (§4.8), chosen over fully-inline and fully-quarantined.
 - **Congestion control is pluggable (2026-07-26)**: `congestion.py` defines

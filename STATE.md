@@ -29,9 +29,17 @@ None.
 
 ## Next steps
 
-1. Implement `buffer.py` (varints, RFC 9000 §16) with real tests.
-2. Then `packet.py` header parsing and `protection.py` Initial keys, toward
-   the Interop Runner `handshake` test case.
+The MVP sequence (design.md §6.3), each step verified per the ladder in
+design.md §6.2:
+
+1. `buffer.py` varints (RFC 9000 §16, Appendix A vectors).
+2. `packet.py` header parse/serialize plus `protection.py` Initial keys,
+   byte-exact against RFC 9001 Appendix A.
+3. `tls.py` handshake, dsquic against dsquic in memory.
+4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file
+   transfer over real UDP via the endpoints.
+5. Interop gate (MVP done): `handshake` and `transfer` against quic-go,
+   both directions.
 
 ## Open decisions
 
@@ -39,7 +47,10 @@ See design.md §7. Settled this session: module layout (flat), tooling,
 Python 3.12+, the edge-case convention (state inline, validation
 quarantined, design.md §4.8), pluggable congestion control (interface in
 congestion.py, NewReno baseline in new_reno.py, loss detection fixed),
-hq-interop in core as hq.py, and the endpoints/ subpackage as the
-structural I/O boundary; recorded in the design.md appendix. MVP scoping
-discussion in progress: still to settle are client cert validation
-strictness and milestone ordering.
+hq-interop in core as hq.py, the endpoints/ subpackage as the structural
+I/O boundary, and strict-by-default client certificate validation (path
+plus hostname verification via cryptography, explicit insecure flag for
+debugging only); recorded in the design.md appendix. Also settled: the
+verification ladder (unit tests, loopback, interop both directions;
+design.md §6.2) and the MVP sequence (design.md §6.3). MVP scoping is
+complete; implementation starts with buffer.py.
