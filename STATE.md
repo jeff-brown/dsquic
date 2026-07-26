@@ -6,11 +6,16 @@ state only, no history.
 ## Status (2026-07-26)
 
 MVP implementation in progress, on phase gates per design.md §6.3.
-Phase 1 (buffer.py: varints, byte reader) is committed. Phase 2
-(packet.py: long/short header parse and build, packet number
-encode/decode; protection.py: Initial secrets, packet keys, AEAD,
-header protection) is implemented and staged, verified byte-exact
-against RFC 9001 Appendix A.1-A.3 and RFC 9000 Appendix A.2-A.3.
+Phases 1 and 2 are committed, pushed, and gate-verified. Phase 2
+(packet.py: header parse/build, packet number encode/decode, RFC 8999
+version layering with UnsupportedVersion; protection.py: Initial
+secrets, packet keys, AEAD, header protection) passed byte-exact
+against RFC 9001 Appendix A.1-A.3 and RFC 9000 Appendix A.2-A.3, and
+the user independently verified the emitted client Initial in
+Wireshark via text2pcap (keys derived, HP removed, PN 2 recovered,
+ClientHello with SNI example.com dissected). Throwaway gate artifacts
+client_initial.{bin,hex,pcap} may remain untracked in the repo root;
+safe to delete.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy over
   src and tests, pytest. All checks pass: `uv run pytest -q`,
@@ -37,10 +42,16 @@ The MVP sequence (design.md §6.3), each step verified per the ladder in
 design.md §6.2:
 
 1. Done: `buffer.py` varints (RFC 9000 §16, Appendix A vectors).
-2. Done, staged: `packet.py` headers plus `protection.py` packet
-   protection, byte-exact against RFC 9001 Appendix A. Retry and
-   Version Negotiation parsing intentionally raise HeaderParseError.
-3. Next: `tls.py` handshake, dsquic against dsquic in memory.
+2. Done: `packet.py` headers plus `protection.py` packet protection,
+   byte-exact against RFC 9001 Appendix A. Retry and Version
+   Negotiation parsing intentionally raise HeaderParseError; non-v1
+   versions raise UnsupportedVersion before type bits are interpreted.
+3. Next (not started): `tls.py` handshake, dsquic against dsquic in
+   memory. Scope: message-level state machine over the six handshake
+   messages, X25519, TLS_AES_128_GCM_SHA256 only, transport parameters
+   extension, keylog callback (NSS format) for SSLKEYLOGFILE, server
+   cert + CertificateVerify signing, strict client validation via
+   cryptography's verifier (path + RFC 9525 DNS-ID against SNI).
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file
    transfer over real UDP via the endpoints.
 5. Interop gate (MVP done): `handshake` and `transfer` against quic-go,
