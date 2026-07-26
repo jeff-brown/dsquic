@@ -12,7 +12,8 @@ Scaffold complete. No protocol logic implemented yet.
   `uv run ruff check`, `uv run ruff format --check .`, `uv run mypy`.
 - Layout: flat modules under `src/dsquic/` (buffer, packet, frames, streams,
   connection, tls, protection, recovery, h3, qpack, masque, qlog), each a
-  docstring stub with RFC mapping. `tests/` mirrors the modules;
+  docstring stub with RFC mapping, plus the reference endpoints (client,
+  server), the only modules permitted I/O. `tests/` mirrors the modules;
   `tests/test_scaffold.py` enforces the mirror.
 - Docs: `docs/design.md` (rationale and open questions), `CLAUDE.md`
   (working rules), `interop/README.md` (Interop Runner shim placeholder).
@@ -25,7 +26,7 @@ None.
 
 ## Next steps
 
-1. Decide the edge-case convention (design.md §4.6); required before
+1. Decide the edge-case convention (design.md §4.7); required before
    `recovery.py`.
 2. Implement `buffer.py` (varints, RFC 9000 §16) with real tests.
 3. Then `packet.py` header parsing and `protection.py` Initial keys, toward

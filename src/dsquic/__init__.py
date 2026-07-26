@@ -2,7 +2,8 @@
 
 The protocol core is sans-IO: state machines take bytes and clock readings
 in and return bytes, deadlines, and events out. No sockets, threads, or
-event loops in the protocol path.
+event loops in the protocol path. The only I/O in the package is in the
+reference endpoints, client.py and server.py.
 
 Module map (each module docstring cites the RFC sections it implements):
 
@@ -18,6 +19,8 @@ Module map (each module docstring cites the RFC sections it implements):
     qpack       - QPACK field compression (RFC 9204)
     masque      - MASQUE proxying: CONNECT-UDP (RFC 9298)
     qlog        - qlog structured event output (draft-ietf-quic-qlog)
+    client      - reference client endpoint (the only I/O, with server)
+    server      - reference server endpoint (the only I/O, with client)
 """
 
 __version__ = "0.0.1"

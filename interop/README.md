@@ -12,7 +12,11 @@ contract: `ROLE` (client/server), `TESTCASE` (exit 127 if unsupported),
 `handshake` -> `transfer` -> `retry` -> `resumption` -> `multiplexing` ->
 `http3` -> `keyupdate` -> `ecn` -> `zerortt`
 
+The shim wraps the package's reference endpoints, `dsquic.client` and
+`dsquic.server`; it adds no endpoint logic of its own.
+
 To be added here once the sans-IO core can complete a handshake:
 
 - `run_endpoint.sh` + Dockerfile per the runner's interface
-- a minimal synchronous UDP client/server wrapping `dsquic.connection`
+- environment plumbing from the runner contract to `dsquic.client` and
+  `dsquic.server` invocations

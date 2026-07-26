@@ -49,7 +49,8 @@ The first question anyone will ask. Defensible differentiators:
 3. **No asyncio initially.** asyncio is the main way Python becomes unreadable. A reader should follow a packet from parse to frame handling to state change without ever chasing an event loop. An async transport layer can wrap the core later.
 4. **qlog as a first-class output**, not an afterthought. This is what buys the tooling and dashboard story later.
 5. **Explicit RFC citation in code.** Section references in docstrings/comments; the mapping is part of the pedagogy.
-6. **Decide the edge-case convention once, up front.** The spec's complexity lives in loss recovery, ACK range coalescing, flow control accounting, key update, stateless reset, and ECN validation: exactly the parts that turn readable code into a thicket. Every edge case is either handled *inline* (readable but noisy) or *quarantined behind a well-named boundary* (clean but hides what the reader came for). Pick one convention and apply it consistently; this is worth more than any individual module.
+6. **Reference client and server are part of the deliverable.** The library alone is not the product; `client.py` and `server.py` are reference endpoints that exercise every protocol code path and interop cleanly with other QUIC implementations. They are the only I/O code in the package, kept synchronous and readable, and they are the surface the Interop Runner drives. A protocol feature is not done until it is reachable from both endpoints.
+7. **Decide the edge-case convention once, up front.** The spec's complexity lives in loss recovery, ACK range coalescing, flow control accounting, key update, stateless reset, and ECN validation: exactly the parts that turn readable code into a thicket. Every edge case is either handled *inline* (readable but noisy) or *quarantined behind a well-named boundary* (clean but hides what the reader came for). Pick one convention and apply it consistently; this is worth more than any individual module.
 
 ---
 
@@ -123,7 +124,7 @@ Also note ECN validation is one of QUIC's more commonly botched corners: a trust
 
 ## 7. Open questions
 
-- [ ] Edge-case convention: inline vs. quarantined behind a boundary (§4.6); decide before writing loss recovery
+- [ ] Edge-case convention: inline vs. quarantined behind a boundary (§4.7); decide before writing loss recovery
 - [ ] Module layout, specifically the line between the TLS shim and the packet protection layer; hardest decision to walk back
 - [ ] 0-RTT: in the MVP scope, or deferred?
 - [ ] When (and whether) to add an asyncio transport layer over the sans-IO core
@@ -151,3 +152,6 @@ Recorded here so the open questions above stay honest:
 - **Working conventions live in `CLAUDE.md`** (style, engineering, and
   typing rules); session-to-session status lives in `STATE.md` at the repo
   root, updated at the end of every session.
+- **Reference endpoints live in the package** as `client.py` and
+  `server.py`, the only modules permitted to perform I/O (§4.6). The
+  `interop/` shim wraps them rather than implementing its own endpoints.

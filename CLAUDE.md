@@ -47,10 +47,16 @@ it exists to teach QUIC.
   interop validation, run it for real (interop shim, real peer, real vectors).
   Never mock the result of an end-to-end check and call it done. Unit tests
   may stub internals; interop and conformance claims may not.
-- Sans-IO core. No sockets, threads, or asyncio anywhere in `src/dsquic/`.
-  State machines take bytes and clock readings in, return bytes, deadlines,
-  and events out. I/O belongs to callers (tests, `interop/`, a future
-  transport wrapper).
+- Sans-IO core. No sockets, threads, or asyncio anywhere in `src/dsquic/`,
+  with exactly two exceptions: `client.py` and `server.py`, the reference
+  endpoints. State machines take bytes and clock readings in, return bytes,
+  deadlines, and events out; the endpoints own the sockets and the clock and
+  contain no protocol logic.
+- Reference endpoints are deliverables, not demos. `client.py` and
+  `server.py` must exercise every protocol code path and interop cleanly
+  with other QUIC implementations. A protocol feature is not done until it
+  is reachable from both endpoints and validated by the corresponding
+  Interop Runner test case.
 - Pure Python in the protocol path. No C extensions, no dependencies beyond
   `cryptography`, which is used for raw primitives only (AEAD, HKDF,
   signatures, X.509). The TLS 1.3 handshake is hand-written in
