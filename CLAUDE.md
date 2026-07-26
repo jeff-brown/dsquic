@@ -47,11 +47,11 @@ it exists to teach QUIC.
   interop validation, run it for real (interop shim, real peer, real vectors).
   Never mock the result of an end-to-end check and call it done. Unit tests
   may stub internals; interop and conformance claims may not.
-- Sans-IO core. No sockets, threads, or asyncio anywhere in `src/dsquic/`,
-  with exactly two exceptions: `client.py` and `server.py`, the reference
-  endpoints. State machines take bytes and clock readings in, return bytes,
-  deadlines, and events out; the endpoints own the sockets and the clock and
-  contain no protocol logic.
+- Sans-IO core. No sockets, threads, files, or asyncio anywhere in
+  `src/dsquic/` except the `endpoints/` subpackage, the package's only I/O
+  boundary. State machines take bytes and clock readings in, return bytes,
+  deadlines, and events out; endpoint code owns sockets, files, and the
+  clock and contains no protocol logic.
 - Don't optimize, but don't foreclose optimization (design.md §4.7). If it
   determines the bytes or when they are due, it is core; if it determines
   how bytes reach the kernel, it is I/O. Packet sizing, coalescing,
@@ -61,11 +61,11 @@ it exists to teach QUIC.
   `sendmmsg`/`recvmmsg`, io_uring, sockopts, buffer pooling) never appear
   in protocol modules; their presence in a file with "frame" or "packet"
   in the name is a design smell.
-- Reference endpoints are deliverables, not demos. `client.py` and
-  `server.py` must exercise every protocol code path and interop cleanly
-  with other QUIC implementations. A protocol feature is not done until it
-  is reachable from both endpoints and validated by the corresponding
-  Interop Runner test case.
+- Reference endpoints are deliverables, not demos. `endpoints/client.py`
+  and `endpoints/server.py` must exercise every protocol code path and
+  interop cleanly with other QUIC implementations. A protocol feature is
+  not done until it is reachable from both endpoints and validated by the
+  corresponding Interop Runner test case.
 - Pure Python in the protocol path. No C extensions, no dependencies beyond
   `cryptography`, which is used for raw primitives only (AEAD, HKDF,
   signatures, X.509). The TLS 1.3 handshake is hand-written in
@@ -87,11 +87,13 @@ it exists to teach QUIC.
 
 ## Layout conventions
 
-- Flat modules under `src/dsquic/`, one concern per module; the package
+- Flat sans-IO protocol modules under `src/dsquic/`, one concern per
+  module; I/O code lives only in the `endpoints/` subpackage. The package
   docstring in `__init__.py` is the module map. Keep it current.
 - `tests/` mirrors the module tree: every `dsquic/foo.py` has a
-  `tests/test_foo.py`. `tests/test_scaffold.py` enforces this; do not weaken
-  it.
+  `tests/test_foo.py`, and subpackage modules mirror as
+  `tests/<subpackage>/test_<name>.py`. `tests/test_scaffold.py` enforces
+  this; do not weaken it.
 - New modules need: RFC-mapping docstring, mirror test file, entry in the
   `__init__.py` module map.
 - Text is ASCII except the section sign (§) in RFC citations.

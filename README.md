@@ -39,15 +39,17 @@ performance. Performance is an explicit non-goal.
   narrative of what happened on the wire.
 - **MASQUE as a day-one design input.** CONNECT-UDP proxying is part of the
   HTTP/3 layer's contract from the start, not a later bolt-on.
-- **Reference client and server are part of the deliverable.** `client.py`
-  and `server.py` are synchronous endpoints that drive the sans-IO core,
-  exercise every protocol code path, and interop cleanly with other QUIC
-  implementations. They are the only I/O code in the package, and they are
-  what the Interop Runner drives.
+- **Reference client and server are part of the deliverable.**
+  `endpoints/client.py` and `endpoints/server.py` are synchronous endpoints
+  that drive the sans-IO core, exercise every protocol code path, and
+  interop cleanly with other QUIC implementations. The `endpoints/`
+  subpackage is the only I/O code in the package, and it is what the
+  Interop Runner drives.
 
 ## Module map
 
-Flat modules under `src/dsquic/`, one concern per module:
+Flat sans-IO modules under `src/dsquic/`, one concern per module; the
+`endpoints/` subpackage is the only place I/O exists:
 
 | Module          | Covers                                          | RFC                  |
 |-----------------|-------------------------------------------------|----------------------|
@@ -64,9 +66,10 @@ Flat modules under `src/dsquic/`, one concern per module:
 | `h3.py`         | HTTP/3                                          | 9114, 9220           |
 | `qpack.py`      | QPACK field compression                         | 9204                 |
 | `masque.py`     | CONNECT-UDP proxying                            | 9298, 9297, 9221     |
+| `hq.py`         | hq-interop application protocol                 | none (Interop Runner) |
 | `qlog.py`       | Structured event output                         | draft-ietf-quic-qlog |
-| `client.py`     | Reference client endpoint (I/O)                 | n/a                  |
-| `server.py`     | Reference server endpoint (I/O)                 | n/a                  |
+| `endpoints/client.py` | Reference client endpoint (I/O)           | n/a                  |
+| `endpoints/server.py` | Reference server endpoint (I/O)           | n/a                  |
 
 ## Relationship to aioquic
 
