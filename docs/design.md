@@ -230,7 +230,15 @@ Recorded here so the open questions above stay honest:
   Runner uses. Required from the TLS phase (§6.3 step 3) onward so wire
   captures can be decrypted in Wireshark for independent verification
   between phases.
-- **Client certificate validation is strict by default (2026-07-26)**: full
+- **Version handling is layered per RFC 8999 (2026-07-26)**: parsing reads
+  only the version-independent prefix (first bit, version, connection IDs)
+  before checking the version; anything else, notably the type bits that
+  RFC 9369 remaps for v2, is interpreted only for v1. Unknown and greased
+  versions (RFC 9000 §15) raise `UnsupportedVersion`, the hook a server
+  uses to send Version Negotiation. Grease tolerated from peers as the
+  relevant parsers land: reserved transport parameters and frame types
+  (31N+27) are ignored, never rejected. RFC 9287 (greasing the fixed bit)
+  is post-MVP; the fixed bit is required until then. full
   X.509 path validation plus hostname verification (RFC 9525 DNS-ID
   matching against SNI), both delegated to `cryptography`'s verification
   API per §5.1. An explicit insecure flag on the client endpoint disables

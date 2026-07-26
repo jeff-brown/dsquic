@@ -5,8 +5,12 @@ state only, no history.
 
 ## Status (2026-07-26)
 
-Scaffold and working conventions complete, committed, and pushed to
-origin/main. No protocol logic implemented yet.
+MVP implementation in progress, on phase gates per design.md §6.3.
+Phase 1 (buffer.py: varints, byte reader) is committed. Phase 2
+(packet.py: long/short header parse and build, packet number
+encode/decode; protection.py: Initial secrets, packet keys, AEAD,
+header protection) is implemented and staged, verified byte-exact
+against RFC 9001 Appendix A.1-A.3 and RFC 9000 Appendix A.2-A.3.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy over
   src and tests, pytest. All checks pass: `uv run pytest -q`,
@@ -32,10 +36,11 @@ None.
 The MVP sequence (design.md §6.3), each step verified per the ladder in
 design.md §6.2:
 
-1. `buffer.py` varints (RFC 9000 §16, Appendix A vectors).
-2. `packet.py` header parse/serialize plus `protection.py` Initial keys,
-   byte-exact against RFC 9001 Appendix A.
-3. `tls.py` handshake, dsquic against dsquic in memory.
+1. Done: `buffer.py` varints (RFC 9000 §16, Appendix A vectors).
+2. Done, staged: `packet.py` headers plus `protection.py` packet
+   protection, byte-exact against RFC 9001 Appendix A. Retry and
+   Version Negotiation parsing intentionally raise HeaderParseError.
+3. Next: `tls.py` handshake, dsquic against dsquic in memory.
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file
    transfer over real UDP via the endpoints.
 5. Interop gate (MVP done): `handshake` and `transfer` against quic-go,
