@@ -7,7 +7,6 @@ from dsquic.protection import (
     PacketKeys,
     derive_initial_secrets,
     derive_packet_keys,
-    hkdf_label,
     protect,
     unprotect,
 )
@@ -111,20 +110,6 @@ SERVER_INITIAL_PROTECTED = bytes.fromhex(
 )
 
 PN_OFFSET = 18  # both A.2 and A.3 headers place the packet number at byte 18
-
-
-@pytest.mark.parametrize(
-    ("label", "length", "expected"),
-    [
-        (b"client in", 32, "00200f746c73313320636c69656e7420696e00"),
-        (b"server in", 32, "00200f746c7331332073657276657220696e00"),
-        (b"quic key", 16, "00100e746c7331332071756963206b657900"),
-        (b"quic iv", 12, "000c0d746c733133207175696320697600"),
-        (b"quic hp", 16, "00100d746c733133207175696320687000"),
-    ],
-)
-def test_hkdf_label_vectors(label: bytes, length: int, expected: str) -> None:
-    assert hkdf_label(label, length) == bytes.fromhex(expected)
 
 
 def test_initial_secrets() -> None:

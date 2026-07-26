@@ -70,10 +70,11 @@ def test_varint_decode_truncated() -> None:
 
 
 def test_pull_fixed_width_integers() -> None:
-    buf = Buffer(b"\x01\x02\x03\x04\x05\x06\x07")
+    buf = Buffer(b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a")
     assert buf.pull_uint8() == 0x01
     assert buf.pull_uint16() == 0x0203
-    assert buf.pull_uint32() == 0x04050607
+    assert buf.pull_uint24() == 0x040506
+    assert buf.pull_uint32() == 0x0708090A
     assert buf.is_empty
 
 

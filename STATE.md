@@ -46,12 +46,18 @@ design.md §6.2:
    byte-exact against RFC 9001 Appendix A. Retry and Version
    Negotiation parsing intentionally raise HeaderParseError; non-v1
    versions raise UnsupportedVersion before type bits are interpreted.
-3. Next (not started): `tls.py` handshake, dsquic against dsquic in
-   memory. Scope: message-level state machine over the six handshake
-   messages, X25519, TLS_AES_128_GCM_SHA256 only, transport parameters
-   extension, keylog callback (NSS format) for SSLKEYLOGFILE, server
-   cert + CertificateVerify signing, strict client validation via
-   cryptography's verifier (path + RFC 9525 DNS-ID against SNI).
+3. In progress, split into checkpoints 3a/3b/3c.
+   3a done, staged: handshake message codecs (RFC 8446 §4) and the
+   KeySchedule (§7.1) in tls.py, verified against the RFC 8448 §3
+   trace (vectors machine-extracted into tests/rfc8448_vectors.py;
+   messages roundtrip byte-exact, key schedule and both Finished
+   MACs match). HKDF primitives moved from protection.py to tls.py
+   (context parameter added); buffer.py gained pull_uint24.
+   3b next: client/server handshake state machines completing an
+   in-memory handshake (X25519, TLS_AES_128_GCM_SHA256, transport
+   parameters, ALPN); secrets/events surfaced per the module seam.
+   3c after: certificates (sign and strict verify per the recorded
+   decision), keylog callback (NSS format) for SSLKEYLOGFILE.
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file
    transfer over real UDP via the endpoints.
 5. Interop gate (MVP done): `handshake` and `transfer` against quic-go,

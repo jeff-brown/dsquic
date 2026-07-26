@@ -20,12 +20,11 @@ also what Initial packets always use (§5.2).
 
 from dataclasses import dataclass
 
-from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
 from dsquic.packet import HEADER_FORM_LONG, decode_packet_number
+from dsquic.tls import hkdf_expand_label, hkdf_extract
 
 INITIAL_SALT_V1 = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")  # §5.2
 
@@ -54,25 +53,6 @@ class InitialSecrets:
     server: bytes
 
 
-def hkdf_label(label: bytes, length: int) -> bytes:
-    """Build the HkdfLabel structure with an empty context (RFC 8446 §7.1)."""
-    full_label = b"tls13 " + label
-    return length.to_bytes(2, "big") + bytes([len(full_label)]) + full_label + b"\x00"
-
-
-def hkdf_expand_label(secret: bytes, label: bytes, length: int) -> bytes:
-    """HKDF-Expand-Label over SHA-256 (RFC 8446 §7.1, RFC 9001 §5.1)."""
-    expand = HKDFExpand(algorithm=hashes.SHA256(), length=length, info=hkdf_label(label, length))
-    return expand.derive(secret)
-
-
-def hkdf_extract(salt: bytes, input_key_material: bytes) -> bytes:
-    """HKDF-Extract over SHA-256 (RFC 5869 §2.2): HMAC(salt, ikm)."""
-    mac = hmac.HMAC(salt, hashes.SHA256())
-    mac.update(input_key_material)
-    return mac.finalize()
-
-
 def derive_initial_secrets(client_dcid: bytes) -> InitialSecrets:
     """Derive Initial secrets from the client's first Destination CID (§5.2).
 
@@ -82,17 +62,17 @@ def derive_initial_secrets(client_dcid: bytes) -> InitialSecrets:
     """
     initial_secret = hkdf_extract(INITIAL_SALT_V1, client_dcid)
     return InitialSecrets(
-        client=hkdf_expand_label(initial_secret, b"client in", 32),
-        server=hkdf_expand_label(initial_secret, b"server in", 32),
+        client=hkdf_expand_label(initial_secret, b"client in", b"", 32),
+        server=hkdf_expand_label(initial_secret, b"server in", b"", 32),
     )
 
 
 def derive_packet_keys(secret: bytes) -> PacketKeys:
     """Derive the packet protection keys from a traffic secret (§5.1)."""
     return PacketKeys(
-        key=hkdf_expand_label(secret, b"quic key", 16),
-        iv=hkdf_expand_label(secret, b"quic iv", 12),
-        hp=hkdf_expand_label(secret, b"quic hp", 16),
+        key=hkdf_expand_label(secret, b"quic key", b"", 16),
+        iv=hkdf_expand_label(secret, b"quic iv", b"", 12),
+        hp=hkdf_expand_label(secret, b"quic hp", b"", 16),
     )
 
 

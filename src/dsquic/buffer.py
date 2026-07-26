@@ -70,6 +70,9 @@ class Buffer:
     def pull_uint16(self) -> int:
         return int.from_bytes(self.pull_bytes(2), "big")
 
+    def pull_uint24(self) -> int:
+        return int.from_bytes(self.pull_bytes(3), "big")
+
     def pull_uint32(self) -> int:
         return int.from_bytes(self.pull_bytes(4), "big")
 
