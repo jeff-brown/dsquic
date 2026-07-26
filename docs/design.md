@@ -51,7 +51,7 @@ The first question anyone will ask. Defensible differentiators:
 5. **Explicit RFC citation in code.** Section references in docstrings/comments; the mapping is part of the pedagogy.
 6. **Reference client and server are part of the deliverable.** The library alone is not the product; `client.py` and `server.py` are reference endpoints that exercise every protocol code path and interop cleanly with other QUIC implementations. They are the only I/O code in the package, kept synchronous and readable, and they are the surface the Interop Runner drives. A protocol feature is not done until it is reachable from both endpoints.
 7. **Don't optimize, but don't foreclose optimization.** Performance is a non-goal; unoptimizability is not. Optimizing makes the code worse: keep refusing it. Not foreclosing optimization is nearly free at the type and interface level. The rule: if it determines the bytes, or when they are due, it is core; if it determines how those bytes reach the kernel, it is I/O. Expanded in §4.7 below.
-8. **Decide the edge-case convention once, up front.** The spec's complexity lives in loss recovery, ACK range coalescing, flow control accounting, key update, stateless reset, and ECN validation: exactly the parts that turn readable code into a thicket. Every edge case is either handled *inline* (readable but noisy) or *quarantined behind a well-named boundary* (clean but hides what the reader came for). Pick one convention and apply it consistently; this is worth more than any individual module.
+8. **Edge-case convention (decided): state inline, validation quarantined.** The spec's complexity lives in loss recovery, ACK range coalescing, flow control accounting, key update, stateless reset, and ECN validation: exactly the parts that turn readable code into a thicket. The convention, applied consistently everywhere: any edge case that mutates state or changes subsequent behavior (RTT sampling conditions, ACK-delay capping, loss thresholds, key-phase transitions) is handled *inline*, in spec order, with its RFC citation; interacting state is the pedagogical payload and is never hidden behind a name. Pure reject-and-raise validation (ACK of an unsent packet number, a frame type illegal in its packet type, malformed encodings) may be *quarantined* into named, cited validators. The rule is testable at review time: if handling it can only raise, it may be extracted; if it changes what happens next, it stays inline. Consistency is worth more than any individual module.
 
 ### 4.7 Don't optimize, but don't foreclose optimization
 
@@ -165,7 +165,7 @@ Also note ECN validation is one of QUIC's more commonly botched corners: a trust
 
 ## 7. Open questions
 
-- [ ] Edge-case convention: inline vs. quarantined behind a boundary (§4.8); decide before writing loss recovery
+- [x] Edge-case convention: decided, state inline / validation quarantined (§4.8)
 - [ ] Module layout, specifically the line between the TLS shim and the packet protection layer; hardest decision to walk back
 - [ ] 0-RTT: in the MVP scope, or deferred?
 - [ ] When (and whether) to add an asyncio transport layer over the sans-IO core
@@ -196,3 +196,5 @@ Recorded here so the open questions above stay honest:
 - **Reference endpoints live in the package** as `client.py` and
   `server.py`, the only modules permitted to perform I/O (§4.6). The
   `interop/` shim wraps them rather than implementing its own endpoints.
+- **Edge-case convention settled (2026-07-26)**: state inline, validation
+  quarantined (§4.8), chosen over fully-inline and fully-quarantined.

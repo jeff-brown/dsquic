@@ -26,13 +26,12 @@ None.
 
 ## Next steps
 
-1. Decide the edge-case convention (design.md §4.8); required before
-   `recovery.py`.
-2. Implement `buffer.py` (varints, RFC 9000 §16) with real tests.
-3. Then `packet.py` header parsing and `protection.py` Initial keys, toward
+1. Implement `buffer.py` (varints, RFC 9000 §16) with real tests.
+2. Then `packet.py` header parsing and `protection.py` Initial keys, toward
    the Interop Runner `handshake` test case.
 
 ## Open decisions
 
 See design.md §7. Settled this session: module layout (flat), tooling,
-Python 3.12+; recorded in the design.md appendix.
+Python 3.12+, and the edge-case convention (state inline, validation
+quarantined, design.md §4.8); recorded in the design.md appendix.

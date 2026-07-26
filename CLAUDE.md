@@ -75,6 +75,12 @@ it exists to teach QUIC.
   `RFC 9000 §17.1`). The RFC-to-code mapping is part of the product.
 - Explicit state machines. Prefer named state tables and enums over
   conditionals scattered through large classes.
+- Edge-case convention: state inline, validation quarantined (design.md
+  §4.8). An edge case that mutates state or changes subsequent behavior is
+  handled inline, in spec order, with its RFC citation. Pure reject-and-raise
+  validation may be extracted into a named, cited validator. Review test: if
+  handling it can only raise, it may be extracted; if it changes what happens
+  next, it stays inline.
 - Strict typing. mypy strict must pass; fully annotate all defs, including
   tests. No `Any` unless forced by a third-party boundary; no bare
   `# type: ignore` (always `# type: ignore[code]`).
