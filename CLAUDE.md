@@ -53,6 +53,12 @@ it exists to teach QUIC.
   Interop Runner test case in both directions. A rung is skippable only
   while it is not yet applicable, never for convenience. Report results by
   the rung reached: loopback success is never reported as interop.
+- Phase gates (design.md §6.3). Work proceeds phase by phase. Do not start
+  a phase until the previous one passes every applicable ladder rung, is
+  committed, and the user has independently verified the wire format from a
+  capture (tcpdump/Wireshark) for wire-facing phases. From the TLS phase
+  onward the stack must support SSLKEYLOGFILE (NSS Key Log Format; keylog
+  callback in tls.py, file writing in endpoints/) so captures decrypt.
 - Sans-IO core. No sockets, threads, files, or asyncio anywhere in
   `src/dsquic/` except the `endpoints/` subpackage, the package's only I/O
   boundary. State machines take bytes and clock readings in, return bytes,

@@ -82,8 +82,8 @@ Minimum viable shape for the send record:
 class OutgoingDatagram:
     data: bytes
     destination: Address
-    ecn: ECNCodepoint                # required from day one
-    txtime: int | None = None        # SO_TXTIME / pacing offload
+    ecn: ECNCodepoint  # required from day one
+    txtime: int | None = None  # SO_TXTIME / pacing offload
     segment_size: int | None = None  # GSO hint
 ```
 
@@ -179,6 +179,8 @@ A rung is skippable only while it is not yet applicable (wire encoding has no lo
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file transfer over real UDP via the endpoints
 5. Interop gate, the definition of MVP done: `handshake` and `transfer` against quic-go, both directions
 
+Each step is a gate: the next phase starts only after the previous phase passes every applicable rung of §6.2, the work is committed, and, for the wire-facing phases (3 onward), the wire format has been independently verified from a capture (tcpdump/Wireshark, decrypted via SSLKEYLOGFILE).
+
 ---
 
 ## 7. Open questions
@@ -221,6 +223,13 @@ Recorded here so the open questions above stay honest:
   lineage, no RFC). Endpoints select the application protocol by negotiated
   ALPN (`hq.py` now, `h3.py` later); file and socket handling stay in
   `endpoints/`.
+- **SSLKEYLOGFILE support is a phase requirement, not a later feature
+  (2026-07-26)**: `tls.py` exposes a keylog callback emitting NSS Key Log
+  Format lines; the endpoints write them to the path named by the
+  `SSLKEYLOGFILE` environment variable, the same contract the Interop
+  Runner uses. Required from the TLS phase (§6.3 step 3) onward so wire
+  captures can be decrypted in Wireshark for independent verification
+  between phases.
 - **Client certificate validation is strict by default (2026-07-26)**: full
   X.509 path validation plus hostname verification (RFC 9525 DNS-ID
   matching against SNI), both delegated to `cryptography`'s verification

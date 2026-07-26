@@ -18,4 +18,8 @@ Interface to the rest of the package:
 The key schedule is standard TLS 1.3 and yields the standard traffic
 secrets. QUIC derives its own packet protection keys from those secrets;
 see protection.py.
+
+Emits NSS Key Log Format entries through a keylog callback as each
+secret becomes available; endpoints/ writes them to the file named by
+SSLKEYLOGFILE so wire captures can be decrypted.
 """
