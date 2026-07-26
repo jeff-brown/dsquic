@@ -5,7 +5,8 @@ state only, no history.
 
 ## Status (2026-07-26)
 
-Scaffold complete. No protocol logic implemented yet.
+Scaffold and working conventions complete, committed, and pushed to
+origin/main. No protocol logic implemented yet.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy over
   src and tests, pytest. All checks pass: `uv run pytest -q`,
@@ -15,10 +16,11 @@ Scaffold complete. No protocol logic implemented yet.
   docstring stub with RFC mapping, plus the reference endpoints (client,
   server), the only modules permitted I/O. `tests/` mirrors the modules;
   `tests/test_scaffold.py` enforces the mirror.
-- Docs: `docs/design.md` (rationale and open questions), `CLAUDE.md`
-  (working rules), `interop/README.md` (Interop Runner shim placeholder).
-- Nothing committed to git yet; all scaffold work is staged on `main`
-  awaiting the initial commit (agent never commits or pushes, per CLAUDE.md).
+- Docs: `README.md` (public overview), `docs/design.md` (rationale and open
+  questions), `CLAUDE.md` (working rules), `interop/README.md` (Interop
+  Runner shim placeholder).
+- Working tree is clean; everything is committed and pushed (agent stages
+  only, never commits or pushes, per CLAUDE.md).
 
 ## In-flight work
 

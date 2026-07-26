@@ -36,7 +36,7 @@ Ops people read captures and dashboards, not implementations. The long-term payo
 The first question anyone will ask. Defensible differentiators:
 
 - **Pure Python in the entire protocol path**, including buffers and packet number handling; accept an order of magnitude in performance. aioquic leans on a C extension in the packet path, so the parts most worth reading are the parts you can't.
-- **One module per RFC section**, with the mapping made explicit rather than left as an exercise.
+- **An explicit RFC-to-module mapping** (flat modules, one concern per module, every docstring citing the sections it implements), rather than the mapping being left as an exercise.
 - **MASQUE (CONNECT-UDP, CONNECT-IP) as a day-one design input**, not a layer bolted onto an H3 stack that never anticipated it.
 - **Explicit state machine tables** rather than conditionals scattered across thousand-line files.
 
@@ -166,7 +166,7 @@ Also note ECN validation is one of QUIC's more commonly botched corners: a trust
 ## 7. Open questions
 
 - [x] Edge-case convention: decided, state inline / validation quarantined (§4.8)
-- [ ] Module layout, specifically the line between the TLS shim and the packet protection layer; hardest decision to walk back
+- [x] Module layout: decided, flat modules; the TLS-shim/packet-protection line is drawn as `tls.py` / `protection.py` (see appendix)
 - [ ] 0-RTT: in the MVP scope, or deferred?
 - [ ] When (and whether) to add an asyncio transport layer over the sans-IO core
 - [ ] PyPI distribution name: publish as `dsquic`, or stay git-install only for the academic phase?

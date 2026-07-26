@@ -122,9 +122,25 @@ it exists to teach QUIC.
   named files under `docs/` and reference them here so they can be retrieved
   on demand instead of held in context.
 
+## Sync discipline
+
+- Clean beats fast. When thoroughness and speed conflict, choose
+  thoroughness; a smaller amount of coherent work beats a larger amount of
+  drifting work.
+- Ruthlessly resync at every major checkpoint: a settled decision, a
+  completed milestone, a new module, or any change to `docs/design.md`.
+  Verify that `docs/design.md`, `README.md`, this file, `STATE.md`, the
+  module map in `__init__.py`, and the code all agree, including section
+  number cross-references. Fix every discrepancy immediately; a stale claim
+  in any of these files is a defect, not a doc chore.
+- Actively raise ambiguities and concerns. When the design, a spec, or an
+  instruction admits more than one reading, or new work creates tension with
+  a recorded decision, surface the question rather than silently picking a
+  side. Recorded decisions change by raising them, never by drift.
+
 ## Open decisions
 
-Check `docs/design.md` §7 before touching related areas. Notably: the
-edge-case convention (inline vs. quarantined) must be decided before writing
-loss recovery in `recovery.py`. Record newly settled decisions in the appendix
-of `docs/design.md`.
+Check `docs/design.md` §7 before touching related areas. Still open: 0-RTT
+scope, the asyncio transport layer, PyPI publication, and the v1 MASQUE
+surface (CONNECT-UDP only vs. CONNECT-IP alongside). Record newly settled
+decisions in the appendix of `docs/design.md`.
