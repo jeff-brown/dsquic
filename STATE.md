@@ -53,15 +53,34 @@ design.md §6.2:
    messages roundtrip byte-exact, key schedule and both Finished
    MACs match). HKDF primitives moved from protection.py to tls.py
    (context parameter added); buffer.py gained pull_uint24.
-   3b next: client/server handshake state machines completing an
-   in-memory handshake (X25519, TLS_AES_128_GCM_SHA256, transport
-   parameters, ALPN); secrets/events surfaced per the module seam.
-   3c after: certificates (sign and strict verify per the recorded
-   decision), keylog callback (NSS format) for SSLKEYLOGFILE.
+   3b done, staged: TlsClient/TlsServer state machines (states and
+   expectation tables per RFC 8446 Appendix A), full six-message flow
+   with real CertificateVerify signing and leaf-signature verification,
+   per-level CRYPTO reassembly, ALPN and transport-parameter
+   negotiation, alerts as TlsAlert. Events per the seam: SendData,
+   SecretAvailable(level, direction, secret), HandshakeComplete. The
+   in-memory dsquic-to-dsquic handshake completes with matching
+   secrets on both sides (ladder rung 2 half-step).
+   3c done, staged: certificate policy on the client (chain to
+   configured CA anchors plus hostname matching via cryptography's
+   build_server_verifier; ClientConfig.insecure_skip_verify as the
+   explicit escape hatch, ValueError if neither CAs nor the flag;
+   verification_time supplied by the caller per sans-IO), and the
+   keylog callback (NSS Key Log Format lines on both machines,
+   endpoint writes SSLKEYLOGFILE). Phase 3 code-complete; phase 3
+   gate is the user review plus commit, then phase 4 starts with the
+   loopback wire and the Wireshark/SSLKEYLOGFILE verification.
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file
    transfer over real UDP via the endpoints.
 5. Interop gate (MVP done): `handshake` and `transfer` against quic-go,
    both directions.
+
+## Standing constraints for upcoming phases
+
+MASQUE nesting readiness (design.md appendix): connection.py must be
+transport-agnostic, no hardcoded MTU constants, endpoint loop handles N
+connections, h3.py models long-lived CONNECT streams. Check before
+declaring phase 4 or the h3 milestone done.
 
 ## Open decisions
 

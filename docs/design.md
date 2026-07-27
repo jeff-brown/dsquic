@@ -246,6 +246,30 @@ Recorded here so the open questions above stay honest:
   interop or conformance claims.
 - **Edge-case convention settled (2026-07-26)**: state inline, validation
   quarantined (§4.8), chosen over fully-inline and fully-quarantined.
+- **MASQUE nesting readiness (2026-07-26)**: MASQUE tunnels a complete
+  inner QUIC connection (with its own ordinary TLS handshake) through an
+  outer connection as HTTP Datagrams; the nesting is at the QUIC packet
+  layer, and the proxy never terminates inner TLS. Four commitments keep
+  this from requiring a later refactor, checked before `connection.py`,
+  the endpoint loop, and the `h3.py` API are considered done:
+  1. `connection.py` is transport-agnostic: consumes datagrams, emits
+     `OutgoingDatagram` with an abstract destination, never assumes a
+     socket; an inner connection's transport can be an outer
+     connection's datagram surface.
+  2. No hardcoded MTU or payload-size constants in the core; packet
+     sizing is per-connection configuration (tunneled connections have
+     reduced effective MTU; the client Initial 1200-byte floor
+     interacts with outer datagram capacity).
+  3. The endpoint loop handles N concurrent connections, including
+     connections whose sends route into another connection rather than
+     the socket.
+  4. `h3.py` models long-lived Extended CONNECT streams with associated
+     datagram flows, not request/response calls; DATAGRAM frames
+     (RFC 9221) are in the frame vocabulary and transport parameter
+     set, parse-side at minimum, from first implementation.
+  Already satisfied by construction: tls/protection/packet are
+  instance-scoped and nesting-neutral; the §4.7 interfaces (abstract
+  destinations, per-datagram receive, deadline timers) are the enablers.
 - **Congestion control is pluggable (2026-07-26)**: `congestion.py` defines
   the controller interface using the RFC 9002 §7 event vocabulary (packet
   sent, packets acked, packets lost, persistent congestion) plus congestion

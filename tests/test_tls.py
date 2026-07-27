@@ -1,25 +1,50 @@
-"""Tests for dsquic.tls against the RFC 8448 simple 1-RTT handshake trace."""
+"""Tests for dsquic.tls: RFC 8448 trace vectors and the in-memory handshake."""
+
+import datetime
+from dataclasses import dataclass
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 import rfc8448_vectors as rfc8448
+from dsquic.protection import derive_packet_keys
 from dsquic.tls import (
+    BAD_CERTIFICATE,
+    DECRYPT_ERROR,
     ECDSA_SECP256R1_SHA256,
+    NO_APPLICATION_PROTOCOL,
     RSA_PSS_RSAE_SHA256,
     TLS_AES_128_GCM_SHA256,
+    UNEXPECTED_MESSAGE,
     Certificate,
     CertificateVerify,
+    ClientConfig,
     ClientHello,
+    ClientState,
+    Direction,
     EncryptedExtensions,
+    EncryptionLevel,
     ExtensionType,
     Finished,
+    HandshakeComplete,
     HandshakeParseError,
     KeySchedule,
+    SecretAvailable,
+    SendData,
+    ServerConfig,
     ServerHello,
+    ServerState,
+    TlsAlert,
+    TlsClient,
+    TlsEvent,
+    TlsServer,
     encode_certificate,
     encode_certificate_verify,
     encode_client_hello,
@@ -30,6 +55,8 @@ from dsquic.tls import (
     hkdf_label,
     parse_handshake_message,
 )
+
+# --- RFC 8448 §3 vectors ------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -162,3 +189,309 @@ def test_parse_rejects_nonnull_compression() -> None:
     body[48] = 0x01
     with pytest.raises(HandshakeParseError, match="compression"):
         parse_handshake_message(bytes(body))
+
+
+# --- In-memory handshake (verification ladder rung 2 half-step) ---------------
+
+VERIFICATION_TIME = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
+
+
+@dataclass(frozen=True)
+class Credentials:
+    chain: list[bytes]
+    key: ec.EllipticCurvePrivateKey
+    ca: list[bytes]
+    ca_key: ec.EllipticCurvePrivateKey
+
+
+def _name(common_name: str) -> x509.Name:
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+
+
+def make_ca() -> tuple[bytes, ec.EllipticCurvePrivateKey]:
+    key = ec.generate_private_key(ec.SECP256R1())
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(_name("dsquic test CA"))
+        .issuer_name(_name("dsquic test CA"))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2036, 1, 1, tzinfo=datetime.UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    return certificate.public_bytes(serialization.Encoding.DER), key
+
+
+def issue_leaf(
+    ca_key: ec.EllipticCurvePrivateKey, hostname: str
+) -> tuple[bytes, ec.EllipticCurvePrivateKey]:
+    key = ec.generate_private_key(ec.SECP256R1())
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(_name(hostname))
+        .issuer_name(_name("dsquic test CA"))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2036, 1, 1, tzinfo=datetime.UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    return certificate.public_bytes(serialization.Encoding.DER), key
+
+
+@pytest.fixture(scope="module")
+def credentials() -> Credentials:
+    ca_der, ca_key = make_ca()
+    leaf_der, leaf_key = issue_leaf(ca_key, "localhost")
+    return Credentials(chain=[leaf_der], key=leaf_key, ca=[ca_der], ca_key=ca_key)
+
+
+def make_client(
+    credentials: Credentials,
+    *,
+    alpn: list[str] | None = None,
+    server_name: str = "localhost",
+    insecure_skip_verify: bool = False,
+    keylog: list[str] | None = None,
+) -> TlsClient:
+    config = ClientConfig(
+        server_name=server_name,
+        alpn=alpn if alpn is not None else ["hq-interop"],
+        transport_parameters=b"client-params",
+        ca_certificates=[] if insecure_skip_verify else credentials.ca,
+        insecure_skip_verify=insecure_skip_verify,
+        verification_time=VERIFICATION_TIME,
+    )
+    return TlsClient(config, keylog=keylog.append if keylog is not None else None)
+
+
+def make_server(
+    credentials: Credentials,
+    alpn: list[str] | None = None,
+    keylog: list[str] | None = None,
+) -> TlsServer:
+    config = ServerConfig(
+        certificate_chain=credentials.chain,
+        signing_key=credentials.key,
+        alpn=alpn if alpn is not None else ["hq-interop"],
+        transport_parameters=b"server-params",
+    )
+    return TlsServer(config, keylog=keylog.append if keylog is not None else None)
+
+
+def pump(client: TlsClient, server: TlsServer) -> tuple[list[TlsEvent], list[TlsEvent]]:
+    """Shuttle SendData between the machines until both go quiet."""
+    client_events: list[TlsEvent] = []
+    server_events: list[TlsEvent] = []
+    client.start()
+    for _ in range(10):
+        moved = False
+        for event in client.take_events():
+            client_events.append(event)
+            if isinstance(event, SendData):
+                server.receive(event.level, event.data)
+                moved = True
+        for event in server.take_events():
+            server_events.append(event)
+            if isinstance(event, SendData):
+                client.receive(event.level, event.data)
+                moved = True
+        if not moved:
+            return client_events, server_events
+    raise AssertionError("handshake did not converge")
+
+
+def secrets_of(events: list[TlsEvent]) -> dict[tuple[EncryptionLevel, Direction], bytes]:
+    return {(e.level, e.direction): e.secret for e in events if isinstance(e, SecretAvailable)}
+
+
+def test_in_memory_handshake_completes(credentials: Credentials) -> None:
+    client = make_client(credentials)
+    server = make_server(credentials)
+    client_events, server_events = pump(client, server)
+    assert client.state is ClientState.CONNECTED
+    assert server.state is ServerState.CONNECTED
+
+    client_secrets = secrets_of(client_events)
+    server_secrets = secrets_of(server_events)
+    assert client_secrets == server_secrets
+    assert set(client_secrets) == {
+        (EncryptionLevel.HANDSHAKE, Direction.CLIENT),
+        (EncryptionLevel.HANDSHAKE, Direction.SERVER),
+        (EncryptionLevel.ONE_RTT, Direction.CLIENT),
+        (EncryptionLevel.ONE_RTT, Direction.SERVER),
+    }
+    assert len(set(client_secrets.values())) == 4
+
+    client_done = next(e for e in client_events if isinstance(e, HandshakeComplete))
+    server_done = next(e for e in server_events if isinstance(e, HandshakeComplete))
+    assert client_done.alpn == "hq-interop"
+    assert server_done.alpn == "hq-interop"
+    assert client_done.peer_transport_parameters == b"server-params"
+    assert server_done.peer_transport_parameters == b"client-params"
+
+
+def test_handshake_secrets_feed_packet_protection(credentials: Credentials) -> None:
+    client = make_client(credentials)
+    server = make_server(credentials)
+    client_events, _ = pump(client, server)
+    secrets = secrets_of(client_events)
+    keys = derive_packet_keys(secrets[(EncryptionLevel.ONE_RTT, Direction.CLIENT)])
+    assert len(keys.key) == 16
+    assert len(keys.iv) == 12
+    assert len(keys.hp) == 16
+
+
+def test_handshake_bytes_survive_fragmentation(credentials: Credentials) -> None:
+    client = make_client(credentials)
+    server = make_server(credentials)
+    client.start()
+    for event in client.take_events():
+        if isinstance(event, SendData):
+            for i in range(len(event.data)):  # one byte at a time
+                server.receive(event.level, event.data[i : i + 1])
+    assert server.state is ServerState.WAIT_FINISHED
+
+
+def test_keylog_lines(credentials: Credentials) -> None:
+    client_lines: list[str] = []
+    server_lines: list[str] = []
+    client = make_client(credentials, keylog=client_lines)
+    server = make_server(credentials, keylog=server_lines)
+    pump(client, server)
+    labels = [
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+        "SERVER_TRAFFIC_SECRET_0",
+    ]
+    assert [line.split()[0] for line in client_lines] == labels
+    assert sorted(client_lines) == sorted(server_lines)
+    for line in client_lines:
+        _, client_random, secret = line.split()
+        assert len(client_random) == 64
+        assert len(secret) == 64
+        bytes.fromhex(client_random)
+        bytes.fromhex(secret)
+
+
+def test_wrong_hostname_rejected(credentials: Credentials) -> None:
+    leaf_der, leaf_key = issue_leaf(credentials.ca_key, "other.example")
+    bad = Credentials(chain=[leaf_der], key=leaf_key, ca=credentials.ca, ca_key=credentials.ca_key)
+    client = make_client(bad, server_name="localhost")
+    server = make_server(bad)
+    with pytest.raises(TlsAlert) as excinfo:
+        pump(client, server)
+    assert excinfo.value.alert == BAD_CERTIFICATE
+
+
+def test_untrusted_ca_rejected(credentials: Credentials) -> None:
+    other_ca_der, _ = make_ca()
+    distrusting = Credentials(
+        chain=credentials.chain, key=credentials.key, ca=[other_ca_der], ca_key=credentials.ca_key
+    )
+    client = make_client(distrusting)
+    server = make_server(credentials)
+    with pytest.raises(TlsAlert) as excinfo:
+        pump(client, server)
+    assert excinfo.value.alert == BAD_CERTIFICATE
+
+
+def test_expired_certificate_rejected(credentials: Credentials) -> None:
+    config = ClientConfig(
+        server_name="localhost",
+        alpn=["hq-interop"],
+        transport_parameters=b"client-params",
+        ca_certificates=credentials.ca,
+        verification_time=datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC),
+    )
+    client = TlsClient(config)
+    server = make_server(credentials)
+    with pytest.raises(TlsAlert) as excinfo:
+        pump(client, server)
+    assert excinfo.value.alert == BAD_CERTIFICATE
+
+
+def test_insecure_skip_verify_accepts_untrusted(credentials: Credentials) -> None:
+    other_ca_der, other_ca_key = make_ca()
+    leaf_der, leaf_key = issue_leaf(other_ca_key, "localhost")
+    untrusted = Credentials(chain=[leaf_der], key=leaf_key, ca=[other_ca_der], ca_key=other_ca_key)
+    client = make_client(credentials, insecure_skip_verify=True)
+    server = make_server(untrusted)
+    pump(client, server)
+    assert client.state is ClientState.CONNECTED
+
+
+def test_client_config_requires_trust_anchors() -> None:
+    with pytest.raises(ValueError, match="ca_certificates"):
+        ClientConfig(server_name="localhost", alpn=["hq-interop"], transport_parameters=b"")
+
+
+def test_alpn_mismatch_raises(credentials: Credentials) -> None:
+    client = make_client(credentials, alpn=["h3"])
+    server = make_server(credentials, alpn=["hq-interop"])
+    client.start()
+    send = next(e for e in client.take_events() if isinstance(e, SendData))
+    with pytest.raises(TlsAlert) as excinfo:
+        server.receive(send.level, send.data)
+    assert excinfo.value.alert == NO_APPLICATION_PROTOCOL
+
+
+def test_tampered_server_finished_raises(credentials: Credentials) -> None:
+    client = make_client(credentials)
+    server = make_server(credentials)
+    client.start()
+    for event in client.take_events():
+        if isinstance(event, SendData):
+            server.receive(event.level, event.data)
+    with pytest.raises(TlsAlert) as excinfo:
+        for event in server.take_events():
+            if isinstance(event, SendData):
+                data = bytearray(event.data)
+                data[-1] ^= 0x01  # last byte of the server Finished verify_data
+                client.receive(event.level, bytes(data))
+    assert excinfo.value.alert == DECRYPT_ERROR
+
+
+def test_message_at_wrong_level_raises(credentials: Credentials) -> None:
+    client = make_client(credentials)
+    server = make_server(credentials)
+    client.start()
+    send = next(e for e in client.take_events() if isinstance(e, SendData))
+    with pytest.raises(TlsAlert) as excinfo:
+        server.receive(EncryptionLevel.HANDSHAKE, send.data)
+    assert excinfo.value.alert == UNEXPECTED_MESSAGE
+
+
+def test_unexpected_message_order_raises(credentials: Credentials) -> None:
+    client = make_client(credentials)
+    client.start()
+    client.take_events()
+    finished = encode_finished(Finished(verify_data=bytes(32)))
+    with pytest.raises(TlsAlert) as excinfo:
+        client.receive(EncryptionLevel.INITIAL, finished)
+    assert excinfo.value.alert == UNEXPECTED_MESSAGE
