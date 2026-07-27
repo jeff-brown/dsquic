@@ -280,7 +280,7 @@ def _encode_extensions(extensions: list[Extension]) -> bytes:
 
 def _parse_extensions(buf: Buffer) -> list[Extension]:
     block = Buffer(buf.pull_bytes(buf.pull_uint16()))
-    extensions = []
+    extensions: list[Extension] = []
     while not block.is_empty:
         ext_type = block.pull_uint16()
         extensions.append(Extension(type=ext_type, data=block.pull_bytes(block.pull_uint16())))
@@ -344,7 +344,7 @@ def _parse_client_hello(buf: Buffer) -> ClientHello:
     random = buf.pull_bytes(32)
     session_id = buf.pull_bytes(buf.pull_uint8())
     suites_block = Buffer(buf.pull_bytes(buf.pull_uint16()))
-    cipher_suites = []
+    cipher_suites: list[int] = []
     while not suites_block.is_empty:
         cipher_suites.append(suites_block.pull_uint16())
     if buf.pull_bytes(buf.pull_uint8()) != b"\x00":
@@ -376,7 +376,7 @@ def _parse_server_hello(buf: Buffer) -> ServerHello:
 def _parse_certificate(buf: Buffer) -> Certificate:
     request_context = buf.pull_bytes(buf.pull_uint8())
     entries_block = Buffer(buf.pull_bytes(buf.pull_uint24()))
-    entries = []
+    entries: list[CertificateEntry] = []
     while not entries_block.is_empty:
         data = entries_block.pull_bytes(entries_block.pull_uint24())
         entries.append(CertificateEntry(data=data, extensions=_parse_extensions(entries_block)))
@@ -510,7 +510,7 @@ class ClientConfig:
     server_name: str
     alpn: list[str]
     transport_parameters: bytes
-    ca_certificates: list[bytes] = field(default_factory=list)
+    ca_certificates: list[bytes] = field(default_factory=list[bytes])
     insecure_skip_verify: bool = False
     verification_time: datetime.datetime | None = None
 
@@ -616,7 +616,7 @@ def _alpn_extension(protocols: list[str]) -> bytes:
 
 def _parse_alpn(data: bytes) -> list[str]:
     block = Buffer(Buffer(data).pull_bytes(int.from_bytes(data[:2], "big") + 2)[2:])
-    protocols = []
+    protocols: list[str] = []
     while not block.is_empty:
         protocols.append(block.pull_bytes(block.pull_uint8()).decode("ascii"))
     return protocols

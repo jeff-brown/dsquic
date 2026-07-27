@@ -61,15 +61,24 @@ design.md §6.2:
    SecretAvailable(level, direction, secret), HandshakeComplete. The
    in-memory dsquic-to-dsquic handshake completes with matching
    secrets on both sides (ladder rung 2 half-step).
-   3c done, staged: certificate policy on the client (chain to
-   configured CA anchors plus hostname matching via cryptography's
-   build_server_verifier; ClientConfig.insecure_skip_verify as the
-   explicit escape hatch, ValueError if neither CAs nor the flag;
-   verification_time supplied by the caller per sans-IO), and the
-   keylog callback (NSS Key Log Format lines on both machines,
-   endpoint writes SSLKEYLOGFILE). Phase 3 code-complete; phase 3
-   gate is the user review plus commit, then phase 4 starts with the
-   loopback wire and the Wireshark/SSLKEYLOGFILE verification.
+   Done and committed (message codecs, key schedule, state machines,
+   certificate policy, keylog).
+4. In progress, split into checkpoints 4a-4e:
+   4a done, staged: frames.py, the full RFC 9000 §19 vocabulary plus
+   RFC 9221 DATAGRAM. One frozen dataclass per frame with encode();
+   parse_frames() drives a frame-type dispatch table. PADDING
+   coalesces; ACK ranges as inclusive (low, high) pairs highest-first
+   with the §19.3.1 gap arithmetic; shortest-form frame types
+   enforced; unknown types raise FrameParseError. buffer.py gained
+   peek_uint8.
+   4b next: recovery.py (sent-packet tracking, ACK processing, loss
+   detection, PTO, RTT estimation) plus new_reno.py behind the
+   congestion.py interface, driven by a synthetic clock in tests.
+   4c: streams.py (state machines, flow control, reassembly), hq.py.
+   4d: connection.py composition; in-memory dsquic-to-dsquic
+   connection test.
+   4e: endpoints (sync UDP loop, SSLKEYLOGFILE, file serve/download);
+   loopback transfer over real UDP; user Wireshark gate.
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file
    transfer over real UDP via the endpoints.
 5. Interop gate (MVP done): `handshake` and `transfer` against quic-go,

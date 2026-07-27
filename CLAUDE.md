@@ -94,7 +94,10 @@ it exists to teach QUIC.
   handling it can only raise, it may be extracted; if it changes what happens
   next, it stays inline.
 - Strict typing. mypy strict must pass; fully annotate all defs, including
-  tests. No `Any` unless forced by a third-party boundary; no bare
+  tests. Annotate empty container initializations (`x: list[T] = []`) and
+  parameterize dataclass factories (`field(default_factory=list[T])`);
+  mypy infers them but Pylance reports them as Unknown, and both checkers
+  must be clean. No `Any` unless forced by a third-party boundary; no bare
   `# type: ignore` (always `# type: ignore[code]`).
 
 ## Layout conventions

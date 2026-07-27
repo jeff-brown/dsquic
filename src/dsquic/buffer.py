@@ -64,6 +64,12 @@ class Buffer:
         self._position += length
         return self._data[start : self._position]
 
+    def peek_uint8(self) -> int:
+        """Read the next byte without advancing the position."""
+        if self.remaining < 1:
+            raise BufferReadError("cannot peek, buffer is empty")
+        return self._data[self._position]
+
     def pull_uint8(self) -> int:
         return self.pull_bytes(1)[0]
 
