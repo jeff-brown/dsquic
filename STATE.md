@@ -81,7 +81,15 @@ design.md §6.2:
    start, avoidance, one-reduction-per-recovery, minimum window).
    Spaces keyed by tls.EncryptionLevel; time is caller-supplied float
    seconds. SentPacket carries frames for connection re-bundling.
-   4c: streams.py (state machines, flow control, reassembly), hq.py.
+   4c done, staged: streams.py (SendStream/RecvStream carrying the
+   §3.1/§3.2 state machines; RangeSet for reassembly and ack
+   tracking; StreamManager with §2.1 ID sequencing, §4.6 stream-count
+   limits, §4.1 connection-level flow control both directions, §4.2
+   half-window credit updates; §18.2 limit naming preserved). hq.py
+   (encode_request/parse_request; FIN-terminated, terminator-tolerant,
+   traversal-rejecting). frames.py gained the §20.1 transport error
+   code constants. RESET_STREAM/STOP_SENDING handling deferred, noted
+   in the SendStream docstring.
    4d: connection.py composition; in-memory dsquic-to-dsquic
    connection test.
    4e: endpoints (sync UDP loop, SSLKEYLOGFILE, file serve/download);
