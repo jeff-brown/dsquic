@@ -71,9 +71,16 @@ design.md §6.2:
    with the §19.3.1 gap arithmetic; shortest-form frame types
    enforced; unknown types raise FrameParseError. buffer.py gained
    peek_uint8.
-   4b next: recovery.py (sent-packet tracking, ACK processing, loss
-   detection, PTO, RTT estimation) plus new_reno.py behind the
-   congestion.py interface, driven by a synthetic clock in tests.
+   4b done, staged: recovery.py (RttEstimator per §5.3; LossDetection
+   with per-space sent tracking, ACK processing returning
+   AckOutcome(acked, lost), packet/time-threshold loss, PTO with
+   backoff and the §6.2.2.1 client anti-deadlock, space discard,
+   persistent congestion span test); congestion.py now a
+   runtime-checkable Protocol (adds bytes_in_flight and
+   on_packets_discarded); new_reno.py implements §7/Appendix B (slow
+   start, avoidance, one-reduction-per-recovery, minimum window).
+   Spaces keyed by tls.EncryptionLevel; time is caller-supplied float
+   seconds. SentPacket carries frames for connection re-bundling.
    4c: streams.py (state machines, flow control, reassembly), hq.py.
    4d: connection.py composition; in-memory dsquic-to-dsquic
    connection test.
