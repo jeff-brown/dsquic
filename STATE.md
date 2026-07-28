@@ -90,8 +90,21 @@ design.md §6.2:
    traversal-rejecting). frames.py gained the §20.1 transport error
    code constants. RESET_STREAM/STOP_SENDING handling deferred, noted
    in the SendStream docstring.
-   4d: connection.py composition; in-memory dsquic-to-dsquic
-   connection test.
+   4d done, staged: connection.py, the sans-IO composition root.
+   Three packet number spaces with per-space keys, packet numbers,
+   received-range tracking and CRYPTO reassembly; receive path
+   (coalesced packets, unprotect, frame dispatch, duplicate
+   suppression); send path (frame selection, coalescing, §14.1
+   Initial padding, §5.4.2 minimum-sample padding, protection);
+   §8.1 anti-amplification; §4.9 key discard on both sides; §7.2
+   peer CID adoption and §7.3 CID authentication; ACK generation;
+   loss/PTO retransmission via frame requeue; §10 close and drain;
+   idle timer; OutgoingDatagram with opaque destination and
+   next_timer(), per the MASQUE constraints. transport_parameters.py
+   added (§18 codec, grease-tolerant). streams.py gained requeue()
+   and writable_streams(). In-memory dsquic-to-dsquic handshake,
+   hq request/response, 50KB transfer, retransmission after loss,
+   close, and anti-amplification all verified.
    4e: endpoints (sync UDP loop, SSLKEYLOGFILE, file serve/download);
    loopback transfer over real UDP; user Wireshark gate.
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file

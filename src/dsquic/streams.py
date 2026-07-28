@@ -169,6 +169,19 @@ class SendStream:
         ):
             self.state = SendState.DATA_RECVD
 
+    def requeue(self, frame: Stream) -> None:
+        """Put a lost frame's bytes back at the front of the queue (§13.3).
+
+        The frame is resent at its original offset, so the queue base
+        moves back; already-acked bytes may be resent, which is
+        harmless (the receiver's RangeSet merges overlap).
+        """
+        if frame.data:
+            self._pending[:0] = frame.data
+            self._base_offset = min(self._base_offset, frame.offset)
+        if frame.fin:
+            self._fin_sent = False
+
     @property
     def has_pending(self) -> bool:
         return bool(self._pending) or (self._fin_queued and not self._fin_sent)
@@ -350,6 +363,14 @@ class StreamManager:
         if frame is not None:
             self.data_sent += len(frame.data)
         return frame
+
+    def writable_streams(self) -> list[int]:
+        """Stream IDs with data or a FIN waiting to be sent."""
+        return [
+            stream_id
+            for stream_id, half in self._streams.items()
+            if half.send is not None and half.send.has_pending
+        ]
 
     def on_max_data(self, maximum: int) -> None:
         self.max_data = max(self.max_data, maximum)
