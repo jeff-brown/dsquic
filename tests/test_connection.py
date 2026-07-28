@@ -13,6 +13,7 @@ from dsquic.connection import (
     HandshakeConfirmed,
     StreamDataReceived,
 )
+from dsquic.packet import parse_long_header
 from dsquic.tls import ClientConfig, EncryptionLevel, ServerConfig
 from test_tls import Credentials, issue_leaf, make_ca
 
@@ -73,6 +74,19 @@ def pump(client: Connection, server: Connection, now: float = 0.0, rounds: int =
     return now
 
 
+def assert_exactly_packets(data: bytes) -> None:
+    """Every byte of the datagram belongs to a parseable packet (§12.2)."""
+    offset = 0
+    while offset < len(data):
+        first = data[offset]
+        assert first & 0x40, f"packet at offset {offset} has no fixed bit: 0x{first:02x}"
+        if not first & 0x80:
+            return  # short header: runs to the end of the datagram
+        header = parse_long_header(data[offset:])
+        offset += header.pn_offset + header.length
+    assert offset == len(data), f"{len(data) - offset} trailing bytes after the last packet"
+
+
 def handshake(credentials: Credentials, **kwargs: object) -> tuple[Connection, Connection, float]:
     client, server = make_pair(credentials, **kwargs)  # type: ignore[arg-type]
     client.connect(0.0)
@@ -107,6 +121,24 @@ class TestHandshake:
         first = client.datagrams_to_send(0.0)
         assert first
         assert len(first[0].data) >= 1200  # §14.1
+
+    def test_datagrams_contain_no_trailing_bytes(self, credentials: Credentials) -> None:
+        """§14.1 padding is PADDING frames inside a packet, never bytes
+        appended to the datagram: a short header packet runs to the end
+        of the datagram, so trailing bytes would corrupt it."""
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        now = 0.0
+        for _ in range(6):
+            for datagram in client.datagrams_to_send(now):
+                assert_exactly_packets(datagram.data)
+                server.datagram_received(datagram.data, now, source="client")
+            now += 0.01
+            for datagram in server.datagrams_to_send(now):
+                assert_exactly_packets(datagram.data)
+                client.datagram_received(datagram.data, now, source="server")
+            now += 0.01
+        assert client.state is ConnectionState.CONNECTED
 
     def test_initial_and_handshake_keys_discarded(self, credentials: Credentials) -> None:
         client, server, _ = handshake(credentials)

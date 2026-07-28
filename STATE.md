@@ -105,8 +105,36 @@ design.md §6.2:
    and writable_streams(). In-memory dsquic-to-dsquic handshake,
    hq request/response, 50KB transfer, retransmission after loss,
    close, and anti-amplification all verified.
-   4e: endpoints (sync UDP loop, SSLKEYLOGFILE, file serve/download);
-   loopback transfer over real UDP; user Wireshark gate.
+   4e done, staged: endpoints/__init__.py (pump: send, select on the
+   core's next_timer deadline, receive, handle_timer; keylog_writer
+   honouring SSLKEYLOGFILE; PEM to DER loading at the I/O boundary),
+   endpoints/client.py (fetch() plus a CLI: python -m
+   dsquic.endpoints.client HOST PORT PATH --ca ca.pem), and
+   endpoints/server.py (serve_one plus a CLI: python -m
+   dsquic.endpoints.server --certificate --private-key --www).
+   Loopback over real UDP verified: single transfer, 100KB transfer,
+   concurrent streams, missing file, keylog contents, and certificate
+   rejection on a wrong SNI name. Two bugs the synthetic clock hid:
+   min() over (deadline, EncryptionLevel) tuples broke on exact ties,
+   and transport errors escaped as Python exceptions instead of
+   becoming CONNECTION_CLOSE per §10.2 (both fixed).
+   Phase 4 gate PASSED (2026-07-28): the user captured loopback
+   traffic with tcpdump and decrypted it in Wireshark via
+   SSLKEYLOGFILE. Wireshark dissected the whole connection: Initial
+   with ClientHello and PADDING frames, ServerHello, EncryptedExtensions
+   with ALPN and transport parameters, the X.509 certificate,
+   CertificateVerify, both Finished messages, HANDSHAKE_DONE, the
+   STREAM frames carrying "GET /index.html" and the HTML response,
+   and a clean CONNECTION_CLOSE.
+   Three bugs found by the real wire and the capture, all fixed:
+   §14.1 padding appended after packets instead of as PADDING frames
+   inside one (broke any correct receiver's parse of a following
+   short-header packet); min() over (deadline, EncryptionLevel)
+   tuples on exact ties; the §6.2.2.1 anti-deadlock PTO defaulting
+   to 0.0 when nothing was in flight, which fired immediately under a
+   monotonic clock and put a spurious PING on the wire.
+   Next: phase 5, interop against quic-go (ladder rung 3), starting
+   with the interop/ shim.
 4. `connection.py`, `recovery.py`, `streams.py`, `hq.py`: loopback file
    transfer over real UDP via the endpoints.
 5. Interop gate (MVP done): `handshake` and `transfer` against quic-go,

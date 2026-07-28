@@ -289,7 +289,19 @@ class Connection:
     # --- receive path ---------------------------------------------------------
 
     def datagram_received(self, data: bytes, now: float, source: object = None) -> None:
-        """Process one received datagram (§12.2: coalesced packets)."""
+        """Process one received datagram (§12.2: coalesced packets).
+
+        A transport error detected while processing does not propagate:
+        per §10.2 it becomes a CONNECTION_CLOSE to the peer and a
+        ConnectionTerminated event to the application.
+        """
+        try:
+            self._datagram_received(data, now, source)
+        except ConnectionError_ as exc:
+            self.close(error_code=exc.error_code, reason=exc.reason, frame_type=exc.frame_type)
+            self._events.append(ConnectionTerminated(error_code=exc.error_code, reason=exc.reason))
+
+    def _datagram_received(self, data: bytes, now: float, source: object) -> None:
         if self.state in (ConnectionState.TERMINATED, ConnectionState.DRAINING):
             return
         self._bytes_received += len(data)
@@ -597,29 +609,36 @@ class Connection:
         return budget
 
     def _build_datagram(self, now: float) -> OutgoingDatagram | None:
-        """Coalesce one packet per level into a single datagram (§12.2)."""
-        if self._send_budget() <= 0:
+        """Coalesce one packet per level into a single datagram (§12.2).
+
+        §14.1: a datagram carrying an Initial packet is expanded to at
+        least 1200 bytes. The expansion is PADDING frames inside the
+        Initial packet's payload, never bytes appended to the datagram:
+        a packet with a short header runs to the end of the datagram, so
+        trailing bytes would be read as part of it (or as a malformed
+        packet) and fail authentication.
+        """
+        budget = self._send_budget()
+        if budget <= 0:
             return None
         size_limit = self.config.max_datagram_size
         payload = bytearray()
-        needs_padding = False
         for level in (EncryptionLevel.INITIAL, EncryptionLevel.HANDSHAKE, EncryptionLevel.ONE_RTT):
             space = self._spaces[level]
             if space.keys_send is None or space.discarded:
                 continue
             room = size_limit - len(payload)
-            packet = self._build_packet(level, room, now)
+            # An Initial fills its datagram to the floor, so nothing is
+            # coalesced after it; the remaining levels take the next one.
+            pad_to = min(MIN_INITIAL_DATAGRAM, budget) if level is EncryptionLevel.INITIAL else 0
+            packet = self._build_packet(level, room, now, pad_datagram_to=pad_to)
             if packet is None:
                 continue
             payload += packet
-            if level is EncryptionLevel.INITIAL and self.is_client:
-                needs_padding = True
+            if pad_to:
+                break
         if not payload:
             return None
-        if needs_padding and len(payload) < MIN_INITIAL_DATAGRAM:
-            # §14.1: a datagram containing a client Initial is padded to
-            # at least 1200 bytes, proving path capacity.
-            payload += bytes(MIN_INITIAL_DATAGRAM - len(payload))
         self._bytes_sent += len(payload)
         return OutgoingDatagram(data=bytes(payload), destination=self.destination)
 
@@ -673,8 +692,14 @@ class Connection:
                         used += len(stream_frame.encode())
         return chosen, used
 
-    def _build_packet(self, level: EncryptionLevel, room: int, now: float) -> bytes | None:
-        """Build one protected packet for a level, or None if nothing to send."""
+    def _build_packet(
+        self, level: EncryptionLevel, room: int, now: float, pad_datagram_to: int = 0
+    ) -> bytes | None:
+        """Build one protected packet for a level, or None if nothing to send.
+
+        ``pad_datagram_to`` adds PADDING frames so the finished packet
+        reaches that size, which is how §14.1 expansion is done.
+        """
         space = self._spaces[level]
         assert space.keys_send is not None
         header_overhead = 64  # bounded: long header, CIDs, length, PN
@@ -708,6 +733,19 @@ class Connection:
                 destination_cid=self.peer_cid,
                 source_cid=self.host_cid,
             )
+            if pad_datagram_to:
+                # The Length varint is the same width for the padded and
+                # unpadded sizes here, so one trial build gives the
+                # overhead exactly.
+                trial = build_long_header(
+                    template,
+                    payload_length=pad_datagram_to,
+                    packet_number=packet_number,
+                    packet_number_length=pn_length,
+                )
+                padding = pad_datagram_to - len(trial) - len(payload) - AEAD_TAG_LENGTH
+                if padding > 0:
+                    payload += bytes(padding)  # PADDING frames (§19.1)
             header = build_long_header(
                 template,
                 payload_length=len(payload) + AEAD_TAG_LENGTH,
@@ -742,12 +780,22 @@ class Connection:
 
     # --- termination (§10) ----------------------------------------------------
 
-    def close(self, error_code: int = frames.NO_ERROR, reason: str = "") -> None:
-        """Begin an immediate close (§10.2)."""
+    def close(
+        self,
+        error_code: int = frames.NO_ERROR,
+        reason: str = "",
+        frame_type: int | None = None,
+    ) -> None:
+        """Begin an immediate close (§10.2).
+
+        ``frame_type`` None sends the application variant (0x1d); an
+        integer sends the transport variant (0x1c) naming the frame at
+        fault, which is what a detected transport error uses.
+        """
         if self.state in (ConnectionState.CLOSING, ConnectionState.DRAINING):
             return
         self._close_frame = ConnectionClose(
-            error_code=error_code, reason=reason.encode("utf-8"), frame_type=None
+            error_code=error_code, reason=reason.encode("utf-8"), frame_type=frame_type
         )
         self.state = ConnectionState.CLOSING
 

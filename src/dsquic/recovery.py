@@ -128,11 +128,17 @@ class LossDetection:
         self._max_ack_delay = max_ack_delay
         self._pto_count = 0
         self._spaces = {level: _Space() for level in EncryptionLevel}
+        # When an ack-eliciting packet was last sent in each space. Kept
+        # after those packets are acknowledged, because the anti-deadlock
+        # PTO of §6.2.2.1 arms relative to it with nothing in flight.
+        self._last_ack_eliciting_sent: dict[EncryptionLevel, float] = {}
 
     def on_packet_sent(self, packet: SentPacket) -> None:
         space = self._spaces[packet.level]
         space.sent[packet.packet_number] = packet
         space.largest_sent = max(space.largest_sent, packet.packet_number)
+        if packet.ack_eliciting:
+            self._last_ack_eliciting_sent[packet.level] = packet.time_sent
         self.controller.on_packet_sent(packet)
 
     def on_ack_received(
@@ -241,10 +247,12 @@ class LossDetection:
             for level, space in self._spaces.items()
             if space.loss_time is not None and not space.discarded
         ]
-        return min(candidates) if candidates else None
+        # Compare on time only: equal deadlines are common with a real
+        # clock, and EncryptionLevel is deliberately not orderable.
+        return min(candidates, key=lambda item: item[0]) if candidates else None
 
     def _earliest_pto(self) -> tuple[float, EncryptionLevel] | None:
-        candidates = []
+        candidates: list[tuple[float, EncryptionLevel]] = []
         for level, space in self._spaces.items():
             if space.discarded:
                 continue
@@ -255,7 +263,7 @@ class LossDetection:
                 continue
             last_sent = max(packet.time_sent for packet in eliciting)
             candidates.append((last_sent + self._pto_duration(level), level))
-        return min(candidates) if candidates else None
+        return min(candidates, key=lambda item: item[0]) if candidates else None
 
     def loss_detection_timeout(self) -> float | None:
         """When the connection must call on_loss_detection_timeout (A.8).
@@ -276,16 +284,22 @@ class LossDetection:
             return self._anti_deadlock_pto()
         return None
 
-    def _anti_deadlock_pto(self) -> float:
+    def _anti_deadlock_pto(self) -> float | None:
+        """§6.2.2.1: a client arms a PTO even with nothing in flight, so a
+        lost server flight cannot deadlock the handshake.
+
+        The timer runs from the last ack-eliciting packet this client
+        actually sent, which is not the same as what is still in flight:
+        those packets may all have been acknowledged.
+        """
         level = (
             EncryptionLevel.INITIAL
             if not self._spaces[EncryptionLevel.INITIAL].discarded
             else EncryptionLevel.HANDSHAKE
         )
-        last_sent = max(
-            (packet.time_sent for packet in self._spaces[level].sent.values()),
-            default=0.0,
-        )
+        last_sent = self._last_ack_eliciting_sent.get(level)
+        if last_sent is None:
+            return None  # nothing sent at this level yet; nothing to probe
         return last_sent + self._pto_duration(level)
 
     def on_loss_detection_timeout(self, now: float) -> TimeoutOutcome:
@@ -298,6 +312,7 @@ class LossDetection:
         pto = self._earliest_pto()
         if pto is not None:
             return TimeoutOutcome(lost=[], probe_level=pto[1])
+        # Nothing in flight: this is the §6.2.2.1 anti-deadlock probe.
         level = (
             EncryptionLevel.INITIAL
             if not self._spaces[EncryptionLevel.INITIAL].discarded

@@ -5,3 +5,90 @@ are the only code in the package permitted to touch sockets, files, and
 the clock. They drive the protocol core in connection.py and contain no
 protocol logic.
 """
+
+import os
+import selectors
+import socket
+import time
+from collections.abc import Callable
+from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.x509 import Certificate, load_pem_x509_certificate
+
+from dsquic.connection import Connection
+
+MAX_DATAGRAM_RECV = 65536
+PEM_CERTIFICATE_MARKER = b"-----BEGIN CERTIFICATE-----"
+
+
+def split_pem_chain(data: bytes) -> list[Certificate]:
+    """Parse a PEM bundle into certificates, in file order."""
+    blocks = data.split(PEM_CERTIFICATE_MARKER)[1:]
+    return [load_pem_x509_certificate(PEM_CERTIFICATE_MARKER + block) for block in blocks]
+
+
+def load_pem_certificates(path: Path) -> list[bytes]:
+    """Read a PEM file as DER bytes, the form the core works in.
+
+    The core speaks DER because that is what the wire carries; PEM is a
+    file format, so it is converted here at the I/O boundary.
+    """
+    return [
+        certificate.public_bytes(serialization.Encoding.DER)
+        for certificate in split_pem_chain(path.read_bytes())
+    ]
+
+
+def keylog_writer() -> Callable[[str], None] | None:
+    """Append NSS Key Log Format lines to $SSLKEYLOGFILE, if set.
+
+    The same contract Wireshark and the QUIC Interop Runner expect: one
+    line per secret, appended as it becomes available and flushed so a
+    live capture can be decrypted while the connection runs.
+    """
+    path = os.environ.get("SSLKEYLOGFILE")
+    if not path:
+        return None
+    handle = open(path, "a", encoding="ascii")
+
+    def write(line: str) -> None:
+        handle.write(line + "\n")
+        handle.flush()
+
+    return write
+
+
+def pump(
+    connection: Connection,
+    sock: socket.socket,
+    selector: selectors.BaseSelector,
+    deadline: float | None = None,
+) -> None:
+    """Run one I/O step: send what is due, then wait for a packet or timer.
+
+    The whole event loop of an endpoint. The core decides *what* to send
+    and *when* to wake up; this decides only how the bytes move.
+    """
+    now = time.monotonic()
+    for datagram in connection.datagrams_to_send(now):
+        # The core keeps destinations opaque so a connection can be
+        # tunnelled; a socket endpoint knows they are addresses.
+        if isinstance(datagram.destination, tuple):
+            sock.sendto(datagram.data, datagram.destination)
+
+    timer = connection.next_timer()
+    timeouts = [value for value in (timer, deadline) if value is not None]
+    wait = min(timeouts) - time.monotonic() if timeouts else None
+    if wait is not None and wait < 0:
+        wait = 0
+    for key, _ in selector.select(timeout=wait):
+        readable: socket.socket = key.fileobj  # type: ignore[assignment]
+        while True:
+            try:
+                data, source = readable.recvfrom(MAX_DATAGRAM_RECV)
+            except BlockingIOError:
+                break
+            connection.datagram_received(data, time.monotonic(), source=source)
+
+    connection.handle_timer(time.monotonic())

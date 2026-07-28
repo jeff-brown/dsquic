@@ -179,11 +179,21 @@ class TestPto:
 
     def test_client_anti_deadlock_pto(self) -> None:
         detector = LossDetection(NewReno(), is_client=True)
-        # Handshake not confirmed, nothing in flight: a client still arms
-        # a PTO so lost server flights cannot deadlock it (§6.2.2.1).
-        assert detector.loss_detection_timeout() is not None
-        outcome = detector.on_loss_detection_timeout(1.0)
+        send(detector, 0, time_sent=1000.0, level=EncryptionLevel.INITIAL)
+        detector.on_ack_received(EncryptionLevel.INITIAL, ack([(0, 0)]), ack_delay=0, now=1000.1)
+        # Handshake not confirmed and nothing in flight, but the client
+        # still arms a PTO so a lost server flight cannot deadlock it
+        # (§6.2.2.1). The timer runs from the last ack-eliciting packet
+        # sent, not from zero.
+        timeout = detector.loss_detection_timeout()
+        assert timeout is not None
+        assert timeout > 1000.0
+        outcome = detector.on_loss_detection_timeout(timeout)
         assert outcome.probe_level is EncryptionLevel.INITIAL
+
+    def test_no_anti_deadlock_pto_before_anything_is_sent(self) -> None:
+        detector = LossDetection(NewReno(), is_client=True)
+        assert detector.loss_detection_timeout() is None
 
     def test_no_app_pto_before_handshake_confirmed(self) -> None:
         detector = LossDetection(NewReno(), is_client=False)
