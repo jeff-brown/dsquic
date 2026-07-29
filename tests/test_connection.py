@@ -143,8 +143,8 @@ class TestHandshake:
     def test_initial_and_handshake_keys_discarded(self, credentials: Credentials) -> None:
         client, server, _ = handshake(credentials)
         for connection in (client, server):
-            assert connection._spaces[EncryptionLevel.INITIAL].discarded
-            assert connection._spaces[EncryptionLevel.HANDSHAKE].discarded
+            assert connection.keys_discarded(EncryptionLevel.INITIAL)
+            assert connection.keys_discarded(EncryptionLevel.HANDSHAKE)
 
     def test_keylog_emitted(self, credentials: Credentials) -> None:
         lines: list[str] = []

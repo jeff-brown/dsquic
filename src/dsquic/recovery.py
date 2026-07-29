@@ -153,7 +153,7 @@ class LossDetection:
         if ack.largest > space.largest_sent:
             raise AckOfUnsentPacket(f"ACK for unsent packet {ack.largest} at {level.name}")
 
-        newly_acked = []
+        newly_acked: list[SentPacket] = []
         for low, high in ack.ranges:
             for packet_number in list(space.sent):
                 if low <= packet_number <= high:
@@ -194,7 +194,7 @@ class LossDetection:
         # floored at timer granularity.
         loss_delay = max(TIME_THRESHOLD * max(self.rtt.latest, self.rtt.smoothed), GRANULARITY)
         lost_before = now - loss_delay
-        lost = []
+        lost: list[SentPacket] = []
         for packet_number in sorted(space.sent):
             packet = space.sent[packet_number]
             if packet_number > space.largest_acked:

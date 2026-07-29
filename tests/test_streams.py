@@ -1,5 +1,7 @@
 """Tests for dsquic.streams."""
 
+from dataclasses import replace
+
 import pytest
 
 from dsquic.frames import (
@@ -33,11 +35,8 @@ GENEROUS = FlowControlLimits(
 
 
 def make_manager(is_client: bool = True, **overrides: int) -> StreamManager:
-    local = GENEROUS
-    peer = GENEROUS
-    if overrides:
-        peer = FlowControlLimits(**{**GENEROUS.__dict__, **overrides})
-    return StreamManager(is_client=is_client, local=local, peer=peer)
+    peer = replace(GENEROUS, **overrides) if overrides else GENEROUS
+    return StreamManager(is_client=is_client, local=GENEROUS, peer=peer)
 
 
 class TestStreamIds:
@@ -91,9 +90,11 @@ class TestSendStream:
         states = [stream.state]
         stream.write(b"hello", fin=True)
         frame = stream.next_frame(max_bytes=3, connection_credit=1000)
+        assert frame is not None
         assert frame == Stream(stream_id=0, offset=0, data=b"hel", fin=False)
         states.append(stream.state)
         fin_frame = stream.next_frame(max_bytes=100, connection_credit=1000)
+        assert fin_frame is not None
         assert fin_frame == Stream(stream_id=0, offset=3, data=b"lo", fin=True)
         states.append(stream.state)
         stream.on_frame_acked(frame)
@@ -220,7 +221,7 @@ class TestStreamManager:
         assert recv.read() == b"hi"
 
     def test_peer_exceeding_our_stream_limit(self) -> None:
-        local = FlowControlLimits(**{**GENEROUS.__dict__, "max_streams_bidi": 1})
+        local = replace(GENEROUS, max_streams_bidi=1)
         manager = StreamManager(is_client=False, local=local, peer=GENEROUS)
         manager.on_stream_frame(Stream(stream_id=0, offset=0, data=b"", fin=False))
         with pytest.raises(StreamError) as excinfo:
@@ -234,7 +235,7 @@ class TestStreamManager:
         assert excinfo.value.error_code == STREAM_STATE_ERROR
 
     def test_connection_flow_control_enforced(self) -> None:
-        local = FlowControlLimits(**{**GENEROUS.__dict__, "max_data": 10})
+        local = replace(GENEROUS, max_data=10)
         manager = StreamManager(is_client=False, local=local, peer=GENEROUS)
         manager.on_stream_frame(Stream(stream_id=0, offset=0, data=b"abcdef", fin=False))
         with pytest.raises(StreamError) as excinfo:
@@ -253,7 +254,7 @@ class TestStreamManager:
         assert more is not None and more.data == b"fgh"
 
     def test_max_data_update(self) -> None:
-        local = FlowControlLimits(**{**GENEROUS.__dict__, "max_data": 10})
+        local = replace(GENEROUS, max_data=10)
         manager = StreamManager(is_client=False, local=local, peer=GENEROUS)
         recv = manager.on_stream_frame(Stream(stream_id=0, offset=0, data=b"abcdef", fin=False))
         assert manager.max_data_update() is None  # received but not yet read

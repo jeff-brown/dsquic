@@ -12,6 +12,7 @@ import socket
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509 import Certificate, load_pem_x509_certificate
@@ -20,6 +21,9 @@ from dsquic.connection import Connection
 
 MAX_DATAGRAM_RECV = 65536
 PEM_CERTIFICATE_MARKER = b"-----BEGIN CERTIFICATE-----"
+
+# What an opaque core destination is, once a socket endpoint owns it.
+Address = tuple[str, int] | None
 
 
 def split_pem_chain(data: bytes) -> list[Certificate]:
@@ -74,8 +78,9 @@ def pump(
     for datagram in connection.datagrams_to_send(now):
         # The core keeps destinations opaque so a connection can be
         # tunnelled; a socket endpoint knows they are addresses.
-        if isinstance(datagram.destination, tuple):
-            sock.sendto(datagram.data, datagram.destination)
+        destination = cast("Address", datagram.destination)
+        if destination is not None:
+            sock.sendto(datagram.data, destination)
 
     timer = connection.next_timer()
     timeouts = [value for value in (timer, deadline) if value is not None]

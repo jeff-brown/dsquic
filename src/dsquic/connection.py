@@ -24,7 +24,7 @@ for those features are parsed and ignored where the spec permits.
 import enum
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from cryptography.exceptions import InvalidTag
 
@@ -224,12 +224,7 @@ class Connection:
             if client_config is None:
                 raise ValueError("client_config is required for a client connection")
             self.tls = TlsClient(
-                ClientConfig(
-                    **{
-                        **client_config.__dict__,
-                        "transport_parameters": self._local_parameters.encode(),
-                    }
-                ),
+                replace(client_config, transport_parameters=self._local_parameters.encode()),
                 keylog=self.config.keylog,
             )
         elif server_config is None:
@@ -323,26 +318,27 @@ class Connection:
         """Unprotect and handle one packet; returns bytes consumed."""
         try:
             if data[0] & 0x80:
-                header = parse_long_header(data)
+                long_header = parse_long_header(data)
                 level = {
                     PacketType.INITIAL: EncryptionLevel.INITIAL,
                     PacketType.HANDSHAKE: EncryptionLevel.HANDSHAKE,
-                }.get(header.packet_type)
+                }.get(long_header.packet_type)
                 if level is None:
                     return 0  # 0-RTT: not supported, stop parsing this datagram
-                packet_end = header.pn_offset + header.length
+                pn_offset = long_header.pn_offset
+                packet_end = long_header.pn_offset + long_header.length
+                packet = data[:packet_end]
                 if not self.is_client and level is EncryptionLevel.INITIAL:
-                    self._adopt_client_initial(header.destination_cid, header.source_cid)
+                    self._adopt_client_initial(long_header.destination_cid, long_header.source_cid)
                 elif self.is_client and not self._peer_cid_confirmed:
                     # §7.2: the client switches to the server's chosen
                     # source connection ID from its first server packet.
-                    self.peer_cid = header.source_cid
+                    self.peer_cid = long_header.source_cid
                     self._peer_cid_confirmed = True
-                packet = data[:packet_end]
             else:
-                short = parse_short_header(data, len(self.host_cid))
+                # §17.3: a short header packet runs to the end of the datagram.
                 level = EncryptionLevel.ONE_RTT
-                header = None
+                pn_offset = parse_short_header(data, len(self.host_cid)).pn_offset
                 packet = data
                 packet_end = len(data)
         except (HeaderParseError, BufferReadError, UnsupportedVersion):
@@ -351,7 +347,6 @@ class Connection:
         space = self._spaces[level]
         if space.keys_recv is None or space.discarded:
             return packet_end  # no keys yet: drop, keep parsing the datagram
-        pn_offset = header.pn_offset if header is not None else short.pn_offset
         try:
             packet_number, payload = unprotect(
                 space.keys_recv, packet, pn_offset, space.largest_received
@@ -374,13 +369,12 @@ class Connection:
     def _parameters_for(self, initial_dcid: bytes) -> TransportParameters:
         """Our transport parameters, including the §7.3 connection ID
         authentication fields."""
-        values = {
-            **self.config.transport_parameters.__dict__,
-            "initial_source_connection_id": self.host_cid,
-        }
-        if not self.is_client:
-            values["original_destination_connection_id"] = initial_dcid
-        return TransportParameters(**values)
+        parameters = replace(
+            self.config.transport_parameters, initial_source_connection_id=self.host_cid
+        )
+        if self.is_client:
+            return parameters
+        return replace(parameters, original_destination_connection_id=initial_dcid)
 
     def _adopt_client_initial(self, dcid: bytes, scid: bytes) -> None:
         """A server learns both connection IDs from the client's first
@@ -391,11 +385,9 @@ class Connection:
             self._initial_dcid = dcid
             self._local_parameters = self._parameters_for(dcid)
             self.tls = TlsServer(
-                ServerConfig(
-                    **{
-                        **self._server_config.__dict__,
-                        "transport_parameters": self._local_parameters.encode(),
-                    }
+                replace(
+                    self._server_config,
+                    transport_parameters=self._local_parameters.encode(),
                 ),
                 keylog=self.config.keylog,
             )
@@ -520,7 +512,7 @@ class Connection:
                 self._spaces[event.level].crypto_pending += event.data
             elif isinstance(event, SecretAvailable):
                 self._on_secret(event)
-            elif isinstance(event, HandshakeComplete):
+            else:
                 self._on_handshake_complete(event, now)
 
     def _on_handshake_complete(self, event: HandshakeComplete, now: float) -> None:
@@ -920,3 +912,7 @@ class Connection:
     def take_events(self) -> list[ConnectionEvent]:
         events, self._events = self._events, []
         return events
+
+    def keys_discarded(self, level: EncryptionLevel) -> bool:
+        """Whether a packet number space has been retired (RFC 9001 §4.9)."""
+        return self._spaces[level].discarded

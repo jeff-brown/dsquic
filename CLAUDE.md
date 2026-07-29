@@ -11,8 +11,10 @@ Everything runs through uv:
 - `uv run pytest -q` (tests)
 - `uv run ruff check` and `uv run ruff format` (lint, format)
 - `uv run mypy` (strict type check, src and tests)
+- `uv run pyright` (strict type check; the engine behind Pylance, so it
+  catches what the editor shows)
 
-All three must pass before any change is considered done. Run them as separate
+All four must pass before any change is considered done. Run them as separate
 commands, not one `&&` chain.
 
 ## Priorities (in order)
@@ -93,12 +95,14 @@ it exists to teach QUIC.
   validation may be extracted into a named, cited validator. Review test: if
   handling it can only raise, it may be extracted; if it changes what happens
   next, it stays inline.
-- Strict typing. mypy strict must pass; fully annotate all defs, including
-  tests. Annotate empty container initializations (`x: list[T] = []`) and
-  parameterize dataclass factories (`field(default_factory=list[T])`);
-  mypy infers them but Pylance reports them as Unknown, and both checkers
-  must be clean. No `Any` unless forced by a third-party boundary; no bare
-  `# type: ignore` (always `# type: ignore[code]`).
+- Strict typing. mypy strict and pyright strict must both pass; fully
+  annotate all defs, including tests. Annotate empty container
+  initializations (`x: list[T] = []`) and parameterize dataclass factories
+  (`field(default_factory=list[T])`): mypy infers them, pyright reports
+  them as Unknown. Copy frozen dataclasses with `dataclasses.replace()`,
+  never `Type(**{**old.__dict__, ...})`, which erases types. No `Any`
+  unless forced by a third-party boundary; no bare `# type: ignore`
+  (always `# type: ignore[code]`).
 
 ## Layout conventions
 

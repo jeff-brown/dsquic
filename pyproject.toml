@@ -28,6 +28,7 @@ Repository = "https://github.com/jeff-brown/dsquic"
 [dependency-groups]
 dev = [
     "mypy>=1.10",
+    "pyright>=1.1.380",
     "pytest>=8",
     "ruff>=0.5",
 ]

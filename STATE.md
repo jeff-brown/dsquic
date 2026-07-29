@@ -17,9 +17,11 @@ ClientHello with SNI example.com dissected). Throwaway gate artifacts
 client_initial.{bin,hex,pcap} may remain untracked in the repo root;
 safe to delete.
 
-- Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy over
+- Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy and
+  strict pyright (the Pylance engine; config in pyrightconfig.json) over
   src and tests, pytest. All checks pass: `uv run pytest -q`,
-  `uv run ruff check`, `uv run ruff format --check .`, `uv run mypy`.
+  `uv run ruff check`, `uv run ruff format --check .`, `uv run mypy`,
+  `uv run pyright`.
 - Layout: flat sans-IO modules under `src/dsquic/` (buffer, packet, frames,
   streams, connection, tls, protection, recovery, congestion, new_reno, h3,
   qpack, masque, hq, qlog), each a docstring stub with RFC mapping, plus
