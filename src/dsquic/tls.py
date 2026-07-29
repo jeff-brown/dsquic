@@ -26,11 +26,18 @@ SSLKEYLOGFILE so wire captures can be decrypted.
 Contents: the message codecs (RFC 8446 §4) and key schedule (§7.1),
 verified against the RFC 8448 simple 1-RTT trace; the TlsClient and
 TlsServer handshake state machines (states per RFC 8446 Appendix A);
-CertificateVerify signing and verification; certificate policy on the
-client (chain to configured anchors plus RFC 9525 hostname matching,
-delegated to cryptography's verifier, with an explicit insecure flag);
-and the NSS-format keylog callback. Unknown extensions are preserved on
-parse and ignored, never rejected (grease tolerance, RFC 8701).
+HelloRetryRequest on both sides (§4.1.4) with the message_hash
+transcript substitution (§4.4.1); CertificateVerify signing and
+verification; certificate policy on the client (chain to configured
+anchors plus RFC 9525 hostname matching, delegated to cryptography's
+verifier, with an explicit insecure flag); and the NSS-format keylog
+callback. Unknown extensions are preserved on parse and ignored, never
+rejected (grease tolerance, RFC 8701).
+
+One key exchange group, x25519. That is enough to interoperate, because
+peers offering post-quantum groups also offer classical ones; when such a
+peer sends no x25519 share, the server asks for one with a
+HelloRetryRequest rather than failing.
 """
 
 import datetime
@@ -60,6 +67,9 @@ SHA256_LENGTH = 32
 
 RSA_PSS_RSAE_SHA256 = 0x0804
 ECDSA_SECP256R1_SHA256 = 0x0403
+
+MESSAGE_HASH_TYPE = 254  # §4.4.1, the HelloRetryRequest transcript stand-in
+SUPPORTED_GROUPS = [X25519_GROUP]  # groups this implementation can key with
 
 
 class HandshakeType(enum.IntEnum):
@@ -147,6 +157,21 @@ class KeySchedule:
 
     def transcript_hash(self) -> bytes:
         return self._transcript.copy().finalize()
+
+    def replace_transcript_with_message_hash(self) -> None:
+        """Substitute ClientHello1 with a synthetic message (§4.4.1).
+
+        After a HelloRetryRequest the transcript is not the messages as
+        sent: the first ClientHello is replaced by a ``message_hash``
+        handshake message (type 254) carrying its hash, so the second
+        ClientHello hashes over a fixed-size stand-in rather than the
+        original bytes. Every secret downstream depends on getting this
+        right, which is why it is done in one place.
+        """
+        digest = self.transcript_hash()
+        self._transcript = hashes.Hash(hashes.SHA256())
+        synthetic = bytes([MESSAGE_HASH_TYPE]) + len(digest).to_bytes(3, "big") + digest
+        self._transcript.update(synthetic)
 
     def _derive(self, label: bytes) -> bytes:
         return hkdf_expand_label(self._secret, label, self.transcript_hash(), SHA256_LENGTH)
@@ -513,6 +538,11 @@ class ClientConfig:
     ca_certificates: list[bytes] = field(default_factory=list[bytes])
     insecure_skip_verify: bool = False
     verification_time: datetime.datetime | None = None
+    # Which offered groups to send a key share for. None means all of
+    # them. A client may deliberately offer groups without shares to keep
+    # the ClientHello small, accepting a HelloRetryRequest round trip in
+    # exchange; an empty list does that for every group.
+    key_share_groups: list[int] | None = None
 
     def __post_init__(self) -> None:
         if not self.insecure_skip_verify and not self.ca_certificates:
@@ -545,6 +575,7 @@ class ServerState(enum.Enum):
     """RFC 8446 Appendix A.2, restricted likewise."""
 
     START = enum.auto()
+    WAIT_SECOND_CLIENT_HELLO = enum.auto()  # a HelloRetryRequest is outstanding
     WAIT_FINISHED = enum.auto()
     CONNECTED = enum.auto()
 
@@ -567,6 +598,10 @@ CLIENT_EXPECTS: dict[ClientState, tuple[HandshakeType, EncryptionLevel]] = {
 
 SERVER_EXPECTS: dict[ServerState, tuple[HandshakeType, EncryptionLevel]] = {
     ServerState.START: (HandshakeType.CLIENT_HELLO, EncryptionLevel.INITIAL),
+    ServerState.WAIT_SECOND_CLIENT_HELLO: (
+        HandshakeType.CLIENT_HELLO,
+        EncryptionLevel.INITIAL,
+    ),
     ServerState.WAIT_FINISHED: (HandshakeType.FINISHED, EncryptionLevel.HANDSHAKE),
 }
 
@@ -588,15 +623,16 @@ def _find_extension(extensions: list[Extension], ext_type: int) -> bytes | None:
     return None
 
 
-def _key_share_entry(public_key: bytes) -> bytes:
-    return X25519_GROUP.to_bytes(2, "big") + _vec(2, public_key)
+def _key_share_entry(group: int, public_key: bytes) -> bytes:
+    return group.to_bytes(2, "big") + _vec(2, public_key)
 
 
-def _parse_key_share_entry(data: bytes) -> bytes:
+def _parse_key_share_entry(data: bytes) -> tuple[int, bytes]:
     buf = Buffer(data)
-    if buf.pull_uint16() != X25519_GROUP:
-        raise TlsAlert(ILLEGAL_PARAMETER, "key_share group is not x25519")
-    return buf.pull_bytes(buf.pull_uint16())
+    group = buf.pull_uint16()
+    if group not in SUPPORTED_GROUPS:
+        raise TlsAlert(ILLEGAL_PARAMETER, f"key_share group {group:#06x} is not supported")
+    return group, buf.pull_bytes(buf.pull_uint16())
 
 
 def _client_key_share(entries: bytes) -> bytes | None:
@@ -608,6 +644,15 @@ def _client_key_share(entries: bytes) -> bytes | None:
         if group == X25519_GROUP:
             return public_key
     return None
+
+
+def _parse_supported_groups(data: bytes) -> list[int]:
+    """The groups a peer will accept, in preference order (§4.2.7)."""
+    block = Buffer(Buffer(data).pull_bytes(int.from_bytes(data[:2], "big") + 2)[2:])
+    groups: list[int] = []
+    while not block.is_empty:
+        groups.append(block.pull_uint16())
+    return groups
 
 
 def _alpn_extension(protocols: list[str]) -> bytes:
@@ -760,15 +805,28 @@ class TlsClient(_Handshake):
         self._config = config
         self._random = random if random is not None else os.urandom(32)
         self._client_random = self._random
-        self._key = key if key is not None else X25519PrivateKey.generate()
+        share_groups = (
+            SUPPORTED_GROUPS if config.key_share_groups is None else config.key_share_groups
+        )
+        self._keys: dict[int, X25519PrivateKey] = {
+            group: (key if key is not None else X25519PrivateKey.generate())
+            for group in share_groups
+        }
+        self._hello_retried = False
         self._leaf_certificate = b""
         self._alpn = ""
         self._peer_transport_parameters = b""
         self.state = ClientState.START
 
-    def start(self) -> None:
-        """Send the ClientHello (RFC 8446 §4.1.2) at the Initial level."""
-        hello = ClientHello(
+    def _build_client_hello(self) -> ClientHello:
+        """RFC 8446 §4.1.2. Sent again unchanged except for key_share if
+        the server answers with a HelloRetryRequest (§4.1.4)."""
+        shares = b"".join(
+            _key_share_entry(group, key.public_key().public_bytes_raw())
+            for group, key in self._keys.items()
+        )
+        groups = b"".join(group.to_bytes(2, "big") for group in SUPPORTED_GROUPS)
+        return ClientHello(
             random=self._random,
             legacy_session_id=b"",  # QUIC has no middlebox compatibility mode (RFC 9001 §8.4)
             cipher_suites=[TLS_AES_128_GCM_SHA256],
@@ -777,7 +835,7 @@ class TlsClient(_Handshake):
                     ExtensionType.SERVER_NAME,
                     _vec(2, b"\x00" + _vec(2, self._config.server_name.encode("ascii"))),
                 ),
-                Extension(ExtensionType.SUPPORTED_GROUPS, _vec(2, X25519_GROUP.to_bytes(2, "big"))),
+                Extension(ExtensionType.SUPPORTED_GROUPS, _vec(2, groups)),
                 Extension(
                     ExtensionType.SIGNATURE_ALGORITHMS,
                     _vec(
@@ -788,18 +846,47 @@ class TlsClient(_Handshake):
                 ),
                 Extension(ExtensionType.ALPN, _alpn_extension(self._config.alpn)),
                 Extension(ExtensionType.SUPPORTED_VERSIONS, _vec(1, TLS_1_3.to_bytes(2, "big"))),
-                Extension(
-                    ExtensionType.KEY_SHARE,
-                    _vec(2, _key_share_entry(self._key.public_key().public_bytes_raw())),
-                ),
+                Extension(ExtensionType.KEY_SHARE, _vec(2, shares)),
                 Extension(
                     ExtensionType.QUIC_TRANSPORT_PARAMETERS, self._config.transport_parameters
                 ),
             ],
         )
-        raw = encode_client_hello(hello)
+
+    def start(self) -> None:
+        """Send the ClientHello at the Initial level."""
+        raw = encode_client_hello(self._build_client_hello())
         self.schedule.update_transcript(raw)
         self.events.append(SendData(EncryptionLevel.INITIAL, raw))
+        self.state = ClientState.WAIT_SERVER_HELLO
+
+    def _on_hello_retry_request(self, hello: ServerHello, raw: bytes) -> None:
+        """Generate the requested key share and send a second ClientHello.
+
+        RFC 8446 §4.1.4. Exactly one retry is permitted, the requested
+        group must be one we offered, and it must differ from a share we
+        already sent, since a retry that changes nothing is a loop.
+        """
+        if self._hello_retried:
+            raise TlsAlert(UNEXPECTED_MESSAGE, "second HelloRetryRequest")
+        # §4.1.4: the retry's key_share carries a NamedGroup and nothing else.
+        selected_group_length = 2
+        key_share = _find_extension(hello.extensions, ExtensionType.KEY_SHARE)
+        if key_share is None or len(key_share) != selected_group_length:
+            raise TlsAlert(MISSING_EXTENSION, "HelloRetryRequest has no selected group")
+        group = int.from_bytes(key_share, "big")
+        if group not in SUPPORTED_GROUPS:
+            raise TlsAlert(ILLEGAL_PARAMETER, f"HelloRetryRequest group {group:#06x} not offered")
+        if group in self._keys:
+            raise TlsAlert(ILLEGAL_PARAMETER, "HelloRetryRequest asks for a group already shared")
+        self._hello_retried = True
+        # §4.4.1: ClientHello1 becomes a message_hash before the retry.
+        self.schedule.replace_transcript_with_message_hash()
+        self.schedule.update_transcript(raw)
+        self._keys = {group: X25519PrivateKey.generate()}
+        retry = encode_client_hello(self._build_client_hello())
+        self.schedule.update_transcript(retry)
+        self.events.append(SendData(EncryptionLevel.INITIAL, retry))
         self.state = ClientState.WAIT_SERVER_HELLO
 
     def _handle(self, level: EncryptionLevel, message: HandshakeMessage, raw: bytes) -> None:
@@ -821,7 +908,8 @@ class TlsClient(_Handshake):
 
     def _on_server_hello(self, hello: ServerHello, raw: bytes) -> None:
         if hello.random == HELLO_RETRY_REQUEST_RANDOM:
-            raise TlsAlert(HANDSHAKE_FAILURE, "HelloRetryRequest not supported")
+            self._on_hello_retry_request(hello, raw)
+            return
         if hello.legacy_session_id_echo != b"":
             raise TlsAlert(ILLEGAL_PARAMETER, "session id echo is not empty")
         if hello.cipher_suite != TLS_AES_128_GCM_SHA256:
@@ -832,9 +920,12 @@ class TlsClient(_Handshake):
         key_share = _find_extension(hello.extensions, ExtensionType.KEY_SHARE)
         if key_share is None:
             raise TlsAlert(MISSING_EXTENSION, "ServerHello has no key_share")
-        peer_public = _parse_key_share_entry(key_share)
+        group, peer_public = _parse_key_share_entry(key_share)
+        our_key = self._keys.get(group)
+        if our_key is None:
+            raise TlsAlert(ILLEGAL_PARAMETER, f"server chose group {group:#06x} with no share")
         self.schedule.update_transcript(raw)
-        shared = self._key.exchange(X25519PublicKey.from_public_bytes(peer_public))
+        shared = our_key.exchange(X25519PublicKey.from_public_bytes(peer_public))
         self._emit_handshake_secrets(shared)
         self.state = ClientState.WAIT_ENCRYPTED_EXTENSIONS
 
@@ -919,6 +1010,7 @@ class TlsServer(_Handshake):
         self._config = config
         self._random = random if random is not None else os.urandom(32)
         self._key = key if key is not None else X25519PrivateKey.generate()
+        self._hello_retry_sent = False
         self._alpn = ""
         self._client_transport_parameters = b""
         self.state = ServerState.START
@@ -940,6 +1032,34 @@ class TlsServer(_Handshake):
                 return protocol
         raise TlsAlert(NO_APPLICATION_PROTOCOL, "no ALPN protocol in common")
 
+    def _send_hello_retry_request(self, hello: ClientHello, raw: bytes, group: int) -> None:
+        """Ask the client to retry with a key share for ``group`` (§4.1.4).
+
+        A HelloRetryRequest is a ServerHello carrying the reserved random
+        and a key_share holding only the selected group. Only one may be
+        sent per connection, and the transcript substitutes a
+        message_hash for the first ClientHello (§4.4.1).
+        """
+        if self._hello_retry_sent:
+            raise TlsAlert(HANDSHAKE_FAILURE, "client retried without a usable key share")
+        self._hello_retry_sent = True
+        self.schedule.update_transcript(raw)
+        self.schedule.replace_transcript_with_message_hash()
+        retry = encode_server_hello(
+            ServerHello(
+                random=HELLO_RETRY_REQUEST_RANDOM,
+                legacy_session_id_echo=hello.legacy_session_id,
+                cipher_suite=TLS_AES_128_GCM_SHA256,
+                extensions=[
+                    Extension(ExtensionType.SUPPORTED_VERSIONS, TLS_1_3.to_bytes(2, "big")),
+                    Extension(ExtensionType.KEY_SHARE, group.to_bytes(2, "big")),
+                ],
+            )
+        )
+        self.schedule.update_transcript(retry)
+        self.events.append(SendData(EncryptionLevel.INITIAL, retry))
+        self.state = ServerState.WAIT_SECOND_CLIENT_HELLO
+
     def _on_client_hello(self, hello: ClientHello, raw: bytes) -> None:
         if TLS_AES_128_GCM_SHA256 not in hello.cipher_suites:
             raise TlsAlert(HANDSHAKE_FAILURE, "client did not offer TLS_AES_128_GCM_SHA256")
@@ -949,8 +1069,18 @@ class TlsServer(_Handshake):
         key_share = _find_extension(hello.extensions, ExtensionType.KEY_SHARE)
         peer_public = _client_key_share(key_share) if key_share is not None else None
         if peer_public is None:
-            # A HelloRetryRequest could ask for x25519; out of scope.
-            raise TlsAlert(HANDSHAKE_FAILURE, "client offered no x25519 key share")
+            # No usable share. If the client would nevertheless accept a
+            # group we support, ask for it rather than giving up (§4.1.4).
+            # This is the common case against clients that offer a
+            # post-quantum group and keep their ClientHello small by
+            # sending fewer shares than groups.
+            groups_data = _find_extension(hello.extensions, ExtensionType.SUPPORTED_GROUPS)
+            offered = _parse_supported_groups(groups_data) if groups_data is not None else []
+            common = next((group for group in SUPPORTED_GROUPS if group in offered), None)
+            if common is None:
+                raise TlsAlert(HANDSHAKE_FAILURE, "no key exchange group in common")
+            self._send_hello_retry_request(hello, raw, common)
+            return
         client_transport_parameters = _find_extension(
             hello.extensions, ExtensionType.QUIC_TRANSPORT_PARAMETERS
         )
@@ -968,7 +1098,7 @@ class TlsServer(_Handshake):
                 Extension(ExtensionType.SUPPORTED_VERSIONS, TLS_1_3.to_bytes(2, "big")),
                 Extension(
                     ExtensionType.KEY_SHARE,
-                    _key_share_entry(self._key.public_key().public_bytes_raw()),
+                    _key_share_entry(X25519_GROUP, self._key.public_key().public_bytes_raw()),
                 ),
             ],
         )

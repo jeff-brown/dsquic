@@ -159,7 +159,14 @@ Wire into the runner's client/server interface early (a thin shim). Every milest
 
 `handshake` -> `transfer` -> `retry` -> `resumption` -> `multiplexing` -> `http3` -> `keyupdate` -> `ecn` -> `zerortt`
 
+HelloRetryRequest is not one of the runner's cases but is inserted after `transfer`, for the reason given below.
+
 Also note ECN validation is one of QUIC's more commonly botched corners: a trustworthy reference for correct ECN counting has value well beyond the pedagogical case.
+
+Added after the first interop run: **HelloRetryRequest, and the post-quantum ClientHello.** Go 1.24 and later enable the hybrid group `X25519MLKEM768` by default, so quic-go's ClientHello carries a 1258-byte key_share and runs 1506 bytes in total, spanning four CRYPTO frames across two datagrams. Chrome and Firefox default to the same group. Two consequences:
+
+- A multi-packet ClientHello is now ordinary traffic rather than an edge case. For QUIC's entire pre-PQ history a ClientHello fit in one Initial, which is why ignoring the CRYPTO frame offset was a bug that could survive every other form of testing. This is the strongest single argument for interop as a design input rather than a validation phase.
+- HelloRetryRequest is closer than the MVP scope assumed. Refusing it is safe while dsquic offers only x25519 as a client, and safe as a server against peers that speculatively send an x25519 share alongside their PQ one (quic-go does). A client offering *only* a PQ group would need an HRR from us and would fail. HelloRetryRequest therefore moves onto the roadmap ahead of the remaining interop cases, since it is a correctness gap against real deployed defaults rather than a missing feature.
 
 ### 6.2 Verification ladder
 

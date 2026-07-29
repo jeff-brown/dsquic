@@ -71,9 +71,7 @@ class TestQuicGoClientToDsquicServer:
     def test_transfer(
         self, credentials: PemCredentials, dsquic_server: int, tmp_path: Path
     ) -> None:
-        _, client_binary = peers()
         bodies = quicgo_fetch(
-            client_binary,
             dsquic_server,
             ["/index.html"],
             credentials,
@@ -84,12 +82,29 @@ class TestQuicGoClientToDsquicServer:
     def test_large_transfer(
         self, credentials: PemCredentials, dsquic_server: int, tmp_path: Path
     ) -> None:
-        _, client_binary = peers()
         bodies = quicgo_fetch(
-            client_binary,
             dsquic_server,
             ["/large.bin"],
             credentials,
             tmp_path / "downloads",
         )
         assert bodies["/large.bin"] == LARGE_BODY
+
+    def test_hello_retry_request(
+        self, credentials: PemCredentials, dsquic_server: int, tmp_path: Path
+    ) -> None:
+        """The peer offers x25519 but shares only P-256, so the server has
+        to ask for a usable share (RFC 8446 §4.1.4).
+
+        This is the shape post-quantum defaults produce in the field: a
+        client that lists classical groups without spending bytes on
+        shares for them.
+        """
+        bodies = quicgo_fetch(
+            dsquic_server,
+            ["/index.html"],
+            credentials,
+            tmp_path / "downloads",
+            force_hello_retry=True,
+        )
+        assert bodies == {"/index.html": INDEX_BODY}

@@ -11,11 +11,12 @@ directions, over real UDP. This is design.md §6.3 step 5, the recorded
 definition of MVP done.
 
 Interop verified against quic-go v0.61 and aioquic 1.3, each as both
-client and server, for a small file and a 77KB file.
+client and server, for a small file and a 77KB file, plus a
+HelloRetryRequest round trip driven by a real quic-go client.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  277 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  285 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -28,7 +29,8 @@ client and server, for a small file and a 77KB file.
 
 ## In-flight work
 
-None. Everything is committed and pushed.
+Staged, awaiting commit: the interop suite and the HelloRetryRequest
+implementation.
 
 ## What interop and the wire found that self-testing did not
 
@@ -45,18 +47,48 @@ Four bugs, each invisible while dsquic only talked to itself:
 - The §6.2.2.1 anti-deadlock PTO defaulted to time 0.0 with nothing in
   flight, firing immediately under a monotonic clock and putting a
   spurious PING on the wire.
+- HelloRetryRequest was refused outright, so a peer that offered x25519
+  without sending a share for it (the shape post-quantum defaults
+  produce) could not connect. Now implemented on both sides, verified by
+  a real quic-go client forced to prefer P-256.
 
 ## Next steps
 
-1. Interop Runner shim in `interop/`: Dockerfile plus `run_endpoint.sh`
-   honouring ROLE/TESTCASE/REQUESTS/WWW/DOWNLOADS/QLOGDIR/SSLKEYLOGFILE,
-   exiting 127 for unsupported test cases. Wraps the endpoints and adds
-   no endpoint logic.
-2. The roadmap past the MVP (design.md §6.1), in order: retry,
+1. **A connection table in the server endpoint**, keyed by destination
+   connection ID. `serve_one` handles one connection at a time; this is
+   also MASQUE nesting constraint 3 and the routing point an inner
+   tunnelled connection would use.
+2. **Interop Runner shim** in `interop/`: Dockerfile plus
+   `run_endpoint.sh` honouring
+   ROLE/TESTCASE/REQUESTS/WWW/DOWNLOADS/QLOGDIR/SSLKEYLOGFILE, exiting
+   127 for unsupported cases. Wraps the endpoints, adds no endpoint
+   logic. Buys validation against a dozen stacks per milestone.
+3. **The roadmap past the MVP** (design.md §6.1), in order: retry,
    resumption, multiplexing, http3, keyupdate, ecn, zerortt. Each climbs
    all three rungs of the ladder (design.md §6.2).
-3. `qlog.py`, which the design doc treats as first-class output and the
-   foundation of the inspection-engine story.
+4. **`qlog.py`**, which the design doc treats as first-class output and
+   the foundation of the inspection-engine story.
+
+## Wire comparison, five pairings (2026-07-29)
+
+Captured on loopback and decrypted via SSLKEYLOGFILE, with zero
+decryption failures in any trace: dsquic to aioquic, aioquic to dsquic,
+dsquic to quic-go, quic-go to dsquic, dsquic to dsquic. All five complete
+in 8 or 9 datagrams and 4.2 to 6.1 KB with the same phase structure.
+Observed divergences worth keeping:
+
+- ClientHello sizes: dsquic 210B (1 CRYPTO frame), aioquic 474B (1),
+  quic-go 1506B (4 frames over 2 datagrams) because of the PQ key_share.
+- Padding: dsquic and quic-go use PADDING frames inside a packet; aioquic
+  appends bytes after the packet, which Wireshark reports as "(Random)
+  padding data appended to the datagram". Both are legal; the frame form
+  is unambiguous, which is why we switched to it.
+- Datagram size: quic-go sends 1280-byte payloads, dsquic and aioquic
+  1200.
+- Frames peers send that we do not: NEW_CONNECTION_ID (aioquic,
+  quic-go), NEW_TOKEN and MAX_STREAMS (quic-go). All parsed and ignored,
+  which is why interop works and why building the full §19 vocabulary in
+  4a paid off.
 
 ## Standing constraints
 

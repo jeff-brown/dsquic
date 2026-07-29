@@ -23,6 +23,8 @@ func main() {
 	serverName := flag.String("server-name", "localhost", "SNI name")
 	outputDir := flag.String("output-dir", ".", "where to write bodies")
 	paths := flag.String("paths", "/index.html", "comma separated paths")
+	forceRetry := flag.Bool("force-hello-retry", false,
+		"prefer P-256 so the share does not match x25519, forcing a HelloRetryRequest")
 	flag.Parse()
 
 	pool := x509.NewCertPool()
@@ -38,11 +40,18 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, err := quic.DialAddr(ctx, *addr, &tls.Config{
+	tlsConf := &tls.Config{
 		RootCAs:    pool,
 		ServerName: *serverName,
 		NextProtos: []string{"hq-interop"},
-	}, nil)
+	}
+	if *forceRetry {
+		// Go sends a key share for its first preference only, so
+		// offering P-256 first while still listing x25519 produces a
+		// ClientHello with no x25519 share: the server must ask for one.
+		tlsConf.CurvePreferences = []tls.CurveID{tls.CurveP256, tls.X25519}
+	}
+	conn, err := quic.DialAddr(ctx, *addr, tlsConf, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "dial:", err)
 		os.Exit(1)

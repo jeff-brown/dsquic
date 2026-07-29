@@ -19,10 +19,15 @@ from dsquic.tls import (
     BAD_CERTIFICATE,
     DECRYPT_ERROR,
     ECDSA_SECP256R1_SHA256,
+    HANDSHAKE_FAILURE,
+    HELLO_RETRY_REQUEST_RANDOM,
+    ILLEGAL_PARAMETER,
     NO_APPLICATION_PROTOCOL,
     RSA_PSS_RSAE_SHA256,
+    TLS_1_3,
     TLS_AES_128_GCM_SHA256,
     UNEXPECTED_MESSAGE,
+    X25519_GROUP,
     Certificate,
     CertificateVerify,
     ClientConfig,
@@ -31,6 +36,7 @@ from dsquic.tls import (
     Direction,
     EncryptedExtensions,
     EncryptionLevel,
+    Extension,
     ExtensionType,
     Finished,
     HandshakeComplete,
@@ -485,6 +491,131 @@ def test_message_at_wrong_level_raises(credentials: Credentials) -> None:
     with pytest.raises(TlsAlert) as excinfo:
         server.receive(EncryptionLevel.HANDSHAKE, send.data)
     assert excinfo.value.alert == UNEXPECTED_MESSAGE
+
+
+class TestHelloRetryRequest:
+    """RFC 8446 §4.1.4 and §4.4.1.
+
+    Reachable in the field because Go, Chrome, and Firefox default to the
+    post-quantum group X25519MLKEM768: a client may offer classical
+    groups without spending 1.2KB on shares for them.
+    """
+
+    def make_withholding_client(self, credentials: Credentials) -> TlsClient:
+        config = ClientConfig(
+            server_name="localhost",
+            alpn=["hq-interop"],
+            transport_parameters=b"client-params",
+            ca_certificates=credentials.ca,
+            verification_time=VERIFICATION_TIME,
+            key_share_groups=[],  # offer groups, send no shares
+        )
+        return TlsClient(config)
+
+    def test_retry_completes_the_handshake(self, credentials: Credentials) -> None:
+        client = self.make_withholding_client(credentials)
+        server = make_server(credentials)
+        client_events, server_events = pump(client, server)
+        assert client.state is ClientState.CONNECTED
+        assert server.state is ServerState.CONNECTED
+        # The secrets still agree, which is the real test of the §4.4.1
+        # message_hash transcript substitution.
+        assert secrets_of(client_events) == secrets_of(server_events)
+
+    def test_retry_costs_one_extra_flight(self, credentials: Credentials) -> None:
+        retried = self.make_withholding_client(credentials)
+        retried_events, _ = pump(retried, make_server(credentials))
+        direct_events, _ = pump(make_client(credentials), make_server(credentials))
+        sent = [e for e in retried_events if isinstance(e, SendData)]
+        direct = [e for e in direct_events if isinstance(e, SendData)]
+        assert len(sent) == len(direct) + 1
+
+    def test_server_sends_a_real_hello_retry_request(self, credentials: Credentials) -> None:
+        client = self.make_withholding_client(credentials)
+        server = make_server(credentials)
+        client.start()
+        for event in client.take_events():
+            if isinstance(event, SendData):
+                server.receive(event.level, event.data)
+        first = next(e for e in server.take_events() if isinstance(e, SendData))
+        message, _ = parse_handshake_message(first.data)
+        assert isinstance(message, ServerHello)
+        assert message.random == HELLO_RETRY_REQUEST_RANDOM
+        key_share = next(e for e in message.extensions if e.type == ExtensionType.KEY_SHARE)
+        assert key_share.data == X25519_GROUP.to_bytes(2, "big")  # group only, no key
+        assert server.state is ServerState.WAIT_SECOND_CLIENT_HELLO
+
+    def test_no_common_group_is_a_handshake_failure(self, credentials: Credentials) -> None:
+        """A client offering only groups we cannot do gets no retry: a
+        HelloRetryRequest would not help."""
+        server = make_server(credentials)
+        hello = ClientHello(
+            random=bytes(32),
+            legacy_session_id=b"",
+            cipher_suites=[TLS_AES_128_GCM_SHA256],
+            extensions=[
+                Extension(ExtensionType.SUPPORTED_VERSIONS, b"\x02\x03\x04"),
+                Extension(ExtensionType.SUPPORTED_GROUPS, b"\x00\x02\x11\xec"),  # MLKEM768 only
+                Extension(ExtensionType.KEY_SHARE, b"\x00\x00"),
+                Extension(ExtensionType.ALPN, b"\x00\x0b\nhq-interop"),
+                Extension(ExtensionType.QUIC_TRANSPORT_PARAMETERS, b"x"),
+            ],
+        )
+        with pytest.raises(TlsAlert) as excinfo:
+            server.receive(EncryptionLevel.INITIAL, encode_client_hello(hello))
+        assert excinfo.value.alert == HANDSHAKE_FAILURE
+
+    def test_second_retry_is_refused(self, credentials: Credentials) -> None:
+        """A client that retries still without a usable share is not sent
+        a second HelloRetryRequest (§4.1.4 forbids the loop)."""
+        client = self.make_withholding_client(credentials)
+        server = make_server(credentials)
+        client.start()
+        first = next(e for e in client.take_events() if isinstance(e, SendData))
+        server.receive(first.level, first.data)
+        server.take_events()
+        with pytest.raises(TlsAlert) as excinfo:
+            server.receive(first.level, first.data)  # the same share-less hello again
+        assert excinfo.value.alert == HANDSHAKE_FAILURE
+
+    def test_client_refuses_a_pointless_retry(self, credentials: Credentials) -> None:
+        """A retry asking for a group the client already shared would loop."""
+        client = make_client(credentials)  # sends an x25519 share
+        client.start()
+        client.take_events()
+        retry = encode_server_hello(
+            ServerHello(
+                random=HELLO_RETRY_REQUEST_RANDOM,
+                legacy_session_id_echo=b"",
+                cipher_suite=TLS_AES_128_GCM_SHA256,
+                extensions=[
+                    Extension(ExtensionType.SUPPORTED_VERSIONS, TLS_1_3.to_bytes(2, "big")),
+                    Extension(ExtensionType.KEY_SHARE, X25519_GROUP.to_bytes(2, "big")),
+                ],
+            )
+        )
+        with pytest.raises(TlsAlert) as excinfo:
+            client.receive(EncryptionLevel.INITIAL, retry)
+        assert excinfo.value.alert == ILLEGAL_PARAMETER
+
+    def test_client_refuses_an_unoffered_group(self, credentials: Credentials) -> None:
+        client = self.make_withholding_client(credentials)
+        client.start()
+        client.take_events()
+        retry = encode_server_hello(
+            ServerHello(
+                random=HELLO_RETRY_REQUEST_RANDOM,
+                legacy_session_id_echo=b"",
+                cipher_suite=TLS_AES_128_GCM_SHA256,
+                extensions=[
+                    Extension(ExtensionType.SUPPORTED_VERSIONS, TLS_1_3.to_bytes(2, "big")),
+                    Extension(ExtensionType.KEY_SHARE, b"\x11\xec"),  # MLKEM768, never offered
+                ],
+            )
+        )
+        with pytest.raises(TlsAlert) as excinfo:
+            client.receive(EncryptionLevel.INITIAL, retry)
+        assert excinfo.value.alert == ILLEGAL_PARAMETER
 
 
 def test_unexpected_message_order_raises(credentials: Credentials) -> None:

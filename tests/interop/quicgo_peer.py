@@ -92,30 +92,43 @@ class QuicGoServer:
 
 
 def quicgo_fetch(
-    binary: Path,
     port: int,
     paths: list[str],
     credentials: PemCredentials,
     output_dir: Path,
+    *,
+    force_hello_retry: bool = False,
 ) -> dict[str, bytes]:
-    """Fetch paths from a server using quic-go as the client."""
+    """Fetch paths from a server using quic-go as the client.
+
+    ``force_hello_retry`` makes the peer prefer P-256, so its ClientHello
+    carries no x25519 share and the server must send a
+    HelloRetryRequest (RFC 8446 §4.1.4).
+    """
+    built = build_peers()
+    if built is None:
+        raise RuntimeError("the quic-go peers are not built")
+    _server_binary, binary = built
     output_dir.mkdir(parents=True, exist_ok=True)
     ca_certificate = credentials.ca_pem
     server_name = "localhost"
+    command = [
+        str(binary),
+        "-addr",
+        f"127.0.0.1:{port}",
+        "-ca",
+        str(ca_certificate),
+        "-server-name",
+        server_name,
+        "-output-dir",
+        str(output_dir),
+        "-paths",
+        ",".join(paths),
+    ]
+    if force_hello_retry:
+        command.append("-force-hello-retry")
     result = subprocess.run(
-        [
-            str(binary),
-            "-addr",
-            f"127.0.0.1:{port}",
-            "-ca",
-            str(ca_certificate),
-            "-server-name",
-            server_name,
-            "-output-dir",
-            str(output_dir),
-            "-paths",
-            ",".join(paths),
-        ],
+        command,
         capture_output=True,
         text=True,
         timeout=60,
