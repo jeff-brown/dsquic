@@ -27,6 +27,9 @@ Repository = "https://github.com/jeff-brown/dsquic"
 
 [dependency-groups]
 dev = [
+    # aioquic is an independent QUIC stack, used only as an interop peer
+    # in tests/interop; nothing in src/ may import it.
+    "aioquic>=1.2",
     "mypy>=1.10",
     "pyright>=1.1.380",
     "pytest>=8",

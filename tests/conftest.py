@@ -1,7 +1,12 @@
-"""Shared fixtures for the endpoint tests: a PEM credential pair on disk."""
+"""Shared fixtures: a PEM credential pair on disk, used by the endpoint
+and interop tests, which drive the real command line surfaces."""
 
 import datetime
-import sys
+import selectors
+import socket
+import threading
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +16,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from dsquic import hq
+from dsquic.endpoints.server import load_credentials, serve_one
+from dsquic.tls import ServerConfig
 
 
 @dataclass(frozen=True)
@@ -95,3 +102,55 @@ def credentials(tmp_path_factory: pytest.TempPathFactory) -> PemCredentials:
     return PemCredentials(
         ca_pem=ca_pem, certificate_pem=certificate_pem, private_key_pem=private_key_pem
     )
+
+
+# --- fixtures for the endpoint and interop tests ---------------------------
+
+INDEX_BODY = b"<html><body>hello from dsquic</body></html>"
+LARGE_BODY = bytes(range(256)) * 300  # 76800 bytes: many packets and ACKs
+
+
+@pytest.fixture
+def document_root(tmp_path: Path) -> Path:
+    root = tmp_path / "www"
+    root.mkdir()
+    (root / "index.html").write_bytes(INDEX_BODY)
+    (root / "large.bin").write_bytes(LARGE_BODY)
+    return root
+
+
+@pytest.fixture
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+    return port
+
+
+@pytest.fixture
+def dsquic_server(
+    credentials: PemCredentials, document_root: Path, free_port: int
+) -> Iterator[int]:
+    """A dsquic server on a loopback port, serving one connection."""
+    chain, key = load_credentials(credentials.certificate_pem, credentials.private_key_pem)
+    server_config = ServerConfig(
+        certificate_chain=chain, signing_key=key, alpn=[hq.ALPN], transport_parameters=b""
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", free_port))
+    sock.setblocking(False)
+    selector = selectors.DefaultSelector()
+    selector.register(sock, selectors.EVENT_READ)
+
+    thread = threading.Thread(
+        target=lambda: serve_one(sock, selector, server_config, document_root, idle_timeout=15.0),
+        daemon=True,
+    )
+    thread.start()
+    time.sleep(0.05)
+    try:
+        yield free_port
+    finally:
+        thread.join(timeout=15)
+        selector.close()
+        sock.close()

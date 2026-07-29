@@ -246,6 +246,15 @@ Recorded here so the open questions above stay honest:
   interop or conformance claims.
 - **Edge-case convention settled (2026-07-26)**: state inline, validation
   quarantined (§4.8), chosen over fully-inline and fully-quarantined.
+- **MVP interop reached (2026-07-29)**: `handshake` and `transfer` pass
+  against quic-go v0.61 in both directions, and against aioquic 1.3 in
+  both directions, over hq-interop on real UDP. This is §6.3 step 5, the
+  recorded definition of MVP done. The peers are driven by thin harnesses
+  in `tests/interop/`; all protocol behaviour on the far side is theirs.
+  Interop found one bug that four layers of self-testing had not: CRYPTO
+  frame offsets were ignored, so a ClientHello spanning several frames
+  was reassembled by concatenation. dsquic and aioquic both send small,
+  in-order ClientHellos; quic-go does not.
 - **MASQUE nesting readiness (2026-07-26)**: MASQUE tunnels a complete
   inner QUIC connection (with its own ordinary TLS handshake) through an
   outer connection as HTTP Datagrams; the nesting is at the QUIC packet

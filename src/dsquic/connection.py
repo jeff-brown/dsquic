@@ -89,6 +89,7 @@ DEFAULT_MAX_DATAGRAM_SIZE = 1200  # conservative default; per-connection config
 CONNECTION_ID_LENGTH = 8
 AMPLIFICATION_FACTOR = 3  # §8.1: server send limit before address validation
 MAX_ACK_RANGES = 32  # bound the ACK frames we build
+MAX_CRYPTO_BUFFER = 65536  # §7.5: a receiver may bound CRYPTO reassembly
 
 LEVEL_TO_PACKET_TYPE = {
     EncryptionLevel.INITIAL: PacketType.INITIAL,
@@ -165,6 +166,12 @@ class _Space:
     ack_eliciting_pending: bool = False
     crypto_offset_sent: int = 0
     crypto_pending: bytearray = field(default_factory=bytearray)
+    # Receive-side CRYPTO reassembly (§19.6). Deliberately separate from
+    # stream reassembly: CRYPTO has offsets but no stream ID, no flow
+    # control, and one ordered byte stream per encryption level.
+    crypto_received: RangeSet = field(default_factory=RangeSet)
+    crypto_buffer: bytearray = field(default_factory=bytearray)
+    crypto_read_offset: int = 0
     discarded: bool = False
 
 
@@ -462,10 +469,33 @@ class Connection:
                 stream.requeue(frame)
 
     def _handle_crypto(self, level: EncryptionLevel, frame: Crypto, now: float) -> None:
+        """Reassemble the CRYPTO stream and feed TLS in order (§19.6).
+
+        A handshake message can span several frames, and those frames can
+        arrive out of order, overlap, or be retransmitted, so the offset
+        decides placement. Only contiguous bytes reach TLS, which has no
+        notion of gaps.
+        """
         if self.tls is None:
             raise ConnectionError_(frames.PROTOCOL_VIOLATION, "CRYPTO frame before Initial")
+        space = self._spaces[level]
+        end = frame.offset + len(frame.data)
+        if end > MAX_CRYPTO_BUFFER:
+            raise ConnectionError_(
+                frames.CRYPTO_BUFFER_EXCEEDED, f"CRYPTO offset {end} exceeds the buffer limit"
+            )
+        if len(space.crypto_buffer) < end:
+            space.crypto_buffer.extend(bytes(end - len(space.crypto_buffer)))
+        space.crypto_buffer[frame.offset : end] = frame.data
+        space.crypto_received.add(frame.offset, end)
+
+        readable_end = space.crypto_received.contiguous_from(space.crypto_read_offset)
+        if readable_end == space.crypto_read_offset:
+            return  # a gap remains; nothing new is deliverable
+        ordered = bytes(space.crypto_buffer[space.crypto_read_offset : readable_end])
+        space.crypto_read_offset = readable_end
         try:
-            self.tls.receive(level, frame.data)
+            self.tls.receive(level, ordered)
         except TlsAlert as exc:
             raise ConnectionError_(frames.CRYPTO_ERROR_BASE + exc.alert, str(exc)) from exc
         self._drain_tls_events(now)
