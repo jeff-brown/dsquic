@@ -41,6 +41,19 @@ it exists to teach QUIC.
 
 ## Engineering rules
 
+- No hacks or workarounds, including in tooling, test harnesses, and
+  local setup. If the supported mechanism does not work, fix it or find
+  out why; do not route around it because the difference looks small
+  today. A workaround becomes a dependency, and the next thing built on
+  it inherits the breakage. When something genuinely cannot be fixed
+  now, say so plainly and stop rather than papering over it.
+- Look things up instead of guessing. Two failed attempts at something
+  knowable, how a tool behaves, what an API expects, what a spec says,
+  means stop and consult the source: read the documentation, search the
+  web, fetch the RFC, or ask a subagent the question directly. Repeated
+  guessing burns time and ends in the workaround the rule above forbids.
+  Prefer the authoritative source over recall: cite the RFC section,
+  quote the documentation, read the peer's code.
 - Refactor over backward compatibility. Pre-1.0 there are no users: when a
   design changes, change every call site and delete the old path in the same
   change. Never keep parallel code paths, shims, aliases, or deprecated

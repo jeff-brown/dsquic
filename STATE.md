@@ -10,9 +10,12 @@ files over hq-interop against independent implementations, in both
 directions, over real UDP. This is design.md §6.3 step 5, the recorded
 definition of MVP done.
 
-Interop verified against quic-go v0.61 and aioquic 1.3, each as both
-client and server, for a small file and a 77KB file, plus a
-HelloRetryRequest round trip driven by a real quic-go client.
+Verified against quic-go v0.61 and aioquic 1.3 by nine hand-written tests
+in `tests/interop/`: each peer as both client and server, a small file and
+a 77KB file, plus a HelloRetryRequest round trip driven by a real quic-go
+client. This is our own harness against two implementations, not the
+Interop Runner: **the runner has never been run against dsquic, so there
+are no interop results to report.**
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
@@ -32,6 +35,21 @@ HelloRetryRequest round trip driven by a real quic-go client.
   and quic-go (Go sources in `tests/interop/quicgo/`, built on demand
   into a temp dir, tests skipped when Go is absent; Go was installed via
   Homebrew). Only the harness wiring is ours.
+- `interop/` holds the Interop Runner shim: a Dockerfile and
+  `run_endpoint.sh` implementing the runner's endpoint contract. Verified
+  by hand with Apple's `container` (installed via Homebrew; needs
+  `container system start`, which downloads a Linux kernel once):
+  unsupported test cases exit 127, a containerised server serves /www to
+  a host client, and a containerised client parses REQUESTS URLs,
+  validates against /certs/ca.pem, and writes to /downloads. Claims
+  handshake and transfer only; interop/README.md tabulates why each of
+  the runner's other 21 cases is not attempted. The runner itself has
+  never been run against dsquic. Container DNS is set up properly (see
+  the README): `sudo container system dns create test` plus
+  `[dns] domain = "test"` in ~/.config/container/config.toml, since
+  `--dns-domain` alone does not register names and 1.2.0 has no
+  `dns default set` subcommand. Gaps: IPv4 only, no qlog, and the full
+  runner matrix needs Linux.
 
 ## In-flight work
 
@@ -60,16 +78,26 @@ Four bugs, each invisible while dsquic only talked to itself:
 
 ## Next steps
 
-1. **Interop Runner shim** in `interop/`: Dockerfile plus
-   `run_endpoint.sh` honouring
-   ROLE/TESTCASE/REQUESTS/WWW/DOWNLOADS/QLOGDIR/SSLKEYLOGFILE, exiting
-   127 for unsupported cases. Wraps the endpoints, adds no endpoint
-   logic. Buys validation against a dozen stacks per milestone.
-2. **The roadmap past the MVP** (design.md §6.1), in order: retry,
+1. **The roadmap past the MVP** (design.md §6.1), in order: retry,
    resumption, multiplexing, http3, keyupdate, ecn, zerortt. Each climbs
    all three rungs of the ladder (design.md §6.2).
-3. **`qlog.py`**, which the design doc treats as first-class output and
-   the foundation of the inspection-engine story.
+2. **`qlog.py`**, which the design doc treats as first-class output and
+   the foundation of the inspection-engine story. Also closes the
+   `QLOGDIR` gap in the interop shim.
+3. **MAX_STREAMS.** dsquic advertises 16 bidirectional streams and never
+   raises the limit, so the seventeenth stream fails. This blocks the
+   runner's `multiplexing` case and is a real gap for any peer that opens
+   many streams.
+4. **IPv6 in the endpoints.** Both open `AF_INET` sockets, so the runner's
+   `ipv6` case cannot pass.
+5. **Actually run the Interop Runner.** Blocked on three things, none of
+   them protocol work: the image must derive from the quic-network-simulator
+   endpoint base image so traffic routes through the simulator; the online
+   runner wants linux/amd64; and the orchestration needs a Linux host or CI
+   with Docker and docker-compose. The runner covers 17 registered
+   implementations against 23 cases, which would be 31 pairings for dsquic
+   (16 as client, 15 as server). Until that runs, the only interop evidence
+   is the nine tests against two peers.
 
 ## Wire comparison, five pairings (2026-07-29)
 
