@@ -16,12 +16,18 @@ HelloRetryRequest round trip driven by a real quic-go client.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  285 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  292 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
   congestion, new_reno, hq, and the `endpoints/` subpackage (the only
   I/O). Still docstring stubs: h3, qpack, masque, qlog.
+- `endpoints.server.Server` serves many connections over one socket,
+  routing by Destination Connection ID via
+  `packet.destination_connection_id` (RFC 8999 §5.1, version
+  independent). The table holds two keys per connection: the client's
+  original CID and the one we issue, since the client switches to ours
+  (§7.2). `serve_one` is now `Server.serve(connection_limit=1)`.
 - Interop harnesses live in `tests/interop/`: aioquic (a dev dependency)
   and quic-go (Go sources in `tests/interop/quicgo/`, built on demand
   into a temp dir, tests skipped when Go is absent; Go was installed via
@@ -54,19 +60,15 @@ Four bugs, each invisible while dsquic only talked to itself:
 
 ## Next steps
 
-1. **A connection table in the server endpoint**, keyed by destination
-   connection ID. `serve_one` handles one connection at a time; this is
-   also MASQUE nesting constraint 3 and the routing point an inner
-   tunnelled connection would use.
-2. **Interop Runner shim** in `interop/`: Dockerfile plus
+1. **Interop Runner shim** in `interop/`: Dockerfile plus
    `run_endpoint.sh` honouring
    ROLE/TESTCASE/REQUESTS/WWW/DOWNLOADS/QLOGDIR/SSLKEYLOGFILE, exiting
    127 for unsupported cases. Wraps the endpoints, adds no endpoint
    logic. Buys validation against a dozen stacks per milestone.
-3. **The roadmap past the MVP** (design.md §6.1), in order: retry,
+2. **The roadmap past the MVP** (design.md §6.1), in order: retry,
    resumption, multiplexing, http3, keyupdate, ecn, zerortt. Each climbs
    all three rungs of the ladder (design.md §6.2).
-4. **`qlog.py`**, which the design doc treats as first-class output and
+3. **`qlog.py`**, which the design doc treats as first-class output and
    the foundation of the inspection-engine story.
 
 ## Wire comparison, five pairings (2026-07-29)
@@ -94,12 +96,10 @@ Observed divergences worth keeping:
 
 - MASQUE nesting readiness (design.md appendix): connection.py stays
   transport-agnostic (satisfied), no hardcoded MTU constants
-  (satisfied), the endpoint loop must handle N connections (**not yet**:
-  `serve_one` handles one at a time), and h3.py must model long-lived
-  CONNECT streams with DATAGRAM frames (**not yet**, h3.py is a stub).
-- The server currently serves one connection at a time; a connection
-  table keyed by destination connection ID is the next structural piece,
-  and is also what an inner MASQUE connection would route through.
+  (satisfied), the endpoint loop handles N connections (satisfied by
+  endpoints.server.Server), and h3.py must model long-lived CONNECT
+  streams with DATAGRAM frames (**not yet**, h3.py is a stub). Only the
+  h3 constraint remains open.
 
 ## Open decisions
 

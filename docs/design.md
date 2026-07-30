@@ -278,7 +278,12 @@ Recorded here so the open questions above stay honest:
      interacts with outer datagram capacity).
   3. The endpoint loop handles N concurrent connections, including
      connections whose sends route into another connection rather than
-     the socket.
+     the socket. **Satisfied 2026-07-29** by `endpoints.server.Server`,
+     which routes on the Destination Connection ID read by
+     `packet.destination_connection_id`. That function is the "CID
+     parsing exposed for demux" commitment of §4.7, and reads only the
+     version-independent fields of RFC 8999 §5.1, so routing works even
+     for versions the stack cannot speak.
   4. `h3.py` models long-lived Extended CONNECT streams with associated
      datagram flows, not request/response calls; DATAGRAM frames
      (RFC 9221) are in the frame vocabulary and transport parameter

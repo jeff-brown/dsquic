@@ -126,6 +126,33 @@ def parse_long_header(data: bytes) -> LongHeader:
     )
 
 
+def destination_connection_id(data: bytes, cid_length: int) -> bytes | None:
+    """Read a datagram's Destination Connection ID for routing.
+
+    RFC 8999 §5.1: the header form bit, the version, and the connection
+    IDs are the only version-independent fields, which is exactly what a
+    demultiplexer needs and no more. Short headers do not carry a length,
+    so ``cid_length`` supplies the one this endpoint issues. Returns None
+    if the datagram is too short to route.
+
+    Exposed for the transport layer to route on (design.md §4.7); the
+    routing itself is I/O and lives in endpoints/.
+    """
+    if not data:
+        return None
+    if data[0] & HEADER_FORM_LONG:
+        offset = 1 + 4  # first byte, version
+        if len(data) <= offset:
+            return None
+        length = data[offset]
+        if length > MAX_CID_LENGTH or len(data) < offset + 1 + length:
+            return None
+        return data[offset + 1 : offset + 1 + length]
+    if len(data) < 1 + cid_length:
+        return None
+    return data[1 : 1 + cid_length]
+
+
 def parse_short_header(data: bytes, cid_length: int) -> ShortHeader:
     """Parse a 1-RTT header up to the Packet Number field (RFC 9000 §17.3)."""
     buf = Buffer(data)
