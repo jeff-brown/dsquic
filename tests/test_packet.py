@@ -14,6 +14,7 @@ from dsquic.packet import (
     encode_packet_number,
     parse_long_header,
     parse_short_header,
+    version_negotiation_response,
 )
 
 CLIENT_DCID = bytes.fromhex("8394c8f03e515708")
@@ -140,6 +141,48 @@ def test_parse_short_header() -> None:
 def test_parse_short_header_rejects_long() -> None:
     with pytest.raises(HeaderParseError, match="not a short header"):
         parse_short_header(CLIENT_INITIAL_HEADER, cid_length=8)
+
+
+class TestVersionNegotiation:
+    """RFC 9000 §6.1 and §17.2.1."""
+
+    def probe(self, version: bytes = b"WAIT", size: int = 1207) -> bytes:
+        """A packet naming a version we do not speak, shaped like the
+        network simulator's readiness probe."""
+        header = b"\xc0" + version + bytes([8]) + b"\xaa" * 8 + bytes([8]) + b"\xbb" * 8
+        return header + bytes(size - len(header))
+
+    def test_answers_an_unknown_version(self) -> None:
+        answer = version_negotiation_response(self.probe())
+        assert answer is not None
+        assert answer[0] & 0x80  # long header form
+        assert answer[1:5] == bytes(4)  # version 0 marks Version Negotiation
+        # §17.2.1: the connection IDs are swapped relative to the packet
+        # being answered, so the peer can match the reply to its attempt.
+        assert answer[5] == 8
+        assert answer[6:14] == b"\xbb" * 8
+        assert answer[14] == 8
+        assert answer[15:23] == b"\xaa" * 8
+        assert answer[23:] == QUIC_V1.to_bytes(4, "big")
+
+    def test_ignores_versions_we_speak(self) -> None:
+        assert version_negotiation_response(self.probe(version=b"\x00\x00\x00\x01")) is None
+
+    def test_never_answers_a_version_negotiation_packet(self) -> None:
+        """Answering one would loop forever."""
+        assert version_negotiation_response(self.probe(version=bytes(4))) is None
+
+    def test_ignores_short_headers(self) -> None:
+        assert version_negotiation_response(b"\x41" + bytes(1206)) is None
+
+    def test_refuses_to_amplify(self) -> None:
+        """§6.1: a datagram below 1200 bytes gets no answer, so the reply
+        cannot be larger than what provoked it."""
+        assert version_negotiation_response(self.probe(size=1199)) is None
+
+    def test_tolerates_truncation(self) -> None:
+        broken = b"\xc0" + b"WAIT" + bytes([255]) + bytes(1202)
+        assert version_negotiation_response(broken) is None
 
 
 def test_encode_packet_number_rfc9000_a2() -> None:

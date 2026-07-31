@@ -1,23 +1,32 @@
 # The dsquic endpoint image for the QUIC Interop Runner.
 #
-# Standard Dockerfile syntax, so it builds with docker, podman, or
-# Apple's container tool. The runner expects the entrypoint to honour the
-# environment contract described in run_endpoint.sh.
+# Derived from the network simulator's endpoint base image, which is
+# ubuntu:24.04 plus the tools and /setup.sh the simulator needs: it
+# disables TX checksum offload, which ns-3 requires, and adds the routes
+# that send traffic through the simulator. Building on anything else
+# produces an image that runs standalone but not under the runner.
+#
+# The online runner requires linux/amd64:
+#   docker build --platform linux/amd64 -t dsquic -f interop/Dockerfile .
 
-FROM python:3.12-slim
+FROM martenseemann/quic-network-simulator-endpoint:latest
 
-# The runner's base images provide /setup.sh to configure simulator
-# routing. It is absent when the image is run standalone, so
-# run_endpoint.sh sources it only if present.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu marks its Python as externally managed (PEP 668), so install
+# into a virtual environment rather than fighting the system packages.
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /dsquic
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir .
 
+# Replaces the base image's placeholder entrypoint script.
 COPY interop/run_endpoint.sh /run_endpoint.sh
 RUN chmod +x /run_endpoint.sh
 

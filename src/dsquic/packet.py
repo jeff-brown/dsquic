@@ -19,15 +19,20 @@ supported.
 """
 
 import enum
+import os
 from dataclasses import dataclass
 
-from dsquic.buffer import Buffer, encode_varint
+from dsquic.buffer import Buffer, BufferReadError, encode_varint
 
 HEADER_FORM_LONG = 0x80
 FIXED_BIT = 0x40
 QUIC_V1 = 0x00000001
+VERSION_NEGOTIATION = 0x00000000  # §17.2.1: not a version, a packet type
+SUPPORTED_VERSIONS = [QUIC_V1]
 MAX_CID_LENGTH = 20  # RFC 9000 §17.2
 MAX_PACKET_NUMBER = 2**62 - 1
+# §6.1: never answer a smaller datagram, so the reply cannot amplify.
+MIN_VERSION_NEGOTIATION_DATAGRAM = 1200
 
 
 class PacketType(enum.Enum):
@@ -124,6 +129,59 @@ def parse_long_header(data: bytes) -> LongHeader:
         length=length,
         pn_offset=buf.position,
     )
+
+
+def build_version_negotiation(destination_cid: bytes, source_cid: bytes) -> bytes:
+    """A Version Negotiation packet listing the versions we speak.
+
+    RFC 9000 §17.2.1. The version field is zero and there is no length or
+    packet number: the body is just a list of versions. The high bit must
+    be set; the remaining seven bits of the first byte are arbitrary and
+    the peer ignores them.
+
+    Callers pass the connection IDs already swapped, per §17.2.1: the
+    answer's Destination CID is the source of the packet being answered.
+    """
+    first = os.urandom(1)[0] | HEADER_FORM_LONG
+    return (
+        bytes([first])
+        + VERSION_NEGOTIATION.to_bytes(4, "big")
+        + bytes([len(destination_cid)])
+        + destination_cid
+        + bytes([len(source_cid)])
+        + source_cid
+        + b"".join(version.to_bytes(4, "big") for version in SUPPORTED_VERSIONS)
+    )
+
+
+def version_negotiation_response(datagram: bytes) -> bytes | None:
+    """The Version Negotiation packet a datagram deserves, if any (§6.1).
+
+    Stateless: a server answers any packet that might start a connection
+    but names a version it does not speak, without creating connection
+    state. Returns None when no answer is owed, which covers short
+    headers, versions we do speak, Version Negotiation packets themselves
+    (answering one would loop), and datagrams below 1200 bytes, which
+    §6.1 forbids answering so the packet cannot be used for
+    amplification.
+    """
+    if len(datagram) < MIN_VERSION_NEGOTIATION_DATAGRAM:
+        return None
+    if not datagram[0] & HEADER_FORM_LONG:
+        return None
+    version = int.from_bytes(datagram[1:5], "big")
+    if version == VERSION_NEGOTIATION or version in SUPPORTED_VERSIONS:
+        return None
+    buf = Buffer(datagram[5:])
+    try:
+        # RFC 8999 §5.1: the connection IDs are version independent.
+        peer_destination = buf.pull_bytes(buf.pull_uint8())
+        peer_source = buf.pull_bytes(buf.pull_uint8())
+    except BufferReadError:
+        return None
+    if len(peer_destination) > MAX_CID_LENGTH or len(peer_source) > MAX_CID_LENGTH:
+        return None
+    return build_version_negotiation(destination_cid=peer_source, source_cid=peer_destination)
 
 
 def destination_connection_id(data: bytes, cid_length: int) -> bytes | None:

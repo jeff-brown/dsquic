@@ -206,6 +206,25 @@ class TestStreams:
 
 
 class TestRecovery:
+    def test_lost_client_hello_is_retransmitted_on_pto(self, credentials: Credentials) -> None:
+        """§6.2.4: before any ACK arrives, PTO is the only loss signal, so
+        the probe has to carry the ClientHello. A bare PING is
+        ack-eliciting but redelivers nothing, and the handshake would sit
+        there until the idle timer.
+        """
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        assert client.datagrams_to_send(0.0)  # the whole first flight is lost
+
+        probe_at = client.next_timer()
+        assert probe_at is not None
+        client.handle_timer(probe_at)
+        assert client.state is not ConnectionState.TERMINATED
+
+        pump(client, server, probe_at)
+        assert client.state is ConnectionState.CONNECTED
+        assert server.state is ConnectionState.CONNECTED
+
     def test_lost_packet_is_retransmitted(self, credentials: Credentials) -> None:
         client, server, now = handshake(credentials)
         client.take_events()
@@ -264,3 +283,99 @@ class TestAntiAmplification:
             server.datagram_received(datagram.data, 0.0, source="client")
         sent = sum(len(datagram.data) for datagram in server.datagrams_to_send(0.01))
         assert sent <= 3 * received  # §8.1
+
+
+class TestKeyUpdate:
+    """RFC 9001 §6. Reached in practice because quic-go updates keys
+    partway through a transfer, which stalls a peer that cannot follow.
+    """
+
+    def fetch(self, credentials: Credentials) -> tuple[Connection, Connection, int, float]:
+        """Handshake and open a stream, leaving both sides idle."""
+        client, server, now = handshake(credentials)
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, b"GET /\r\n", end_stream=True)
+        now = pump(client, server, now)
+        return client, server, stream_id, now
+
+    def test_follows_a_peer_key_update(self, credentials: Credentials) -> None:
+        client, server, stream_id, now = self.fetch(credentials)
+        assert server.initiate_key_update(now)
+        server.send_stream_data(stream_id, b"after the update", end_stream=True)
+        pump(client, server, now)
+
+        received = [
+            event for event in client.take_events() if isinstance(event, StreamDataReceived)
+        ]
+        assert b"".join(event.data for event in received) == b"after the update"
+        assert client.key_phase() is True
+
+    def test_sends_in_the_new_phase_after_following(self, credentials: Credentials) -> None:
+        """§6.2: send keys update before the update is acknowledged, so
+        the peer must be able to read what comes back."""
+        client, server, stream_id, now = self.fetch(credentials)
+        assert server.initiate_key_update(now)
+        server.send_stream_data(stream_id, b"after the update", end_stream=True)
+        now = pump(client, server, now)
+
+        client.send_stream_data(client.open_stream(), b"reply", end_stream=True)
+        pump(client, server, now)
+        replies = [event for event in server.take_events() if isinstance(event, StreamDataReceived)]
+        assert b"reply" in b"".join(event.data for event in replies)
+
+    def reorder_across_update(
+        self, credentials: Credentials, delay: float
+    ) -> tuple[Connection, bytes]:
+        """Hold back a packet sent before a key update and deliver it
+        ``delay`` seconds after the packet that carried the update.
+
+        Delivery is explicit rather than pumped: a pump lets the server
+        retransmit the held-back data in the new phase, which would
+        answer the question by the wrong route.
+        """
+        client, server, stream_id, now = self.fetch(credentials)
+        server.send_stream_data(stream_id, b"before ", end_stream=False)
+        held = [datagram.data for datagram in server.datagrams_to_send(now)]
+        assert held
+
+        assert server.initiate_key_update(now)
+        server.send_stream_data(stream_id, b"after", end_stream=True)
+        for datagram in server.datagrams_to_send(now):
+            client.datagram_received(datagram.data, now, source="server")
+        for data in held:
+            client.datagram_received(data, now + delay, source="server")
+
+        received = [
+            event for event in client.take_events() if isinstance(event, StreamDataReceived)
+        ]
+        return client, b"".join(event.data for event in received)
+
+    def test_update_needs_an_ack_from_the_current_phase(self, credentials: Credentials) -> None:
+        """§6.1: no second update until the peer acknowledges a packet
+        sent in the phase the first one started."""
+        client, server, stream_id, now = self.fetch(credentials)
+        assert server.initiate_key_update(now)
+        assert not server.initiate_key_update(now)
+
+        server.send_stream_data(stream_id, b"after the update", end_stream=True)
+        now = pump(client, server, now)
+        assert server.initiate_key_update(now)
+
+    def test_update_is_refused_before_the_handshake_is_confirmed(
+        self, credentials: Credentials
+    ) -> None:
+        """§6.1: 1-RTT keys alone are not enough."""
+        client, _ = make_pair(credentials)
+        client.connect(0.0)
+        assert not client.initiate_key_update(0.0)
+
+    def test_reordered_packet_from_the_previous_phase(self, credentials: Credentials) -> None:
+        """§6.5: a packet sent before the update still decrypts."""
+        _, received = self.reorder_across_update(credentials, delay=0.0)
+        assert received == b"before after"
+
+    def test_previous_phase_keys_expire(self, credentials: Credentials) -> None:
+        """§6.5: old read keys last three PTOs and no longer, after which
+        the packet is undecryptable rather than merely late."""
+        _, received = self.reorder_across_update(credentials, delay=3600.0)
+        assert received == b""

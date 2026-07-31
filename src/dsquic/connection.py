@@ -60,13 +60,17 @@ from dsquic.packet import (
 )
 from dsquic.protection import (
     AEAD_TAG_LENGTH,
+    KEY_PHASE_BIT,
     MAX_PN_LENGTH,
     SAMPLE_LENGTH,
     PacketKeys,
+    UnprotectedHeader,
+    decrypt_payload,
     derive_initial_secrets,
     derive_packet_keys,
+    next_generation,
     protect,
-    unprotect,
+    remove_header_protection,
 )
 from dsquic.recovery import AckOfUnsentPacket, LossDetection, SentPacket
 from dsquic.streams import FlowControlLimits, RangeSet, RecvStream, StreamError, StreamManager
@@ -173,6 +177,32 @@ class _Space:
     crypto_buffer: bytearray = field(default_factory=bytearray)
     crypto_read_offset: int = 0
     discarded: bool = False
+    # Key update state (§6). Only 1-RTT keys rotate, so these stay at
+    # their defaults in the Initial and Handshake spaces. The next
+    # receive keys are derived in advance so that answering a peer's
+    # update costs no more than an ordinary packet, which is what §6.3
+    # asks for to avoid a timing signal on the key phase bit.
+    key_phase: bool = False
+    secret_send: bytes = b""
+    secret_recv_next: bytes = b""
+    keys_recv_next: PacketKeys | None = None
+    keys_recv_previous: PacketKeys | None = None
+    keys_recv_previous_expiry: float = 0.0
+    # §6.5: the lowest packet number received in the current phase, or
+    # None when nothing has arrived in it yet. Until something does,
+    # every packet carrying the other phase bit belongs to the previous
+    # phase, which is the state an endpoint is in right after starting
+    # an update of its own.
+    key_phase_first: int | None = 0
+    key_phase_send_first: int = 0  # §6.1: gates the next update
+
+
+def _short_header_first_byte(space: _Space, packet_number_length: int) -> int:
+    """§17.3.1: header form, fixed bit, key phase, packet number length."""
+    first = 0x40 | (packet_number_length - 1)
+    if space.key_phase:
+        first |= KEY_PHASE_BIT
+    return first
 
 
 @dataclass(frozen=True)
@@ -244,6 +274,9 @@ class Connection:
         self._events: list[ConnectionEvent] = []
         self._pending: list[OutgoingDatagram] = []
         self._control_frames: list[Frame] = []
+        # Probes owed per space after a PTO (§6.2.4). Counted per level
+        # because a probe must go out at the level whose timer expired.
+        self._probes_pending: dict[EncryptionLevel, int] = dict.fromkeys(EncryptionLevel, 0)
         self._handshake_done_pending = False
         self._close_frame: ConnectionClose | None = None
         self._close_sent = False
@@ -274,8 +307,118 @@ class Connection:
         ours = Direction.CLIENT if self.is_client else Direction.SERVER
         if event.direction is ours:
             space.keys_send = keys
+            space.secret_send = event.secret
         else:
             space.keys_recv = keys
+            if event.level is EncryptionLevel.ONE_RTT:
+                space.secret_recv_next, space.keys_recv_next = next_generation(event.secret, keys)
+
+    def _decrypt(
+        self, space: _Space, level: EncryptionLevel, packet: bytes, pn_offset: int, now: float
+    ) -> tuple[int, bytes] | None:
+        """Unprotect one packet, or None if it does not authenticate.
+
+        Header protection comes off first because its key is the same in
+        every key generation (§6); the key phase and packet number it
+        recovers are what select the packet protection keys.
+        """
+        assert space.keys_recv is not None
+        try:
+            unprotected = remove_header_protection(
+                space.keys_recv.hp, packet, pn_offset, space.largest_received
+            )
+            keys, updating = self._receive_keys(space, level, unprotected, now)
+            payload = decrypt_payload(keys, unprotected)
+        except (InvalidTag, ValueError):
+            return None
+        if updating:
+            # §6.2: only a packet that authenticates proves the peer
+            # updated, so this follows the decryption rather than the key
+            # selection. Rotating here, before the packet's frames are
+            # handled, is what §6.2 requires: the acknowledgment for this
+            # packet goes out in the new phase.
+            self._rotate_keys(space, now)
+        if level is EncryptionLevel.ONE_RTT:
+            self._note_key_phase(space, unprotected)
+        return unprotected.packet_number, payload
+
+    def _note_key_phase(self, space: _Space, unprotected: UnprotectedHeader) -> None:
+        """§6.5: record the lowest packet number seen in the current key
+        phase, which is the boundary that sends earlier packets to the
+        previous keys."""
+        if unprotected.key_phase != space.key_phase:
+            return
+        if space.key_phase_first is None or unprotected.packet_number < space.key_phase_first:
+            space.key_phase_first = unprotected.packet_number
+
+    def _receive_keys(
+        self, space: _Space, level: EncryptionLevel, unprotected: UnprotectedHeader, now: float
+    ) -> tuple[PacketKeys, bool]:
+        """Choose the keys for a received packet (§6.5).
+
+        Returns the keys and whether using them would mean the peer has
+        started a key update. Only 1-RTT keys rotate; every other level
+        has exactly one key set. Within 1-RTT the key phase bit selects
+        between generations, and when it differs from ours the packet
+        number breaks the tie: below this phase's first packet number it
+        is a reordered packet from the previous phase, above it the peer
+        has updated.
+        """
+        assert space.keys_recv is not None
+        if level is not EncryptionLevel.ONE_RTT or unprotected.key_phase == space.key_phase:
+            return space.keys_recv, False
+        if space.key_phase_first is None or unprotected.packet_number < space.key_phase_first:
+            if space.keys_recv_previous is None or now > space.keys_recv_previous_expiry:
+                # §6.5: old keys are gone, so the packet is undecryptable
+                # rather than misdecrypted. Current keys will fail the
+                # AEAD check, which is the drop this needs.
+                return space.keys_recv, False
+            return space.keys_recv_previous, False
+        if space.keys_recv_next is None or not self.recovery.handshake_confirmed:
+            # §6.1: the peer cannot legitimately update before the
+            # handshake is confirmed, so do not follow it there.
+            return space.keys_recv, False
+        return space.keys_recv_next, True
+
+    def _rotate_keys(self, space: _Space, now: float) -> None:
+        """Advance both directions into the next key phase (§6.1).
+
+        The two directions always move together, whether this endpoint
+        started the update or is following the peer's.
+        """
+        assert space.keys_recv_next is not None
+        assert space.keys_send is not None
+        current_secret = space.secret_recv_next
+        space.keys_recv_previous = space.keys_recv
+        # §6.5: reordered packets from the old phase stay decryptable for
+        # three PTOs, and no longer.
+        space.keys_recv_previous_expiry = now + 3 * self._pto_estimate()
+        space.keys_recv = space.keys_recv_next
+        space.secret_recv_next, space.keys_recv_next = next_generation(
+            current_secret, space.keys_recv
+        )
+        space.secret_send, space.keys_send = next_generation(space.secret_send, space.keys_send)
+        space.key_phase = not space.key_phase
+        space.key_phase_send_first = space.next_packet_number
+        # Nothing has been received in the new phase yet, so packets
+        # still in flight from the peer belong to the old one (§6.5).
+        space.key_phase_first = None
+
+    def initiate_key_update(self, now: float) -> bool:
+        """Start the next key phase, reporting whether it started (§6.1).
+
+        §6.1 allows an update only after the handshake is confirmed and
+        only once the peer has acknowledged a packet sent in the current
+        phase, which stops an endpoint from updating faster than its
+        peer can follow.
+        """
+        space = self._spaces[EncryptionLevel.ONE_RTT]
+        if space.keys_recv_next is None or not self.recovery.handshake_confirmed:
+            return False
+        if self.recovery.largest_acked(EncryptionLevel.ONE_RTT) < space.key_phase_send_first:
+            return False
+        self._rotate_keys(space, now)
+        return True
 
     def _discard_space(self, level: EncryptionLevel) -> None:
         """§4.9: drop a level's keys and its recovery state."""
@@ -354,12 +497,10 @@ class Connection:
         space = self._spaces[level]
         if space.keys_recv is None or space.discarded:
             return packet_end  # no keys yet: drop, keep parsing the datagram
-        try:
-            packet_number, payload = unprotect(
-                space.keys_recv, packet, pn_offset, space.largest_received
-            )
-        except (InvalidTag, ValueError):
+        decrypted = self._decrypt(space, level, packet, pn_offset, now)
+        if decrypted is None:
             return packet_end  # §12.2: failed decryption is not fatal
+        packet_number, payload = decrypted
         if space.received.covers(packet_number, packet_number + 1):
             return packet_end  # already processed
         space.received.add(packet_number, packet_number + 1)
@@ -467,6 +608,31 @@ class Connection:
             elif isinstance(frame, Stream) and self.streams is not None:
                 stream = self.streams.send_stream(frame.stream_id)
                 stream.requeue(frame)
+
+    def _prepare_probe(self, level: EncryptionLevel) -> None:
+        """§6.2.4: give a PTO probe something worth carrying.
+
+        A probe sends new data when there is any and retransmits the
+        oldest unacknowledged data otherwise. A bare PING satisfies the
+        requirement to be ack-eliciting but redelivers nothing, so a lost
+        ClientHello would stall the handshake until the idle timer: PTO
+        is the only loss signal when no ACK ever arrives.
+        """
+        if self._has_pending_data(level):
+            return
+        oldest = self.recovery.oldest_unacked(level)
+        if oldest is not None:
+            self._requeue_lost(oldest)
+
+    def _has_pending_data(self, level: EncryptionLevel) -> bool:
+        """Whether anything is already queued to send at a level."""
+        if self._spaces[level].crypto_pending:
+            return True
+        if level is not EncryptionLevel.ONE_RTT:
+            return False
+        if self._control_frames or self._handshake_done_pending:
+            return True
+        return self.streams is not None and bool(self.streams.writable_streams())
 
     def _handle_crypto(self, level: EncryptionLevel, frame: Crypto, now: float) -> None:
         """Reassemble the CRYPTO stream and feed TLS in order (§19.6).
@@ -623,9 +789,18 @@ class Connection:
         return result
 
     def _send_budget(self) -> int:
-        """§8.1 anti-amplification plus the congestion window."""
+        """§8.1 anti-amplification plus the congestion window.
+
+        RFC 9002 §7.5: a PTO probe is exempt from the congestion window.
+        Without that exemption a connection that loses an entire window
+        deadlocks, because the window is only freed by acknowledgements
+        and no packet can be sent to provoke one. Anti-amplification is
+        not waived: it bounds what an unvalidated peer can make us send.
+        """
         controller = self.recovery.controller
         budget = controller.congestion_window - controller.bytes_in_flight
+        if any(self._probes_pending.values()):
+            budget = max(budget, self.config.max_datagram_size)
         if not self.is_client and not self._address_validated:
             budget = min(budget, AMPLIFICATION_FACTOR * self._bytes_received - self._bytes_sent)
         return budget
@@ -690,28 +865,50 @@ class Connection:
                 used += len(crypto.encode())
 
         if level is EncryptionLevel.ONE_RTT:
-            if self._handshake_done_pending:
-                chosen.append(HandshakeDone())
+            application, application_used = self._application_frames(room - used)
+            chosen.extend(application)
+            used += application_used
+
+        if self._probes_pending[level]:
+            # §6.2.4: the probe must be ack-eliciting. Anything already
+            # chosen that elicits an ACK serves; a PING is the fallback.
+            if not any(is_ack_eliciting(frame) for frame in chosen):
+                chosen.append(Ping())
                 used += 1
-                self._handshake_done_pending = False
-            while self._control_frames and used < room:
-                control = self._control_frames[0]
-                encoded = len(control.encode())
-                if encoded > room - used:
+            self._probes_pending[level] -= 1
+        return chosen, used
+
+    def _application_frames(self, room: int) -> tuple[list[Frame], int]:
+        """Choose the frames only the application space carries.
+
+        HANDSHAKE_DONE, the connection-level control frames, and stream
+        data, in that order: control frames carry flow control credit,
+        which the peer needs before more stream data is worth sending.
+        """
+        chosen: list[Frame] = []
+        used = 0
+        if self._handshake_done_pending:
+            chosen.append(HandshakeDone())
+            used += 1
+            self._handshake_done_pending = False
+        while self._control_frames and used < room:
+            control = self._control_frames[0]
+            encoded = len(control.encode())
+            if encoded > room - used:
+                break
+            self._control_frames.pop(0)
+            chosen.append(control)
+            used += encoded
+        if self.streams is not None:
+            for stream_id in self.streams.writable_streams():
+                stream_overhead = 24  # type, id, offset, length varints
+                available = room - used - stream_overhead
+                if available <= 0:
                     break
-                self._control_frames.pop(0)
-                chosen.append(control)
-                used += encoded
-            if self.streams is not None:
-                for stream_id in self.streams.writable_streams():
-                    stream_overhead = 24  # type, id, offset, length varints
-                    available = room - used - stream_overhead
-                    if available <= 0:
-                        break
-                    stream_frame = self.streams.next_frame(stream_id, available)
-                    if stream_frame is not None:
-                        chosen.append(stream_frame)
-                        used += len(stream_frame.encode())
+                stream_frame = self.streams.next_frame(stream_id, available)
+                if stream_frame is not None:
+                    chosen.append(stream_frame)
+                    used += len(stream_frame.encode())
         return chosen, used
 
     def _build_packet(
@@ -746,8 +943,7 @@ class Connection:
         pn_length = len(pn_bytes)
 
         if level is EncryptionLevel.ONE_RTT:
-            first = 0x40 | (pn_length - 1)
-            header = bytes([first]) + self.peer_cid + pn_bytes
+            header = bytes([_short_header_first_byte(space, pn_length)]) + self.peer_cid + pn_bytes
         else:
             template = LongHeaderTemplate(
                 packet_type=LEVEL_TO_PACKET_TYPE[level],
@@ -847,7 +1043,11 @@ class Connection:
             space.next_packet_number += 1
             pn_bytes = encode_packet_number(packet_number, None)
             if level is EncryptionLevel.ONE_RTT:
-                header = bytes([0x40 | (len(pn_bytes) - 1)]) + self.peer_cid + pn_bytes
+                header = (
+                    bytes([_short_header_first_byte(space, len(pn_bytes))])
+                    + self.peer_cid
+                    + pn_bytes
+                )
             else:
                 header = build_long_header(
                     LongHeaderTemplate(
@@ -916,9 +1116,9 @@ class Connection:
             for packet in outcome.lost:
                 self._requeue_lost(packet)
             if outcome.probe_level is not None:
-                # §6.2.4: a PTO sends new ack-eliciting data, a PING if
-                # nothing else is pending.
-                self._control_frames.append(Ping())
+                # §6.2.4: a PTO sends ack-eliciting data at that level.
+                self._probes_pending[outcome.probe_level] += 1
+                self._prepare_probe(outcome.probe_level)
 
     # --- application interface -------------------------------------------------
 
@@ -946,3 +1146,7 @@ class Connection:
     def keys_discarded(self, level: EncryptionLevel) -> bool:
         """Whether a packet number space has been retired (RFC 9001 §4.9)."""
         return self._spaces[level].discarded
+
+    def key_phase(self) -> bool:
+        """The current 1-RTT key phase (RFC 9001 §6)."""
+        return self._spaces[EncryptionLevel.ONE_RTT].key_phase

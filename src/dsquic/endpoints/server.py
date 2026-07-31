@@ -41,7 +41,11 @@ from dsquic.endpoints import (
     send_pending,
     wait_for_readable,
 )
-from dsquic.packet import HEADER_FORM_LONG, destination_connection_id
+from dsquic.packet import (
+    HEADER_FORM_LONG,
+    destination_connection_id,
+    version_negotiation_response,
+)
 from dsquic.tls import ServerConfig, SigningKey
 
 
@@ -141,6 +145,14 @@ class Server:
             return
         session = self._sessions.get(cid)
         if session is None:
+            # §6.1: a packet naming a version we do not speak is answered
+            # statelessly, before any connection exists. The simulator's
+            # readiness probe relies on this.
+            negotiation = version_negotiation_response(data)
+            if negotiation is not None:
+                if isinstance(source, tuple):
+                    self._sock.sendto(negotiation, source)
+                return
             if not data[0] & HEADER_FORM_LONG:
                 return  # no state for this CID, and nothing to build it from
             session = self._accept(cid)

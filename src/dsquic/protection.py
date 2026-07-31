@@ -18,13 +18,13 @@ MVP cipher: AES-128-GCM with SHA-256 (TLS_AES_128_GCM_SHA256), which is
 also what Initial packets always use (§5.2).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from dsquic.packet import HEADER_FORM_LONG, decode_packet_number
-from dsquic.tls import hkdf_expand_label, hkdf_extract
+from dsquic.tls import SHA256_LENGTH, hkdf_expand_label, hkdf_extract
 
 INITIAL_SALT_V1 = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")  # §5.2
 
@@ -34,6 +34,7 @@ MAX_PN_LENGTH = 4
 PN_LENGTH_BITS = 0x03
 LONG_PROTECTED_BITS = 0x0F  # §5.4.1
 SHORT_PROTECTED_BITS = 0x1F
+KEY_PHASE_BIT = 0x04  # §17.3.1, short headers only
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,17 @@ def derive_packet_keys(secret: bytes) -> PacketKeys:
     )
 
 
+def next_generation(secret: bytes, keys: PacketKeys) -> tuple[bytes, PacketKeys]:
+    """The next key generation for one direction (§6.1).
+
+    ``secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "",
+    Hash.length)``. The header protection key is not part of a key
+    update, so it carries forward from ``keys`` unchanged (§6).
+    """
+    updated = hkdf_expand_label(secret, b"quic ku", b"", SHA256_LENGTH)
+    return updated, replace(derive_packet_keys(updated), hp=keys.hp)
+
+
 def header_protection_mask(hp_key: bytes, sample: bytes) -> bytes:
     """Compute the 5-byte header protection mask (§5.4.3, AES-based)."""
     encryptor = Cipher(algorithms.AES(hp_key), modes.ECB()).encryptor()
@@ -109,27 +121,69 @@ def protect(keys: PacketKeys, header: bytes, payload: bytes, packet_number: int)
     return bytes(protected)
 
 
-def unprotect(
-    keys: PacketKeys, packet: bytes, pn_offset: int, largest_pn: int
-) -> tuple[int, bytes]:
-    """Unprotect one packet: remove header protection, then AEAD (§5.4.1, §5.3).
+@dataclass(frozen=True)
+class UnprotectedHeader:
+    """One packet with header protection removed, before AEAD (§5.4.1).
+
+    ``key_phase`` is only meaningful for short headers, where bit 0x04
+    is the Key Phase (§17.3.1). In a long header that bit belongs to the
+    type-specific bits, so callers at Initial and Handshake ignore it.
+    """
+
+    packet_number: int
+    key_phase: bool
+    header: bytes
+    ciphertext: bytes
+
+
+def remove_header_protection(
+    hp_key: bytes, packet: bytes, pn_offset: int, largest_pn: int
+) -> UnprotectedHeader:
+    """Remove header protection and recover the packet number (§5.4.1).
 
     ``packet`` is one complete packet, header through AEAD tag;
     ``largest_pn`` is the largest packet number processed in this space,
-    or -1 if none. Returns the full packet number and decrypted payload.
-    Raises cryptography's InvalidTag if authentication fails.
+    or -1 if none. This is separate from AEAD because a key update
+    leaves the header protection key alone (§6): the key phase and
+    packet number recovered here are what select the packet protection
+    keys for the payload.
     """
     sample_start = pn_offset + MAX_PN_LENGTH
     sample = packet[sample_start : sample_start + SAMPLE_LENGTH]
     if len(sample) < SAMPLE_LENGTH:
         raise ValueError("packet too short to sample for header protection")
-    mask = header_protection_mask(keys.hp, sample)
+    mask = header_protection_mask(hp_key, sample)
     first_byte_bits = LONG_PROTECTED_BITS if packet[0] & HEADER_FORM_LONG else SHORT_PROTECTED_BITS
     first = packet[0] ^ (mask[0] & first_byte_bits)
     pn_length = (first & PN_LENGTH_BITS) + 1
     pn_bytes = bytes(packet[pn_offset + i] ^ mask[1 + i] for i in range(pn_length))
-    packet_number = decode_packet_number(largest_pn, int.from_bytes(pn_bytes, "big"), pn_length * 8)
-    header = bytes([first]) + packet[1:pn_offset] + pn_bytes
-    ciphertext = packet[pn_offset + pn_length :]
-    payload = AESGCM(keys.key).decrypt(_nonce(keys.iv, packet_number), ciphertext, header)
-    return packet_number, payload
+    return UnprotectedHeader(
+        packet_number=decode_packet_number(
+            largest_pn, int.from_bytes(pn_bytes, "big"), pn_length * 8
+        ),
+        key_phase=bool(first & KEY_PHASE_BIT),
+        header=bytes([first]) + packet[1:pn_offset] + pn_bytes,
+        ciphertext=packet[pn_offset + pn_length :],
+    )
+
+
+def decrypt_payload(keys: PacketKeys, unprotected: UnprotectedHeader) -> bytes:
+    """AEAD-decrypt a packet whose header protection is already off (§5.3).
+
+    Raises cryptography's InvalidTag if authentication fails.
+    """
+    return AESGCM(keys.key).decrypt(
+        _nonce(keys.iv, unprotected.packet_number), unprotected.ciphertext, unprotected.header
+    )
+
+
+def unprotect(
+    keys: PacketKeys, packet: bytes, pn_offset: int, largest_pn: int
+) -> tuple[int, bytes]:
+    """Unprotect one packet: remove header protection, then AEAD (§5.4.1, §5.3).
+
+    For levels whose keys never rotate, where one key set answers both
+    steps. Returns the full packet number and decrypted payload.
+    """
+    unprotected = remove_header_protection(keys.hp, packet, pn_offset, largest_pn)
+    return unprotected.packet_number, decrypt_payload(keys, unprotected)

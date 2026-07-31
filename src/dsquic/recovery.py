@@ -141,6 +141,20 @@ class LossDetection:
             self._last_ack_eliciting_sent[packet.level] = packet.time_sent
         self.controller.on_packet_sent(packet)
 
+    def largest_acked(self, level: EncryptionLevel) -> int:
+        """The largest packet number acknowledged in a space, or -1."""
+        return self._spaces[level].largest_acked
+
+    def oldest_unacked(self, level: EncryptionLevel) -> SentPacket | None:
+        """The oldest packet in a space still awaiting acknowledgment.
+
+        §6.2.4: what a PTO probe retransmits when there is no new data.
+        """
+        sent = self._spaces[level].sent
+        if not sent:
+            return None
+        return sent[min(sent)]
+
     def on_ack_received(
         self, level: EncryptionLevel, ack: Ack, ack_delay: float, now: float
     ) -> AckOutcome:

@@ -24,7 +24,7 @@ set -e
 # over one connection and expects the server to raise stream limits with
 # MAX_STREAMS, which dsquic does not send yet. It advertises 16
 # bidirectional streams and the seventeenth fails.
-SUPPORTED="handshake transfer"
+SUPPORTED="handshake transfer transferloss transfercorruption blackhole longrtt amplificationlimit"
 
 case " $SUPPORTED " in
     *" $TESTCASE "*) ;;
@@ -34,16 +34,26 @@ case " $SUPPORTED " in
         ;;
 esac
 
-# Provided by the runner's network simulator base image; absent when the
-# image is run by hand.
-if [ -f /setup.sh ]; then
+# The base image always ships /setup.sh and /wait-for-it.sh, but they only
+# apply when this container sits on the simulator's network, which the
+# runner's compose topology fixes at 193.167.0.0/16. Running the image by
+# hand puts it on an ordinary bridge, where adding those routes and waiting
+# for a simulator that does not exist would both fail.
+if hostname -I | grep -qE '(^| )193\.167\.'; then
+    IN_SIMULATOR=yes
+else
+    IN_SIMULATOR=no
+fi
+
+if [ "$IN_SIMULATOR" == "yes" ]; then
+    # Disables TX checksum offload, which ns-3 requires, and routes
+    # traffic through the simulator.
     # shellcheck disable=SC1091
     /setup.sh
 fi
 
 if [ "$ROLE" == "client" ]; then
-    # Wait for the simulator, when running under the runner.
-    if [ -f /wait-for-it.sh ]; then
+    if [ "$IN_SIMULATOR" == "yes" ]; then
         /wait-for-it.sh sim:57832 -s -t 30
     fi
     # REQUESTS holds absolute URLs; the endpoint takes a host, a port,
@@ -63,12 +73,16 @@ if [ "$ROLE" == "client" ]; then
         paths="$paths /${rest#*/}"
     done
     echo "dsquic client: $TESTCASE, host=$host port=$port paths=$paths" >&2
+    # The runner gives a test case 60 seconds and its transfer cases move
+    # 10MB over a 10Mbps link, so give up just short of its deadline to
+    # produce a clean error rather than being killed mid-flight.
     # shellcheck disable=SC2086
     exec python -m dsquic.endpoints.client \
         "$host" "$port" $paths \
         --ca /certs/ca.pem \
         --server-name "$host" \
-        --output-dir /downloads
+        --output-dir /downloads \
+        --timeout 55
 else
     echo "dsquic server: $TESTCASE, serving /www on port 443" >&2
     exec python -m dsquic.endpoints.server \

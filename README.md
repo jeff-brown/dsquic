@@ -101,7 +101,14 @@ test sequence:
 `http3` -> `keyupdate` -> `ecn` -> `zerortt`
 
 Primary interop targets are quic-go first, then picoquic as the conformance
-ratchet. See `interop/` for the runner shim.
+ratchet. See `interop/` for the runner shim and current results.
+
+The runner has been run locally against quic-go and aioquic through its
+ns-3 simulator. `handshake` and `transfer` pass in every pairing of the
+three implementations, in both roles; `transferloss`,
+`transfercorruption`, `blackhole`, `longrtt` and `amplificationlimit`
+pass against quic-go in both roles; and `keyupdate` passes with dsquic as
+server.
 
 ## Development
 

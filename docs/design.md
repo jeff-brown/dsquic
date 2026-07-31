@@ -161,6 +161,8 @@ Wire into the runner's client/server interface early (a thin shim). Every milest
 
 HelloRetryRequest is not one of the runner's cases but is inserted after `transfer`, for the reason given below.
 
+Two milestones arrived out of this order because interop forced them, which is the roadmap working as intended rather than a departure from it. Version Negotiation came first of all: the simulator's readiness probe offers an unknown version specifically to elicit a VN packet, so nothing at all ran until dsquic answered it. `keyupdate` came next, because RFC 9001 §6.2 makes responding to a peer's key update mandatory, and quic-go updates keys mid-transfer; without it `transfer` itself could not pass. Responding is implemented and validated; initiating is not, and that is what the `keyupdate` case still needs for the client role.
+
 Also note ECN validation is one of QUIC's more commonly botched corners: a trustworthy reference for correct ECN counting has value well beyond the pedagogical case.
 
 Added after the first interop run: **HelloRetryRequest, and the post-quantum ClientHello.** Go 1.24 and later enable the hybrid group `X25519MLKEM768` by default, so quic-go's ClientHello carries a 1258-byte key_share and runs 1506 bytes in total, spanning four CRYPTO frames across two datagrams. Chrome and Firefox default to the same group. Two consequences:

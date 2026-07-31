@@ -4,10 +4,14 @@ import pytest
 from cryptography.exceptions import InvalidTag
 
 from dsquic.protection import (
+    KEY_PHASE_BIT,
     PacketKeys,
+    decrypt_payload,
     derive_initial_secrets,
     derive_packet_keys,
+    next_generation,
     protect,
+    remove_header_protection,
     unprotect,
 )
 
@@ -162,3 +166,45 @@ def test_unprotect_rejects_tampered_packet() -> None:
 def test_unprotect_rejects_short_packet() -> None:
     with pytest.raises(ValueError, match="too short"):
         unprotect(SERVER_KEYS, SERVER_INITIAL_PROTECTED[:20], PN_OFFSET, largest_pn=-1)
+
+
+# RFC 9001 A.5: the application write secret and the secret that follows
+# it after a key update. A.5 protects its packet with ChaCha20-Poly1305,
+# which dsquic does not implement, but the "quic ku" derivation is the
+# same HKDF-Expand-Label regardless of the AEAD.
+APPLICATION_SECRET = bytes.fromhex(
+    "9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"
+)
+UPDATED_APPLICATION_SECRET = bytes.fromhex(
+    "1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9"
+)
+
+
+def test_next_generation_secret_matches_rfc_vector() -> None:
+    secret, _ = next_generation(APPLICATION_SECRET, derive_packet_keys(APPLICATION_SECRET))
+    assert secret == UPDATED_APPLICATION_SECRET
+
+
+def test_next_generation_keeps_the_header_protection_key() -> None:
+    """§6: a key update replaces the AEAD key and IV, not the hp key."""
+    keys = derive_packet_keys(APPLICATION_SECRET)
+    _, updated = next_generation(APPLICATION_SECRET, keys)
+    assert updated.hp == keys.hp
+    assert updated.key != keys.key
+    assert updated.iv != keys.iv
+
+
+@pytest.mark.parametrize("key_phase", [False, True])
+def test_key_phase_bit_survives_header_protection(key_phase: bool) -> None:
+    """§17.3.1: bit 0x04 of the first byte, recovered after unmasking.
+
+    An empty Destination Connection ID and a one-byte packet number, as
+    in the A.5 example, put the packet number right after the first byte.
+    """
+    first = 0x40 | (KEY_PHASE_BIT if key_phase else 0)
+    header = bytes([first]) + b"\x01"
+    packet = protect(SERVER_KEYS, header, b"\x01" * 32, packet_number=1)
+    unprotected = remove_header_protection(SERVER_KEYS.hp, packet, 1, largest_pn=-1)
+    assert unprotected.key_phase is key_phase
+    assert unprotected.packet_number == 1
+    assert decrypt_payload(SERVER_KEYS, unprotected) == b"\x01" * 32

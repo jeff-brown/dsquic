@@ -118,6 +118,8 @@ class SendStream:
         self.state = SendState.READY
         self._pending = bytearray()
         self._base_offset = 0  # stream offset of _pending[0]
+        self._retransmit: list[Stream] = []  # lost frames, resent verbatim
+        self.highest_offset_sent = 0  # what connection flow control counts
         self._fin_queued = False
         self._fin_sent = False
         self._final_size: int | None = None
@@ -135,7 +137,17 @@ class SendStream:
 
     def next_frame(self, max_bytes: int, connection_credit: int) -> Stream | None:
         """Produce the next STREAM frame within all three budgets: frame
-        size, stream credit (§4.1), and connection credit."""
+        size, stream credit (§4.1), and connection credit.
+
+        Lost frames go first and are resent exactly as they were, which
+        is what keeps offsets consistent: new data always continues from
+        the highest offset ever queued, never from a retransmission.
+        """
+        if self._retransmit and len(self._retransmit[0].data) <= max_bytes:
+            # Retransmissions carry no new offsets, so they consume no
+            # additional flow control credit (§4.1 counts final sizes).
+            return self._retransmit.pop(0)
+
         offset = self._base_offset
         budget = min(
             len(self._pending), max_bytes, self.max_stream_data - offset, connection_credit
@@ -149,6 +161,7 @@ class SendStream:
         self._base_offset += budget
         if fin_now:
             self._fin_sent = True
+        self.highest_offset_sent = max(self.highest_offset_sent, offset + len(chunk))
         # §3.1: Ready -> Send on the first frame; -> Data Sent with FIN.
         self.state = SendState.DATA_SENT if self._fin_sent else SendState.SEND
         return Stream(stream_id=self.stream_id, offset=offset, data=chunk, fin=fin_now)
@@ -170,21 +183,22 @@ class SendStream:
             self.state = SendState.DATA_RECVD
 
     def requeue(self, frame: Stream) -> None:
-        """Put a lost frame's bytes back at the front of the queue (§13.3).
+        """Queue a lost frame to be sent again verbatim (§13.3).
 
-        The frame is resent at its original offset, so the queue base
-        moves back; already-acked bytes may be resent, which is
-        harmless (the receiver's RangeSet merges overlap).
+        The frame keeps its offset and bytes, so it cannot collide with
+        data queued after it. Re-sending bytes the peer already holds is
+        harmless: the receiver's RangeSet merges the overlap.
         """
-        if frame.data:
-            self._pending[:0] = frame.data
-            self._base_offset = min(self._base_offset, frame.offset)
-        if frame.fin:
-            self._fin_sent = False
+        if frame.data or frame.fin:
+            self._retransmit.append(frame)
 
     @property
     def has_pending(self) -> bool:
-        return bool(self._pending) or (self._fin_queued and not self._fin_sent)
+        return (
+            bool(self._retransmit)
+            or bool(self._pending)
+            or (self._fin_queued and not self._fin_sent)
+        )
 
 
 class RecvStream:
@@ -357,11 +371,18 @@ class StreamManager:
         return half.recv
 
     def next_frame(self, stream_id: int, max_bytes: int) -> Stream | None:
-        """Produce a STREAM frame within the connection send budget."""
+        """Produce a STREAM frame within the connection send budget.
+
+        §4.1 measures connection flow control by the sum of the highest
+        offsets sent, not by bytes transmitted, so a retransmission costs
+        nothing: the offsets it carries were charged when first sent.
+        """
+        stream = self.send_stream(stream_id)
         connection_credit = self.max_data - self.data_sent
-        frame = self.send_stream(stream_id).next_frame(max_bytes, connection_credit)
+        before = stream.highest_offset_sent
+        frame = stream.next_frame(max_bytes, connection_credit)
         if frame is not None:
-            self.data_sent += len(frame.data)
+            self.data_sent += stream.highest_offset_sent - before
         return frame
 
     def writable_streams(self) -> list[int]:
