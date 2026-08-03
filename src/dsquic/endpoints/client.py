@@ -8,7 +8,8 @@ protocol logic. Selects the application protocol by negotiated ALPN
 Exercises every client-side protocol code path: handshake, transfer,
 Retry, resumption, key update, ECN, 0-RTT, HTTP/3 requests, and
 CONNECT-UDP. Acts as the client half of the Interop Runner shim (see
-interop/).
+interop/). ``fetch`` puts every request on one connection; ``fetch_each``
+gives each its own, which is the runner's multiconnect case.
 
 Run with: python -m dsquic.endpoints.client
 """
@@ -19,7 +20,7 @@ import selectors
 import socket
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from dsquic import hq
@@ -119,6 +120,33 @@ def fetch(
         sock.close()
 
 
+def fetch_each(
+    host: str,
+    port: int,
+    paths: list[str],
+    options: ClientOptions | None = None,
+) -> dict[str, bytes]:
+    """Fetch each path over its own connection, in sequence.
+
+    The Interop Runner's multiconnect case. Every file costs a fresh
+    handshake, which is how that case tests loss of handshake packets
+    rather than loss of data packets. ``options.timeout`` bounds the
+    whole run rather than each connection, so one slow handshake cannot
+    spend a budget the remaining paths still need.
+    """
+    options = options if options is not None else ClientOptions()
+    deadline = time.monotonic() + options.timeout
+    bodies: dict[str, bytes] = {}
+    for path in paths:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(
+                f"fetched {len(bodies)} of {len(paths)} paths within {options.timeout}s"
+            )
+        bodies.update(fetch(host, port, [path], replace(options, timeout=remaining)))
+    return bodies
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="dsquic reference client")
     parser.add_argument("host")
@@ -131,13 +159,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--server-name", help="SNI name, if it differs from host")
     parser.add_argument("--output-dir", type=Path, help="write bodies here instead of stdout")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--connection-per-request",
+        action="store_true",
+        help="one connection per path, in sequence, instead of one for all of them",
+    )
     args = parser.parse_args(argv)
 
     if not args.insecure and args.ca is None:
         parser.error("--ca is required unless --insecure is given")
     ca_certificates = load_pem_certificates(args.ca) if args.ca is not None else []
 
-    bodies = fetch(
+    bodies = (fetch_each if args.connection_per_request else fetch)(
         host=args.host,
         port=args.port,
         paths=args.paths,

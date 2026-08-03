@@ -300,3 +300,19 @@ Recorded here so the open questions above stay honest:
   `new_reno.py` (RFC 9002 §7, Appendix B) being the baseline and the MVP
   implementation; no stub controllers. Loss detection (§5-§6, `recovery.py`)
   is fixed and not pluggable.
+- **PTO backoff is capped, and the idle floor uses the unscaled PTO
+  (2026-08-03)**: RFC 9000 §10.1 floors the idle timeout at "three times
+  the current Probe Timeout (PTO)". Read as the backed-off value, that
+  floor recedes exactly as fast as the backoff grows and a connection
+  that keeps losing probes never times out; one was observed probing at
+  128-second intervals for over four minutes rather than failing. Both
+  implementations dsquic interops with read it as the unscaled PTO
+  (quic-go `rttStats.PTO(true)*3`, aioquic `3 * get_probe_timeout()`),
+  so `LossDetection.pto()` carries no backoff and is what §10.1 and
+  §10.2 multiply by three. The backoff is kept for arming timers and
+  truncated at 60 seconds, per RFC 8961 §4 requirement 4 ("A maximum
+  value MAY be placed on the RTO. The maximum RTO MUST NOT be less than
+  60 seconds"), the same citation and constant quic-go uses. RFC 9002
+  sets no ceiling of its own. picoquic instead bounds the number of
+  retransmissions rather than the interval; that needs more state and
+  has no QUIC-spec citation, so it was not taken.

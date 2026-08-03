@@ -34,9 +34,16 @@ recorded in `docs/design.md`.
 
 ## Test cases this image attempts
 
-`handshake`, `transfer`, `transferloss`, `transfercorruption`,
-`blackhole`, `longrtt`, and `amplificationlimit`. Everything else exits
-127.
+`handshake`, `transfer`, `multiconnect`, `transferloss`,
+`transfercorruption`, `blackhole`, `longrtt`, and `amplificationlimit`.
+Everything else exits 127.
+
+`multiconnect` is the name the runner gives the client container for the
+`handshakeloss` and `handshakecorruption` cases: 50 files, one connection
+each, so that what is being lost is handshake packets rather than data
+packets. `run_endpoint.sh` maps it to the client's
+`--connection-per-request`, and raises the timeout to 280 seconds because
+the runner allows those cases 300 rather than the usual 60.
 
 This list is a declaration of what to *attempt*, not a result: the runner
 decides pass or fail. Every case listed has been run and passed; see
@@ -91,7 +98,6 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 | Case | Reason |
 |---|---|
 | `multiplexing` | Needs MAX_STREAMS to raise limits; dsquic advertises 16 bidirectional streams and never increases them |
-| `handshakeloss`, `handshakecorruption` | Both run as `multiconnect`, which asks the client for 50 sequential connections on one invocation; the client makes one connection for all of `REQUESTS` |
 | `retry`, `v2` | Retry packets are not generated or parsed, and only QUIC v1 is offered |
 | `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
 | `resumption`, `zerortt` | No session tickets, no 0-RTT |

@@ -246,9 +246,17 @@ def make_ca() -> tuple[bytes, ec.EllipticCurvePrivateKey]:
 
 
 def issue_leaf(
-    ca_key: ec.EllipticCurvePrivateKey, hostname: str
+    ca_key: ec.EllipticCurvePrivateKey, hostname: str, extra_names: int = 0
 ) -> tuple[bytes, ec.EllipticCurvePrivateKey]:
+    """Issue a leaf certificate for ``hostname``.
+
+    ``extra_names`` pads the SAN list, which is how a test asks for a
+    certificate large enough that the server's handshake flight spans
+    several packets and runs into the §8.1 amplification limit.
+    """
     key = ec.generate_private_key(ec.SECP256R1())
+    names = [x509.DNSName(hostname)]
+    names += [x509.DNSName(f"host{index}.{hostname}") for index in range(extra_names)]
     certificate = (
         x509.CertificateBuilder()
         .subject_name(_name(hostname))
@@ -258,7 +266,7 @@ def issue_leaf(
         .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC))
         .not_valid_after(datetime.datetime(2036, 1, 1, tzinfo=datetime.UTC))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
+        .add_extension(x509.SubjectAlternativeName(names), critical=False)
         .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),

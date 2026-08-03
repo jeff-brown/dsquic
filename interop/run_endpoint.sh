@@ -20,11 +20,15 @@ set -e
 # records "unsupported" rather than a failure, and so new cases can be
 # added upstream without breaking this image.
 #
+# multiconnect is the client-side name the runner gives the handshakeloss
+# and handshakecorruption cases: one connection per file rather than one
+# connection carrying every request.
+#
 # multiplexing is deliberately absent: it transfers thousands of files
 # over one connection and expects the server to raise stream limits with
 # MAX_STREAMS, which dsquic does not send yet. It advertises 16
 # bidirectional streams and the seventeenth fails.
-SUPPORTED="handshake transfer transferloss transfercorruption blackhole longrtt amplificationlimit"
+SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit"
 
 case " $SUPPORTED " in
     *" $TESTCASE "*) ;;
@@ -73,16 +77,22 @@ if [ "$ROLE" == "client" ]; then
         paths="$paths /${rest#*/}"
     done
     echo "dsquic client: $TESTCASE, host=$host port=$port paths=$paths" >&2
-    # The runner gives a test case 60 seconds and its transfer cases move
-    # 10MB over a 10Mbps link, so give up just short of its deadline to
-    # produce a clean error rather than being killed mid-flight.
+    # Give up just short of the runner's deadline, so a stall produces a
+    # clean error rather than a container killed mid-flight. The runner
+    # allows 60 seconds for most cases and 300 for multiconnect, which
+    # pays for 50 handshakes under heavy loss instead of one.
+    if [ "$TESTCASE" == "multiconnect" ]; then
+        MODE="--connection-per-request --timeout 280"
+    else
+        MODE="--timeout 55"
+    fi
     # shellcheck disable=SC2086
     exec python -m dsquic.endpoints.client \
         "$host" "$port" $paths \
         --ca /certs/ca.pem \
         --server-name "$host" \
         --output-dir /downloads \
-        --timeout 55
+        $MODE
 else
     echo "dsquic server: $TESTCASE, serving /www on port 443" >&2
     exec python -m dsquic.endpoints.server \

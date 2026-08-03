@@ -9,16 +9,17 @@ import selectors
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from conftest import PemCredentials
 
+from conftest import PemCredentials
 from dsquic import hq
 from dsquic.endpoints import load_pem_certificates
-from dsquic.endpoints.client import ClientOptions, fetch
-from dsquic.endpoints.server import load_credentials, serve_one
+from dsquic.endpoints.client import ClientOptions, fetch, fetch_each
+from dsquic.endpoints.server import Server, load_credentials
 from dsquic.tls import ServerConfig
 
 INDEX_BODY = b"<html>hello from dsquic over real UDP</html>"
@@ -34,9 +35,14 @@ def document_root(tmp_path: Path) -> Path:
     return root
 
 
-@pytest.fixture
-def server(credentials: PemCredentials, document_root: Path) -> Iterator[int]:
-    """A dsquic server on a loopback port, one connection per test."""
+@contextmanager
+def running_server(
+    credentials: PemCredentials, document_root: Path, connection_limit: int
+) -> Generator[tuple[int, Server], None, None]:
+    """A dsquic server on a loopback port, serving a fixed number of
+    connections and then exiting. Yields the port and the server, whose
+    ``connections_served`` is what distinguishes one connection carrying
+    several requests from one connection each."""
     chain, key = load_credentials(credentials.certificate_pem, credentials.private_key_pem)
     server_config = ServerConfig(
         certificate_chain=chain, signing_key=key, alpn=[hq.ALPN], transport_parameters=b""
@@ -47,19 +53,35 @@ def server(credentials: PemCredentials, document_root: Path) -> Iterator[int]:
     port = sock.getsockname()[1]
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
+    running = Server(sock, selector, server_config, document_root, idle_timeout=5.0)
 
-    def run() -> None:
-        serve_one(sock, selector, server_config, document_root, idle_timeout=5.0)
-
-    thread = threading.Thread(target=run, daemon=True)
+    thread = threading.Thread(
+        target=lambda: running.serve(connection_limit=connection_limit), daemon=True
+    )
     thread.start()
     time.sleep(0.05)  # let the bind settle before the client connects
     try:
-        yield port
+        yield port, running
     finally:
-        thread.join(timeout=5.0)
+        thread.join(timeout=15.0)
         selector.close()
         sock.close()
+
+
+@pytest.fixture
+def server(credentials: PemCredentials, document_root: Path) -> Iterator[int]:
+    """A dsquic server on a loopback port, one connection per test."""
+    with running_server(credentials, document_root, connection_limit=1) as (port, _):
+        yield port
+
+
+@pytest.fixture
+def sequential_server(
+    credentials: PemCredentials, document_root: Path
+) -> Iterator[tuple[int, Server]]:
+    """A dsquic server expecting three connections, for multiconnect."""
+    with running_server(credentials, document_root, connection_limit=3) as running:
+        yield running
 
 
 def test_loopback_transfer(credentials: PemCredentials, server: int) -> None:
@@ -146,5 +168,47 @@ def test_certificate_validation_rejects_wrong_name(
                 ca_certificates=load_pem_certificates(credentials.ca_pem),
                 server_name="wrong.example",
                 timeout=3.0,
+            ),
+        )
+
+
+def test_loopback_connection_per_request(
+    credentials: PemCredentials, sequential_server: tuple[int, Server]
+) -> None:
+    """The runner's multiconnect case: a fresh handshake per file, which
+    is what makes it a test of handshake loss rather than data loss."""
+    port, running = sequential_server
+    bodies = fetch_each(
+        host="127.0.0.1",
+        port=port,
+        paths=["/index.html", "/large.bin", "/index.html"],
+        options=ClientOptions(
+            ca_certificates=load_pem_certificates(credentials.ca_pem),
+            server_name="localhost",
+        ),
+    )
+    assert bodies == {"/index.html": INDEX_BODY, "/large.bin": LARGE_BODY}
+    # The server counts a connection once it is reaped, which happens on
+    # its own thread just after the client closes, so wait rather than
+    # race it. Three paths must cost three connections, not one.
+    deadline = time.monotonic() + 5.0
+    while running.connections_served < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert running.connections_served == 3
+
+
+def test_fetch_each_enforces_a_total_deadline(credentials: PemCredentials) -> None:
+    """The timeout bounds the whole run, so an exhausted budget stops the
+    remaining paths instead of granting each a fresh one. Nothing is
+    listening on the port: the deadline is what is under test."""
+    with pytest.raises(TimeoutError, match="fetched 0 of 3 paths"):
+        fetch_each(
+            host="127.0.0.1",
+            port=1,
+            paths=["/index.html", "/large.bin", "/absent.bin"],
+            options=ClientOptions(
+                ca_certificates=load_pem_certificates(credentials.ca_pem),
+                server_name="localhost",
+                timeout=0.0,
             ),
         )

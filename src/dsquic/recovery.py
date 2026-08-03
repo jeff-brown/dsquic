@@ -26,6 +26,11 @@ TIME_THRESHOLD = 9 / 8  # kTimeThreshold (§6.1.2)
 GRANULARITY = 0.001  # kGranularity, seconds (A.2)
 INITIAL_RTT = 0.333  # kInitialRtt, seconds (§6.2.2)
 PERSISTENT_CONGESTION_THRESHOLD = 3  # kPersistentCongestionThreshold (§7.6.1)
+# RFC 8961 §4, requirement 4: "A maximum value MAY be placed on the RTO.
+# The maximum RTO MUST NOT be less than 60 seconds." RFC 9002 sets no
+# ceiling of its own, so an unbounded backoff would let probe intervals
+# double past any useful timescale. quic-go truncates at the same value.
+MAX_PTO = 60.0
 
 
 class AckOfUnsentPacket(Exception):
@@ -128,32 +133,35 @@ class LossDetection:
         self._max_ack_delay = max_ack_delay
         self._pto_count = 0
         self._spaces = {level: _Space() for level in EncryptionLevel}
-        # When an ack-eliciting packet was last sent in each space. Kept
-        # after those packets are acknowledged, because the anti-deadlock
-        # PTO of §6.2.2.1 arms relative to it with nothing in flight.
-        self._last_ack_eliciting_sent: dict[EncryptionLevel, float] = {}
+        # When this endpoint last did anything recovery cares about. A.8
+        # arms the anti-deadlock PTO at "now() + duration", and this is
+        # the most recent moment A.8 would have been evaluated at.
+        self._last_event: float | None = None
 
     def on_packet_sent(self, packet: SentPacket) -> None:
         space = self._spaces[packet.level]
         space.sent[packet.packet_number] = packet
         space.largest_sent = max(space.largest_sent, packet.packet_number)
-        if packet.ack_eliciting:
-            self._last_ack_eliciting_sent[packet.level] = packet.time_sent
+        self._last_event = packet.time_sent
         self.controller.on_packet_sent(packet)
 
     def largest_acked(self, level: EncryptionLevel) -> int:
         """The largest packet number acknowledged in a space, or -1."""
         return self._spaces[level].largest_acked
 
-    def oldest_unacked(self, level: EncryptionLevel) -> SentPacket | None:
-        """The oldest packet in a space still awaiting acknowledgment.
+    def unacked(self, level: EncryptionLevel) -> list[SentPacket]:
+        """Every packet in a space still awaiting acknowledgment, oldest
+        first.
 
         §6.2.4: what a PTO probe retransmits when there is no new data.
+        The whole flight, not just its oldest packet: a handshake flight
+        spans several packets, and resending one per PTO recovers it at
+        the rate the backoff doubles, which is far slower than the peer's
+        handshake timeout. aioquic reschedules all outstanding CRYPTO for
+        the same reason.
         """
         sent = self._spaces[level].sent
-        if not sent:
-            return None
-        return sent[min(sent)]
+        return [sent[number] for number in sorted(sent)]
 
     def on_ack_received(
         self, level: EncryptionLevel, ack: Ack, ack_delay: float, now: float
@@ -163,6 +171,7 @@ class LossDetection:
         ``ack_delay`` is the decoded delay in seconds; the connection
         applies the peer's ack_delay_exponent before calling.
         """
+        self._last_event = now
         space = self._spaces[level]
         if ack.largest > space.largest_sent:
             raise AckOfUnsentPacket(f"ACK for unsent packet {ack.largest} at {level.name}")
@@ -247,13 +256,26 @@ class LossDetection:
         span = eliciting[-1].time_sent - eliciting[0].time_sent
         return span > duration
 
+    def pto(self) -> float:
+        """The PTO interval without the §6.2.4 backoff.
+
+        This is what RFC 9000 §10.1 and §10.2 mean by "the PTO" when they
+        floor the idle timeout and the closing period at three of them.
+        Reading it as the backed-off value makes those deadlines recede
+        exactly as fast as the backoff grows, so a connection that keeps
+        losing probes never times out at all. quic-go and aioquic both
+        use the unscaled value here (design.md appendix).
+        """
+        return self.rtt.smoothed + max(4 * self.rtt.rttvar, GRANULARITY) + self._max_ack_delay
+
     def _pto_duration(self, level: EncryptionLevel) -> float:
         """§6.2.1: PTO = smoothed_rtt + max(4*rttvar, granularity), plus the
-        peer's max_ack_delay in the application space, backed off per §6.2.4."""
+        peer's max_ack_delay in the application space, backed off per
+        §6.2.4 and truncated at MAX_PTO per RFC 8961 §4."""
         duration = self.rtt.smoothed + max(4 * self.rtt.rttvar, GRANULARITY)
         if level is EncryptionLevel.ONE_RTT:
             duration += self._max_ack_delay
-        return duration * (1 << self._pto_count)
+        return min(duration * (1 << self._pto_count), MAX_PTO)
 
     def _earliest_loss_time(self) -> tuple[float, EncryptionLevel] | None:
         candidates = [
@@ -302,23 +324,27 @@ class LossDetection:
         """§6.2.2.1: a client arms a PTO even with nothing in flight, so a
         lost server flight cannot deadlock the handshake.
 
-        The timer runs from the last ack-eliciting packet this client
-        actually sent, which is not the same as what is still in flight:
-        those packets may all have been acknowledged.
+        A.8 arms this one from the current time rather than from the last
+        ack-eliciting packet, and the difference matters: a client that
+        has only ever sent ACK-only Handshake packets has no such packet
+        to anchor to, and anchoring to one would leave it with no timer
+        at all, waiting on a flight that will never be retransmitted.
+        The last recovery event stands in for "now": it is the most
+        recent moment at which A.8 would have set this timer.
         """
+        if self._last_event is None:
+            return None  # nothing sent yet; the handshake has not started
         level = (
             EncryptionLevel.INITIAL
             if not self._spaces[EncryptionLevel.INITIAL].discarded
             else EncryptionLevel.HANDSHAKE
         )
-        last_sent = self._last_ack_eliciting_sent.get(level)
-        if last_sent is None:
-            return None  # nothing sent at this level yet; nothing to probe
-        return last_sent + self._pto_duration(level)
+        return self._last_event + self._pto_duration(level)
 
     def on_loss_detection_timeout(self, now: float) -> TimeoutOutcome:
         """The timer fired: declare time-threshold losses, or back off the
         PTO and ask the connection to send a probe (§6.2.4, A.9)."""
+        self._last_event = now
         loss = self._earliest_loss_time()
         if loss is not None:
             return TimeoutOutcome(lost=self._detect_and_remove_lost(loss[1], now), probe_level=None)

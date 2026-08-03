@@ -16,9 +16,11 @@ Packet numbers, ACK state, and CRYPTO reassembly exist once per packet
 number space (Initial, Handshake, Application), keyed by
 tls.EncryptionLevel.
 
-Not in this MVP: Retry, Version Negotiation, migration, key update,
-stateless reset, NEW_CONNECTION_ID issuance, and 0-RTT. Received frames
-for those features are parsed and ignored where the spec permits.
+Key update is implemented (RFC 9001 §6); Version Negotiation is answered
+statelessly in packet.py, before any connection exists. Not in this MVP:
+Retry, migration, stateless reset, NEW_CONNECTION_ID issuance, and
+0-RTT. Received frames for those features are parsed and ignored where
+the spec permits.
 """
 
 import enum
@@ -94,6 +96,11 @@ CONNECTION_ID_LENGTH = 8
 AMPLIFICATION_FACTOR = 3  # §8.1: server send limit before address validation
 MAX_ACK_RANGES = 32  # bound the ACK frames we build
 MAX_CRYPTO_BUFFER = 65536  # §7.5: a receiver may bound CRYPTO reassembly
+# RFC 9002 §6.2.4 permits up to two datagrams per PTO, "to avoid an
+# expensive consecutive PTO expiration due to a single lost datagram".
+# The PTO doubles on every expiry, so one unlucky probe is not one lost
+# round trip: it doubles the wait for every attempt that follows.
+PROBE_PACKETS = 2
 
 LEVEL_TO_PACKET_TYPE = {
     EncryptionLevel.INITIAL: PacketType.INITIAL,
@@ -170,6 +177,11 @@ class _Space:
     ack_eliciting_pending: bool = False
     crypto_offset_sent: int = 0
     crypto_pending: bytearray = field(default_factory=bytearray)
+    # §13.3: lost CRYPTO frames are resent verbatim, from their own
+    # queue. They cannot be spliced back into crypto_pending, whose
+    # first byte is by definition at crypto_offset_sent: prepending
+    # earlier bytes there mislabels every frame that follows.
+    crypto_retransmit: list[Crypto] = field(default_factory=list[Crypto])
     # Receive-side CRYPTO reassembly (§19.6). Deliberately separate from
     # stream reassembly: CRYPTO has offsets but no stream ID, no flow
     # control, and one ordered byte stream per encryption level.
@@ -283,7 +295,7 @@ class Connection:
         self._bytes_received = 0
         self._bytes_sent = 0
         self._address_validated = is_client
-        self._idle_deadline: float | None = None
+        self._idle_started: float | None = None
         self._closing_deadline: float | None = None
         self._peer_cid_confirmed = not is_client  # §7.2
         self._largest_time_received: dict[EncryptionLevel, float] = {}
@@ -392,7 +404,7 @@ class Connection:
         space.keys_recv_previous = space.keys_recv
         # §6.5: reordered packets from the old phase stay decryptable for
         # three PTOs, and no longer.
-        space.keys_recv_previous_expiry = now + 3 * self._pto_estimate()
+        space.keys_recv_previous_expiry = now + 3 * self.recovery.pto()
         space.keys_recv = space.keys_recv_next
         space.secret_recv_next, space.keys_recv_next = next_generation(
             current_secret, space.keys_recv
@@ -429,6 +441,7 @@ class Connection:
         space.keys_send = None
         space.keys_recv = None
         space.crypto_pending.clear()
+        space.crypto_retransmit.clear()
         self.recovery.discard_space(level)
 
     # --- receive path ---------------------------------------------------------
@@ -449,11 +462,10 @@ class Connection:
     def _datagram_received(self, data: bytes, now: float, source: object) -> None:
         if self.state in (ConnectionState.TERMINATED, ConnectionState.DRAINING):
             return
+        # §8.1: an Initial validates nothing by itself, but every received
+        # byte grows the server's send budget. Validation itself happens
+        # on the first Handshake packet, in _process_packet.
         self._bytes_received += len(data)
-        if not self.is_client and not self._address_validated:
-            # §8.1: a datagram containing a valid Initial validates nothing
-            # by itself, but receiving any packet grows the send budget.
-            self._address_validated = self.state is ConnectionState.CONNECTED
         if self.destination is None and source is not None:
             self.destination = source
         offset = 0
@@ -508,9 +520,15 @@ class Connection:
             space.largest_received = packet_number
             self._largest_time_received[level] = now
         if not self.is_client and level is EncryptionLevel.HANDSHAKE:
-            # §4.9.1: the server discards Initial keys on the first
-            # successfully processed Handshake packet.
+            # RFC 9001 §4.9.1: the server discards Initial keys on the
+            # first successfully processed Handshake packet. RFC 9000
+            # §8.1: the same packet validates the client's address, since
+            # Handshake keys prove the client processed the server's
+            # Initial. Waiting for the handshake to complete instead
+            # would strand any server whose flight is larger than three
+            # times the client's, which a real certificate chain is.
             self._discard_space(EncryptionLevel.INITIAL)
+            self._address_validated = True
         self._handle_payload(level, payload, now)
         return packet_end
 
@@ -602,9 +620,7 @@ class Connection:
         space = self._spaces[packet.level]
         for frame in packet.frames:
             if isinstance(frame, Crypto):
-                # Re-queue at the front: CRYPTO must stay ordered.
-                space.crypto_pending[:0] = frame.data
-                space.crypto_offset_sent = min(space.crypto_offset_sent, frame.offset)
+                space.crypto_retransmit.append(frame)
             elif isinstance(frame, Stream) and self.streams is not None:
                 stream = self.streams.send_stream(frame.stream_id)
                 stream.requeue(frame)
@@ -613,20 +629,26 @@ class Connection:
         """§6.2.4: give a PTO probe something worth carrying.
 
         A probe sends new data when there is any and retransmits the
-        oldest unacknowledged data otherwise. A bare PING satisfies the
+        unacknowledged data otherwise. A bare PING satisfies the
         requirement to be ack-eliciting but redelivers nothing, so a lost
         ClientHello would stall the handshake until the idle timer: PTO
         is the only loss signal when no ACK ever arrives.
+
+        The whole outstanding flight is requeued, not just its oldest
+        packet. A handshake flight spans several packets, and resending
+        one per PTO recovers it only as fast as the backoff doubles: a
+        server rebuilding a lost certificate flight that way takes tens
+        of seconds, and the peer abandons the handshake first.
         """
         if self._has_pending_data(level):
             return
-        oldest = self.recovery.oldest_unacked(level)
-        if oldest is not None:
-            self._requeue_lost(oldest)
+        for packet in self.recovery.unacked(level):
+            self._requeue_lost(packet)
 
     def _has_pending_data(self, level: EncryptionLevel) -> bool:
         """Whether anything is already queued to send at a level."""
-        if self._spaces[level].crypto_pending:
+        space = self._spaces[level]
+        if space.crypto_pending or space.crypto_retransmit:
             return True
         if level is not EncryptionLevel.ONE_RTT:
             return False
@@ -799,8 +821,9 @@ class Connection:
         """
         controller = self.recovery.controller
         budget = controller.congestion_window - controller.bytes_in_flight
-        if any(self._probes_pending.values()):
-            budget = max(budget, self.config.max_datagram_size)
+        probes = sum(self._probes_pending.values())
+        if probes:
+            budget = max(budget, probes * self.config.max_datagram_size)
         if not self.is_client and not self._address_validated:
             budget = min(budget, AMPLIFICATION_FACTOR * self._bytes_received - self._bytes_sent)
         return budget
@@ -832,6 +855,17 @@ class Connection:
             if packet is None:
                 continue
             payload += packet
+            if self.is_client and level is EncryptionLevel.HANDSHAKE:
+                # RFC 9001 §4.9.1: a client MUST discard Initial keys when
+                # it first sends a Handshake packet, which abandons loss
+                # recovery for that space. Keeping it alive strands the
+                # connection: the server has already dropped its Initial
+                # keys, so the client's last Initial packet can never be
+                # acknowledged, its PTO stays the earliest of the three
+                # spaces forever, and every probe goes to a level the
+                # peer can no longer read while the Handshake flight sits
+                # unsent.
+                self._discard_space(EncryptionLevel.INITIAL)
             if pad_to:
                 break
         if not payload:
@@ -853,9 +887,24 @@ class Connection:
                 used += encoded
                 space.ack_eliciting_pending = False
 
-        if space.crypto_pending:
-            overhead = 16  # type, offset, length varints, generously bounded
-            available = max(0, room - used - overhead)
+        overhead = 16  # type, offset, length varints, generously bounded
+        available = max(0, room - used - overhead)
+        if space.crypto_retransmit and available:
+            # §13.3: lost bytes go first, and keep the offset they were
+            # sent with. A frame too big for what is left is split, which
+            # CRYPTO allows because every frame carries its own offset.
+            lost = space.crypto_retransmit[0]
+            chunk = lost.data[:available]
+            if len(chunk) < len(lost.data):
+                space.crypto_retransmit[0] = Crypto(
+                    offset=lost.offset + len(chunk), data=lost.data[len(chunk) :]
+                )
+            else:
+                space.crypto_retransmit.pop(0)
+            crypto = Crypto(offset=lost.offset, data=chunk)
+            chosen.append(crypto)
+            used += len(crypto.encode())
+        elif space.crypto_pending:
             chunk = bytes(space.crypto_pending[:available])
             if chunk:
                 del space.crypto_pending[:available]
@@ -1020,7 +1069,7 @@ class Connection:
     def _on_connection_close(self, frame: ConnectionClose, now: float) -> None:
         """§10.2.2: entering the draining state; no further packets are sent."""
         self.state = ConnectionState.DRAINING
-        self._closing_deadline = now + 3 * self._pto_estimate()
+        self._closing_deadline = now + 3 * self.recovery.pto()
         self._events.append(
             ConnectionTerminated(
                 error_code=frame.error_code, reason=frame.reason.decode("utf-8", "replace")
@@ -1062,25 +1111,35 @@ class Connection:
                 )
             packet = protect(space.keys_send, header, payload, packet_number)
             self._close_sent = True
-            self._closing_deadline = now + 3 * self._pto_estimate()
+            self._closing_deadline = now + 3 * self.recovery.pto()
             return [OutgoingDatagram(data=packet, destination=self.destination)]
         return []
-
-    def _pto_estimate(self) -> float:
-        return self.recovery.rtt.smoothed + 4 * self.recovery.rtt.rttvar
 
     # --- timers ---------------------------------------------------------------
 
     def _arm_idle_timer(self, now: float) -> None:
-        """§10.1: idle timeout from the negotiated minimum, floored at 3 PTO."""
+        """§10.1: start the idle period. The deadline itself is computed
+        on demand, because the floor it depends on moves."""
+        self._idle_started = now
+
+    @property
+    def _idle_deadline(self) -> float | None:
+        """§10.1: the negotiated minimum idle timeout, floored at three
+        times the PTO.
+
+        Derived on demand rather than stored, because the RTT estimate it
+        depends on moves. The floor uses the unscaled PTO deliberately;
+        see the design.md appendix.
+        """
+        if self._idle_started is None:
+            return None  # the idle period starts at the first packet
         local_ms = self._local_parameters.max_idle_timeout_ms
         peer_ms = self.peer_parameters.max_idle_timeout_ms if self.peer_parameters else 0
         candidates = [value for value in (local_ms, peer_ms) if value > 0]
         if not candidates:
-            self._idle_deadline = None
-            return
+            return None
         timeout = min(candidates) / 1000
-        self._idle_deadline = now + max(timeout, 3 * self._pto_estimate())
+        return self._idle_started + max(timeout, 3 * self.recovery.pto())
 
     def next_timer(self) -> float | None:
         """When the caller must call handle_timer (design.md §4.7)."""
@@ -1117,7 +1176,11 @@ class Connection:
                 self._requeue_lost(packet)
             if outcome.probe_level is not None:
                 # §6.2.4: a PTO sends ack-eliciting data at that level.
-                self._probes_pending[outcome.probe_level] += 1
+                self._probes_pending[outcome.probe_level] += PROBE_PACKETS
+                # Once per timeout, not once per probe packet: a probe is
+                # itself unacknowledged, so requeueing the outstanding
+                # flight per packet would compound, each probe adding
+                # itself to what the next one resends.
                 self._prepare_probe(outcome.probe_level)
 
     # --- application interface -------------------------------------------------

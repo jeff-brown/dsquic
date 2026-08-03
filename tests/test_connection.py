@@ -14,6 +14,7 @@ from dsquic.connection import (
     StreamDataReceived,
 )
 from dsquic.packet import parse_long_header
+from dsquic.recovery import MAX_PTO
 from dsquic.tls import ClientConfig, EncryptionLevel, ServerConfig
 from test_tls import Credentials, issue_leaf, make_ca
 
@@ -206,6 +207,120 @@ class TestStreams:
 
 
 class TestRecovery:
+    def test_a_silent_peer_eventually_times_the_connection_out(
+        self, credentials: Credentials
+    ) -> None:
+        """§10.1: the idle period is the negotiated timeout floored at
+        three times the PTO, where "the PTO" is the unscaled one.
+
+        Reading it as the backed-off PTO instead would make the deadline
+        recede exactly as fast as the backoff grows, and a connection
+        that keeps losing probes would never time out at all. quic-go
+        and aioquic both use the unscaled value.
+        """
+        client, _ = make_pair(credentials)
+        client.connect(0.0)
+        assert client.datagrams_to_send(0.0)  # nothing reaches the server
+
+        now = 0.0
+        for _ in range(40):
+            timer = client.next_timer()
+            assert timer is not None
+            now = timer
+            client.handle_timer(now)
+            client.datagrams_to_send(now)
+            if client.state is ConnectionState.TERMINATED:
+                break
+
+        assert client.state is ConnectionState.TERMINATED
+        # The negotiated 30s dominates the 3 x PTO floor at these RTTs.
+        assert 30.0 <= now < 40.0
+
+    def test_pto_backoff_is_capped(self, credentials: Credentials) -> None:
+        """RFC 8961 §4: a maximum MAY be placed on the timer, and MUST
+        NOT be less than 60 seconds. RFC 9002 sets no ceiling of its own,
+        so without one the interval doubles past any useful timescale.
+        """
+        client, _ = make_pair(credentials)
+        client.connect(0.0)
+        client.datagrams_to_send(0.0)
+
+        now = 0.0
+        for _ in range(30):
+            timer = client.next_timer()
+            assert timer is not None
+            previous, now = now, timer
+            client.handle_timer(now)
+            client.datagrams_to_send(now)
+            assert now - previous <= MAX_PTO
+            if client.state is ConnectionState.TERMINATED:
+                break
+        assert client.recovery.pto() < MAX_PTO  # unscaled, so far below it
+
+    def test_handshake_completes_when_a_large_flight_is_lost(self) -> None:
+        """§13.3: a lost CRYPTO frame is resent with the offset it was
+        sent with.
+
+        Splicing lost bytes back into the pending buffer instead would
+        mislabel every frame sent after them, since that buffer's first
+        byte is by definition the next offset to send. The peer's TLS
+        then reassembles bytes under the wrong offsets and fails.
+
+        The certificate is deliberately large: the server's flight has
+        to outrun its §8.1 amplification budget so that CRYPTO bytes are
+        still waiting to be sent when an earlier packet is declared
+        lost. That is the state in which the offsets diverge.
+        """
+        ca_der, ca_key = make_ca()
+        leaf_der, leaf_key = issue_leaf(ca_key, "localhost", extra_names=200)
+        credentials = Credentials(chain=[leaf_der], key=leaf_key, ca=[ca_der], ca_key=ca_key)
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        now = 0.0
+        datagrams = 0
+        for _ in range(80):
+            for datagram in client.datagrams_to_send(now):
+                datagrams += 1
+                if datagrams % 3:  # every third datagram is lost
+                    server.datagram_received(datagram.data, now, source="client")
+            now += 0.01
+            for datagram in server.datagrams_to_send(now):
+                datagrams += 1
+                if datagrams % 3:
+                    client.datagram_received(datagram.data, now, source="server")
+            now += 0.01
+            for connection in (client, server):
+                timer = connection.next_timer()
+                if timer is not None and timer <= now:
+                    connection.handle_timer(now)
+            if ConnectionState.CONNECTED is client.state is server.state:
+                break
+
+        assert client.state is ConnectionState.CONNECTED
+        assert server.state is ConnectionState.CONNECTED
+
+    def test_pto_sends_two_probes(self, credentials: Credentials) -> None:
+        """§6.2.4: up to two datagrams per PTO, "to avoid an expensive
+        consecutive PTO expiration due to a single lost datagram".
+
+        The PTO doubles on every expiry, so one unlucky probe costs more
+        than a round trip: it doubles the wait for every attempt after
+        it. The first probe carries the outstanding flight; the second
+        carries whatever is left of it, or a PING once it is drained,
+        since every probe packet must be ack-eliciting.
+        """
+        client, _ = make_pair(credentials)
+        client.connect(0.0)
+        assert len(client.datagrams_to_send(0.0)) == 1  # the first flight, lost
+
+        probe_at = client.next_timer()
+        assert probe_at is not None
+        client.handle_timer(probe_at)
+        probes = client.datagrams_to_send(probe_at)
+        assert len(probes) == 2
+        for probe in probes:
+            assert len(probe.data) >= 1200  # §14.1 still applies to a probe
+
     def test_lost_client_hello_is_retransmitted_on_pto(self, credentials: Credentials) -> None:
         """§6.2.4: before any ACK arrives, PTO is the only loss signal, so
         the probe has to carry the ClientHello. A bare PING is
