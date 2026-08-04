@@ -321,6 +321,84 @@ class TestRecovery:
         for probe in probes:
             assert len(probe.data) >= 1200  # §14.1 still applies to a probe
 
+    def test_one_rtt_is_not_processed_before_the_handshake_completes(
+        self, credentials: Credentials
+    ) -> None:
+        """RFC 9001 §5.7: a server MUST NOT process 1-RTT packets before
+        the TLS handshake is complete, and cannot acknowledge them.
+
+        It holds 1-RTT keys as soon as it has sent its own Finished, so
+        a client packet that overtakes the client's Finished decrypts
+        perfectly well. Acting on it means acting on a client that has
+        not yet been authenticated, and the frames arrive before there
+        is any application state to put them in.
+        """
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        now = 0.0
+        # Run the handshake far enough that the server has 1-RTT keys but
+        # has not seen the client's Finished: deliver only to the client.
+        for _ in range(4):
+            for datagram in client.datagrams_to_send(now):
+                server.datagram_received(datagram.data, now, source="client")
+            now += 0.01
+            server_flight = server.datagrams_to_send(now)
+            for datagram in server_flight:
+                client.datagram_received(datagram.data, now, source="server")
+            now += 0.01
+            if server_flight:
+                break
+
+        assert server.state is ConnectionState.HANDSHAKING
+        client.take_events()
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, hq.encode_request("/early"), end_stream=True)
+        # Deliver only the 1-RTT packets, holding back the Finished.
+        for datagram in client.datagrams_to_send(now):
+            if not datagram.data[0] & 0x80:
+                server.datagram_received(datagram.data, now, source="client")
+
+        # The packet is dropped rather than acted on, so the server is
+        # still waiting for the Finished and has raised no error.
+        assert not [e for e in server.take_events() if isinstance(e, ConnectionTerminated)]
+        assert server.state is ConnectionState.HANDSHAKING
+
+    def test_lost_handshake_done_is_retransmitted(self, credentials: Credentials) -> None:
+        """§13.3: HANDSHAKE_DONE MUST be retransmitted until acknowledged.
+
+        The client confirms the handshake on this frame and nothing
+        else, and confirmation is what makes it discard its Handshake
+        keys (RFC 9001 §4.9.2). Drop it once and the client keeps
+        probing a space the server has already discarded keys for, so
+        the probes can never be acknowledged and eventually fill its
+        congestion window.
+        """
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        now = 0.0
+        dropped = False
+        for _ in range(40):
+            for datagram in client.datagrams_to_send(now):
+                server.datagram_received(datagram.data, now, source="client")
+            now += 0.01
+            for datagram in server.datagrams_to_send(now):
+                # The server's first short-header datagram is the one
+                # carrying HANDSHAKE_DONE.
+                if not dropped and not datagram.data[0] & 0x80:
+                    dropped = True
+                    continue
+                client.datagram_received(datagram.data, now, source="server")
+            now += 0.01
+            for connection in (client, server):
+                timer = connection.next_timer()
+                if timer is not None and timer <= now:
+                    connection.handle_timer(now)
+            if dropped and client.keys_discarded(EncryptionLevel.HANDSHAKE):
+                break
+
+        assert dropped, "the server never sent a 1-RTT packet to drop"
+        assert client.keys_discarded(EncryptionLevel.HANDSHAKE)
+
     def test_lost_client_hello_is_retransmitted_on_pto(self, credentials: Credentials) -> None:
         """§6.2.4: before any ACK arrives, PTO is the only loss signal, so
         the probe has to carry the ClientHello. A bare PING is

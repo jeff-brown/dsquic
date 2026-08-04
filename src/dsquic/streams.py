@@ -234,8 +234,11 @@ class RecvStream:
         self._buffer[frame.offset : end] = frame.data
         self._received.add(frame.offset, end)
         self.highest_offset = max(self.highest_offset, end)
-        # §3.2: Recv -> Size Known on FIN; -> Data Recvd when all bytes are in.
-        if self.final_size is not None:
+        # §3.2: Recv -> Size Known on FIN; -> Data Recvd when all bytes are
+        # in. Data Read is terminal, so a retransmitted frame does not move
+        # the stream back out of it: the states in Figure 3 only advance,
+        # and regressing would report the end of the stream a second time.
+        if self.final_size is not None and self.state is not RecvState.DATA_READ:
             self.state = RecvState.SIZE_KNOWN
             if self._received.covers(0, self.final_size):
                 self.state = RecvState.DATA_RECVD

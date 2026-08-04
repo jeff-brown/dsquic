@@ -13,16 +13,15 @@ step 5, the recorded definition of MVP done.
 
 Runner results, locally hosted (see "Interop Runner results" below):
 `handshake` and `transfer` pass in every pairing of dsquic, quic-go and
-aioquic, in both roles. Against quic-go, dsquic as client passes eight of
-the nine cases it attempts, `handshake`, `transfer`, `handshakeloss`,
-`handshakecorruption`, `transferloss`, `transfercorruption`, `longrtt`
-and `amplificationlimit`, with `blackhole` intermittent. As server it
-passes the same set except `handshakeloss` and `handshakecorruption`,
-which are an open gap recorded below, and it passes `keyupdate`.
+aioquic, in both roles. As **server** dsquic passes every case it
+attempts against quic-go, aioquic, picoquic and quiche, plus `keyupdate`.
+As **client** it passes everything against picoquic and quiche, and all
+but `handshakeloss` and `handshakecorruption` against aioquic, which are
+the open item recorded below.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  315 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  318 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -73,17 +72,46 @@ hardcodes `/tmp` for its working directories.
   then
   `cd ~/quic-interop-runner && .venv/bin/python run.py -s dsquic -c quic-go -t handshake,transfer`.
 
+## Reproducing loss locally, without the runner
+
+An Interop Runner cycle is 90 seconds and yields a pcap. The three
+server-side defects listed under "What interop and the wire found" were
+found instead with a 60-line UDP relay that forwards between a real peer
+and a dsquic endpoint while dropping
+every third datagram in each direction, deterministically so a failure
+repeats exactly. Point quic-go's `hq-client` at the relay and the relay
+at `dsquic.endpoints.server`, and the runner's handshakeloss conditions
+reproduce in seconds, with the server available for ordinary printf
+debugging and unlimited restarts.
+
+Two things that only that view showed: the reference server was dying of
+an uncaught `ValueError` and taking every connection on the socket with
+it, and the connection was terminating itself with PROTOCOL_VIOLATION
+rather than stalling. Neither is visible in a capture, which shows only
+that packets stopped.
+
+Worth rebuilding rather than rediscovering. The pieces are a relay that
+keys one upstream socket per client address, and a server harness that
+prints per-connection state whenever it changes.
+
 ## Interop Runner results (2026-08-03)
 
 Every pairing of dsquic, quic-go and aioquic, each as both client and
 server, passes `handshake` and `transfer` through the ns-3 simulator: a
 full 3x3 matrix of `✓(H,DC)`.
 
-Against quic-go, dsquic as client passes `✓(H,DC,L1,C1,L2,C2,LR,A)`,
-eight of the nine cases it attempts. As server it passes
-`✓(H,DC,L2,C2,B,LR,A)`. `keyupdate` passes with dsquic as server, `✓(U)`,
-which the runner verifies by reading key phase bits out of the pcap with
-Wireshark.
+Against quic-go, dsquic as client passes `✓(H,DC,C1,L2,C2,LR,A,B)` and
+as server `✓(H,DC,L1,C1,L2,C2,LR,A)`. `keyupdate` passes with dsquic as
+server, `✓(U)`, which the runner verifies by reading key phase bits out
+of the pcap with Wireshark.
+
+Against aioquic, picoquic and quiche on `handshake`, `transfer`,
+`handshakeloss`, `handshakecorruption` and `transferloss`, dsquic as
+**server** passes all five against all three, `✓(H,DC,L1,C1,L2)` in every
+column. That is four independent implementations behind the server-side
+fixes, picoquic among them, which design.md picks as the conformance
+ratchet. As **client** picoquic and quiche also pass all five; aioquic
+does not, and that is the open item below.
 
 Two cautions about reading these results:
 
@@ -92,50 +120,68 @@ Two cautions about reading these results:
   their own and in a later combined run. Contention, not protocol, but
   it means a single red square is worth re-running before believing.
 - `handshakeloss` and `handshakecorruption` run as `multiconnect`: 50
-  files, one connection each. `endpoints.client.fetch_each` provides
+  files, one connection each, which is what makes them the only cases
+  that lose *handshake* packets. `endpoints.client.fetch_each` provides
   that, bounding the whole run rather than each connection so one slow
-  handshake cannot spend a budget the remaining files still need.
-  **They pass with dsquic as client and fail with dsquic as server**;
-  see the open gap below.
+  handshake cannot spend a budget the remaining files still need. As
+  server both pass; as client `handshakeloss` is intermittent, recorded
+  below.
 
-## Open gap: handshakeloss and handshakecorruption as server
+## Open: handshakeloss and handshakecorruption as client, vs aioquic
 
-dsquic as client passes both, `✓(L1,C1)`, repeatedly. dsquic as server
-does not. This is not a regression: before multiconnect existed the shim
-exited 127 for these cases, so the server side had never run them.
+As **server** these are fixed and confirmed against four peers. As
+**client** they fail consistently against aioquic, pass against picoquic
+and quiche, and are intermittent against quic-go.
 
-What the capture shows, from the most recent run. The client's Initial
-arrives and the server answers at t=0.564 with an Initial (1208 bytes)
-and a Handshake packet (737). The client replies at t=0.565 with a
-coalesced Initial+Handshake and then a short-header packet, so it has
-1-RTT keys. The client then sends 82-byte Handshake packets at 0.696,
-0.696 and 0.952, still wanting something. The server sends nothing at
-all until 1.757, then three 30-byte 1-RTT packets, then goes silent. The
-whole trace is 73 packets, so barely one connection of the fifty. quic-go
-gives up with "timeout: no recent network activity", an idle timeout
-rather than a handshake timeout, so the connection was established and
-then stalled.
+It is not the VM and it is not emulation. aioquic, picoquic and quiche
+are all amd64 images running emulated on an aarch64 host, and two of the
+three pass, so emulation is controlled for. It is also **not a
+regression**: an image built from the previous commit fails the same two
+cases against aioquic in the same way, so the three server-side fixes
+revealed this rather than caused it. It had never been run before,
+because client-versus-aioquic loss cases were not part of any earlier
+matrix.
 
-The server reaching 1-RTT means it confirmed the handshake, which for a
-server happens on completion (RFC 9001 §4.1.2) and discards Handshake
-keys (§4.9.2). The question to answer next is what the client was still
-asking for with those 82-byte Handshake packets, and whether the server
-had by then thrown away the keys needed to answer. Sequential
-connections themselves are fine:
-`tests/endpoints/test_client.py::test_loopback_connection_per_request`
-drives three over loopback and asserts the server served exactly three,
-so this is loss-specific rather than multiconnect-specific.
+This pairing is hard across the ecosystem, which lowers the priority. In
+the public run at
+`https://interop.seemann.io/logs/quic/2026-08-03T17:17/result.json`,
+aioquic as server is failed on `handshakeloss` by quic-go, ngtcp2, lsquic
+and go-x-net, and on `handshakecorruption` by lsquic, quinn and
+go-x-net. aioquic sits mid-pack among servers for these two cases, 4 of
+14 and 3 of 14; mvfst fails 13 of 14 and quiche fails 9 of 14 on
+corruption, while picoquic and neqo are clean. Note that dsquic passes
+both against quiche, which most clients do not, and against picoquic.
+
+That said, 10 of the 14 clients that attempt it do pass against aioquic,
+so this is not an exoneration: most stacks handle whatever the
+interaction is.
+
+Nor is it reproducible with the loss relay: fifty sequential connections
+complete 50/50, twice over, at a higher uniform loss rate than the runner
+uses. Two differences worth chasing, in order:
+
+- The runner drops three datagrams consecutively (`burst_to_server=3`)
+  where the relay drops every third and so never drops two in a row. A
+  PTO sends its two probes back-to-back, so a burst can take both, which
+  is exactly the case two probes exist to survive. Teaching the relay to
+  drop in bursts is the cheapest next experiment, and aioquic can be
+  driven locally since it is already a dev dependency.
+- dsquic does not coalesce a copy of the Finished ahead of its 1-RTT
+  packets, which RFC 9001 §5.7 recommends "until one of the Handshake
+  packets is acknowledged". Once our Finished is sent, a retransmitted
+  request goes out as a bare 1-RTT datagram. Against a server enforcing
+  §5.7 strictly that costs a round trip per attempt rather than
+  breaking, but under burst loss the round trips compound.
 
 ## In-flight work
 
-`origin/main` is at 8ff2809, "Pass the Interop Runner: add Version
-Negotiation and key update, fix three recovery bugs". Staged and awaiting
-commit is the multiconnect work and the six defects it uncovered: the
-client's `fetch_each`, verbatim CRYPTO retransmission, the client's
-Initial key discard, the anti-deadlock PTO anchor, server address
-validation on the first Handshake packet, two probes per PTO, and probes
-that requeue the whole outstanding flight. Plus the settled decision on
-bounding the PTO backoff, recorded in the design.md appendix.
+`origin/main` is at c24c855, "Add multiconnect; fix six defects it
+uncovered under handshake loss". Staged and awaiting
+commit are the three server-side defects: HANDSHAKE_DONE (and the
+flow control frames) retransmitted on loss per §13.3, 1-RTT packets not
+processed before the handshake completes per RFC 9001 §5.7, and Data
+Read made terminal so a retransmitted final frame cannot report the end
+of a stream twice.
 
 ## What interop and the wire found that self-testing did not
 
@@ -230,6 +276,41 @@ the one before it:
   15.4s, 19.4s, 27.4s, 43.4s, 75.4s, 139.4s and 267.4s: ten attempts in
   four and a half minutes. Both probes now carry the lost CRYPTO rather
   than a copy plus a PING.
+
+Three more came from running those cases with dsquic as *server*, which
+had never been exercised before multiconnect existed. All three need
+both loss and a peer that retransmits, so nothing below the runner could
+have reached them:
+
+- **A lost HANDSHAKE_DONE was never retransmitted**, against §13.3's
+  "MUST be retransmitted until it is acknowledged". `_requeue_lost`
+  handled CRYPTO and STREAM frames and silently dropped every other
+  type. The client confirms the handshake on that frame and nothing
+  else, so losing it left the client holding Handshake keys and probing
+  a space the server had already discarded keys for. Those probes can
+  never be acknowledged, so they accumulated in flight, 17 then 65 then
+  129 packets, until the congestion window was full of them and the
+  client could no longer send its actual request. MAX_DATA and
+  MAX_STREAM_DATA were dropped the same way and are now re-sent with
+  their current values, as §13.3 requires.
+- **1-RTT packets were processed before the handshake completed**
+  (RFC 9001 §5.7: "Endpoints in either role MUST NOT decrypt 1-RTT
+  packets from their peer prior to completing the handshake", and "A
+  server MUST NOT process incoming 1-RTT protected packets before the
+  TLS handshake is complete"). A server holds 1-RTT keys from the moment
+  it sends its own Finished, so a request that overtakes the client's
+  Finished decrypts perfectly well. dsquic decrypted it, found a STREAM
+  frame, had no stream manager yet, and killed its own connection with
+  PROTOCOL_VIOLATION. Such packets are now dropped unacknowledged, which
+  is the point: an acknowledgement claims the frames were handled.
+- **A retransmitted final frame reopened a completed stream.**
+  `RecvStream.on_stream_frame` set the receive state unconditionally, so
+  a duplicate of a stream's last frame moved it from Data Read back to
+  Data Recvd; the next read re-entered Data Read and reported the end of
+  the stream a second time. RFC 9000 §3.2 Figure 3 makes Data Read
+  terminal. The reference server answered the same request twice and
+  died on "write after fin", an uncaught crash that took down every
+  connection sharing the socket.
 
 And the one that mattered most, also found this way:
 

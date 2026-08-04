@@ -476,39 +476,62 @@ class Connection:
             offset += consumed
         self._arm_idle_timer(now)
 
+    def _locate_packet(self, data: bytes) -> tuple[EncryptionLevel, int, bytes, int] | None:
+        """Find one packet at the front of a datagram (§12.2).
+
+        Returns its level, packet number offset, bytes, and where the
+        next packet begins, or None when nothing further is parseable.
+        Connection ID bookkeeping that depends only on the header
+        happens here, before any key is involved.
+        """
+        if not data[0] & 0x80:
+            # §17.3: a short header packet runs to the end of the datagram.
+            pn_offset = parse_short_header(data, len(self.host_cid)).pn_offset
+            return EncryptionLevel.ONE_RTT, pn_offset, data, len(data)
+        long_header = parse_long_header(data)
+        level = {
+            PacketType.INITIAL: EncryptionLevel.INITIAL,
+            PacketType.HANDSHAKE: EncryptionLevel.HANDSHAKE,
+        }.get(long_header.packet_type)
+        if level is None:
+            return None  # 0-RTT: not supported, stop parsing this datagram
+        if not self.is_client and level is EncryptionLevel.INITIAL:
+            self._adopt_client_initial(long_header.destination_cid, long_header.source_cid)
+        elif self.is_client and not self._peer_cid_confirmed:
+            # §7.2: the client switches to the server's chosen source
+            # connection ID from its first server packet.
+            self.peer_cid = long_header.source_cid
+            self._peer_cid_confirmed = True
+        packet_end = long_header.pn_offset + long_header.length
+        return level, long_header.pn_offset, data[:packet_end], packet_end
+
     def _process_packet(self, data: bytes, now: float) -> int:
         """Unprotect and handle one packet; returns bytes consumed."""
         try:
-            if data[0] & 0x80:
-                long_header = parse_long_header(data)
-                level = {
-                    PacketType.INITIAL: EncryptionLevel.INITIAL,
-                    PacketType.HANDSHAKE: EncryptionLevel.HANDSHAKE,
-                }.get(long_header.packet_type)
-                if level is None:
-                    return 0  # 0-RTT: not supported, stop parsing this datagram
-                pn_offset = long_header.pn_offset
-                packet_end = long_header.pn_offset + long_header.length
-                packet = data[:packet_end]
-                if not self.is_client and level is EncryptionLevel.INITIAL:
-                    self._adopt_client_initial(long_header.destination_cid, long_header.source_cid)
-                elif self.is_client and not self._peer_cid_confirmed:
-                    # §7.2: the client switches to the server's chosen
-                    # source connection ID from its first server packet.
-                    self.peer_cid = long_header.source_cid
-                    self._peer_cid_confirmed = True
-            else:
-                # §17.3: a short header packet runs to the end of the datagram.
-                level = EncryptionLevel.ONE_RTT
-                pn_offset = parse_short_header(data, len(self.host_cid)).pn_offset
-                packet = data
-                packet_end = len(data)
+            located = self._locate_packet(data)
         except (HeaderParseError, BufferReadError, UnsupportedVersion):
-            return 0  # §5.2: undecodable packets are discarded silently
+            located = None
+        if located is None:
+            # §5.2: undecodable packets are discarded silently, and an
+            # unsupported type ends the datagram, since without its
+            # length the next packet cannot be found.
+            return 0
+        level, pn_offset, packet, packet_end = located
 
         space = self._spaces[level]
         if space.keys_recv is None or space.discarded:
             return packet_end  # no keys yet: drop, keep parsing the datagram
+        if level is EncryptionLevel.ONE_RTT and self.state is ConnectionState.HANDSHAKING:
+            # RFC 9001 §5.7: 1-RTT packets MUST NOT be decrypted before
+            # the handshake completes, and a server MUST NOT process
+            # them: it has the keys but no assurance about the client
+            # until the Finished arrives. Dropping rather than
+            # acknowledging is the point, since an acknowledgement would
+            # claim the frames were handled; the peer retransmits. A
+            # peer that coalesces its 1-RTT packets behind a Handshake
+            # packet carrying Finished, as §5.7 recommends, completes
+            # the handshake earlier in this same loop and is unaffected.
+            return packet_end
         decrypted = self._decrypt(space, level, packet, pn_offset, now)
         if decrypted is None:
             return packet_end  # §12.2: failed decryption is not fatal
@@ -624,6 +647,23 @@ class Connection:
             elif isinstance(frame, Stream) and self.streams is not None:
                 stream = self.streams.send_stream(frame.stream_id)
                 stream.requeue(frame)
+            elif isinstance(frame, HandshakeDone):
+                # §13.3: "MUST be retransmitted until it is
+                # acknowledged". Dropping it strands the client, which
+                # confirms the handshake on this frame and nothing else:
+                # it keeps its Handshake keys and goes on probing a space
+                # the server has already discarded keys for, filling its
+                # congestion window with packets that can never be
+                # acknowledged.
+                self._handshake_done_pending = True
+            elif isinstance(frame, MaxData) and self.streams is not None:
+                # §13.3: the current limit is sent, not the lost one.
+                self._queue_control(MaxData(maximum=self.streams.local_max_data))
+            elif isinstance(frame, MaxStreamData) and self.streams is not None:
+                recv = self.streams.recv_stream(frame.stream_id)
+                self._queue_control(
+                    MaxStreamData(stream_id=frame.stream_id, maximum=recv.max_stream_data)
+                )
 
     def _prepare_probe(self, level: EncryptionLevel) -> None:
         """§6.2.4: give a PTO probe something worth carrying.
@@ -697,8 +737,14 @@ class Connection:
             recv = self.streams.on_stream_frame(frame)
         except StreamError as exc:
             raise ConnectionError_(exc.error_code, str(exc)) from exc
+        # §13.3: a peer retransmits stream data until it is acknowledged,
+        # so the same frame arrives more than once as a matter of course.
+        # The end of a stream is reported exactly once even so: an
+        # application told twice that a request finished answers it
+        # twice, and the second answer is a write after FIN.
+        was_fully_read = recv.is_fully_read
         data = recv.read()
-        if data or recv.state.name in ("DATA_RECVD", "DATA_READ"):
+        if data or (recv.is_fully_read and not was_fully_read):
             self._events.append(
                 StreamDataReceived(
                     stream_id=frame.stream_id,

@@ -162,6 +162,24 @@ class TestRecvStream:
         assert stream.read() == b"world"
         assert stream.state is RecvState.DATA_READ
 
+    def test_retransmitted_frame_does_not_reopen_a_read_stream(self) -> None:
+        """§3.2, Figure 3: Data Read is terminal.
+
+        A peer retransmits until acknowledged, so the last frame of a
+        stream arrives again as a matter of course. Letting that move the
+        stream back to Data Recvd makes the next read re-enter Data Read
+        and report the end of the stream a second time.
+        """
+        stream = RecvStream(0, max_stream_data=1000)
+        frame = Stream(stream_id=0, offset=0, data=b"hello", fin=True)
+        stream.on_stream_frame(frame)
+        assert stream.read() == b"hello"
+        assert stream.state is RecvState.DATA_READ
+
+        stream.on_stream_frame(frame)  # the peer retransmits it
+        assert stream.state is RecvState.DATA_READ
+        assert stream.read() == b""
+
     def test_out_of_order_reassembly(self) -> None:
         stream = RecvStream(0, max_stream_data=1000)
         stream.on_stream_frame(Stream(stream_id=0, offset=6, data=b"world", fin=True))
