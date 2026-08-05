@@ -25,7 +25,7 @@ protocol or application behaviour of its own.
 | `/www` | server: document root, served on port 443 |
 | `/certs` | `cert.pem`, `priv.key` for the server; `ca.pem` for both |
 | `SSLKEYLOGFILE` | NSS key log, so the runner's pcaps decrypt |
-| `QLOGDIR` | qlog output directory (not yet emitted) |
+| `QLOGDIR` | qlog output directory; one `.sqlog` per connection |
 
 `/certs` is mounted into both containers, so the client validates the
 server certificate against `ca.pem` with the SNI taken from the request
@@ -81,12 +81,20 @@ bug, but it is worth re-running rather than assuming.
 
 ## Results
 
-Against quic-go and aioquic through the ns-3 simulator, in both roles:
-`handshake` and `transfer` pass in every pairing of dsquic, quic-go and
-aioquic. `transferloss`, `transfercorruption`, `blackhole`, `longrtt`
-and `amplificationlimit` pass against quic-go in both roles.
-`keyupdate` passes with dsquic as server, which the runner verifies by
-reading key phase bits out of the pcap.
+Through the ns-3 simulator, against quic-go, aioquic, picoquic and
+quiche.
+
+As **server**, every case attempted passes against all four peers,
+including `handshakeloss` and `handshakecorruption`. `keyupdate` passes
+too, which the runner verifies by reading key phase bits out of the
+pcap.
+
+As **client**, everything passes against picoquic and quiche;
+`handshakeloss` and `handshakecorruption` fail against aioquic and
+`handshakeloss` is intermittent against quic-go. That pairing is hard
+across the ecosystem: in the public run of 2026-08-03, aioquic as server
+is failed on `handshakeloss` by quic-go, ngtcp2, lsquic and go-x-net.
+See STATE.md for the detail and the next diagnostic step.
 
 ## Before a real runner submission
 
@@ -111,19 +119,22 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 
 ## Scale, for reference
 
-The runner enumerates 17 registered implementations (14 that act as both
-client and server, plus chrome as a client and haproxy and nginx as
-servers) against 23 test cases. Adding dsquic would mean 16 pairings as a
-client and 15 as a server, 31 in total, each across the case list.
+The runner enumerates 18 registered implementations against 23 test
+cases. dsquic against all of them in both roles is 34 pairings, which at
+the observed per-case timings is an overnight run rather than an
+interactive one.
 
 ## Known gaps
 
-- **No qlog.** `QLOGDIR` is accepted and ignored until `qlog.py` exists.
-- **The full runner needs Linux.** It orchestrates with docker-compose and
-  an ns-3 network simulator. The image contract can be verified by hand on
-  macOS, as below, but the test matrix wants a Linux host or CI.
+- **IPv4 only.** Both endpoints open `AF_INET` sockets, so `ipv6` cannot
+  pass.
+- **linux/amd64 for upstream.** See above; local runs are aarch64.
 
-## Verifying by hand
+## Verifying the image contract by hand
+
+The full matrix runs under colima, as above. The image contract itself
+can also be checked without any simulator, which is quicker when the
+question is whether the shim honours ROLE, TESTCASE and the mounts.
 
 With Apple's `container` (`brew install container`). Containers must
 resolve each other by name, because the URL host has to match a

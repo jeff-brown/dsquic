@@ -21,7 +21,8 @@ Module map (each module docstring cites the RFC sections it implements):
     qpack       - QPACK field compression (RFC 9204)
     masque      - MASQUE proxying: CONNECT-UDP (RFC 9298)
     hq          - hq-interop application protocol (no RFC; Interop Runner)
-    qlog        - qlog structured event output (draft-ietf-quic-qlog)
+    qlog        - qlog event output, sequential JSON-SEQ
+                  (draft-ietf-quic-qlog-main-schema-14, -quic-events-13)
 
     endpoints/  - the I/O boundary; reference endpoints
       client    - reference client (python -m dsquic.endpoints.client)

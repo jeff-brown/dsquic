@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, replace
 
 from cryptography.exceptions import InvalidTag
 
-from dsquic import frames
+from dsquic import frames, qlog
 from dsquic.buffer import BufferReadError
 from dsquic.congestion import CongestionController
 from dsquic.frames import (
@@ -74,6 +74,7 @@ from dsquic.protection import (
     protect,
     remove_header_protection,
 )
+from dsquic.qlog import QlogTrace
 from dsquic.recovery import AckOfUnsentPacket, LossDetection, SentPacket
 from dsquic.streams import FlowControlLimits, RangeSet, RecvStream, StreamError, StreamManager
 from dsquic.tls import (
@@ -96,15 +97,18 @@ CONNECTION_ID_LENGTH = 8
 AMPLIFICATION_FACTOR = 3  # §8.1: server send limit before address validation
 MAX_ACK_RANGES = 32  # bound the ACK frames we build
 MAX_CRYPTO_BUFFER = 65536  # §7.5: a receiver may bound CRYPTO reassembly
-# RFC 9002 §6.2.4 permits up to two datagrams per PTO, "to avoid an
-# expensive consecutive PTO expiration due to a single lost datagram".
-# The PTO doubles on every expiry, so one unlucky probe is not one lost
-# round trip: it doubles the wait for every attempt that follows.
-PROBE_PACKETS = 2
+PROBE_PACKETS = 2  # §6.2.4: up to two datagrams per PTO
 
 LEVEL_TO_PACKET_TYPE = {
     EncryptionLevel.INITIAL: PacketType.INITIAL,
     EncryptionLevel.HANDSHAKE: PacketType.HANDSHAKE,
+}
+
+# qlog packet type names (events §5.5).
+_QLOG_PACKET_TYPE = {
+    EncryptionLevel.INITIAL: "initial",
+    EncryptionLevel.HANDSHAKE: "handshake",
+    EncryptionLevel.ONE_RTT: "1RTT",
 }
 
 
@@ -177,10 +181,8 @@ class _Space:
     ack_eliciting_pending: bool = False
     crypto_offset_sent: int = 0
     crypto_pending: bytearray = field(default_factory=bytearray)
-    # §13.3: lost CRYPTO frames are resent verbatim, from their own
-    # queue. They cannot be spliced back into crypto_pending, whose
-    # first byte is by definition at crypto_offset_sent: prepending
-    # earlier bytes there mislabels every frame that follows.
+    # §13.3: lost CRYPTO frames, resent verbatim. Kept apart from
+    # crypto_pending, whose first byte is at crypto_offset_sent.
     crypto_retransmit: list[Crypto] = field(default_factory=list[Crypto])
     # Receive-side CRYPTO reassembly (§19.6). Deliberately separate from
     # stream reassembly: CRYPTO has offsets but no stream ID, no flow
@@ -235,6 +237,10 @@ class ConnectionConfig:
         )
     )
     keylog: Callable[[str], None] | None = None
+    # Opens a trace, given the group ID, the role, and the reference
+    # clock reading. A factory because a server learns the group ID from
+    # the client's first Initial (§7.2).
+    qlog: Callable[[bytes, bool, float], QlogTrace | None] | None = None
 
 
 class Connection:
@@ -296,6 +302,7 @@ class Connection:
         self._bytes_sent = 0
         self._address_validated = is_client
         self._idle_started: float | None = None
+        self._qlog: QlogTrace | None = None
         self._closing_deadline: float | None = None
         self._peer_cid_confirmed = not is_client  # §7.2
         self._largest_time_received: dict[EncryptionLevel, float] = {}
@@ -415,6 +422,7 @@ class Connection:
         # Nothing has been received in the new phase yet, so packets
         # still in flight from the peer belong to the old one (§6.5).
         space.key_phase_first = None
+        self._log(now, qlog.KEY_UPDATED, {"key_type": "1RTT", "key_phase": int(space.key_phase)})
 
     def initiate_key_update(self, now: float) -> bool:
         """Start the next key phase, reporting whether it started (§6.1).
@@ -432,11 +440,12 @@ class Connection:
         self._rotate_keys(space, now)
         return True
 
-    def _discard_space(self, level: EncryptionLevel) -> None:
+    def _discard_space(self, level: EncryptionLevel, now: float) -> None:
         """§4.9: drop a level's keys and its recovery state."""
         space = self._spaces[level]
         if space.discarded:
             return
+        self._log(now, qlog.KEY_DISCARDED, {"key_type": _QLOG_PACKET_TYPE[level]})
         space.discarded = True
         space.keys_send = None
         space.keys_recv = None
@@ -457,6 +466,11 @@ class Connection:
             self._datagram_received(data, now, source)
         except ConnectionError_ as exc:
             self.close(error_code=exc.error_code, reason=exc.reason, frame_type=exc.frame_type)
+            self._log(
+                now,
+                qlog.CONNECTION_CLOSED,
+                {"initiator": "local", "error_code": exc.error_code, "reason": exc.reason},
+            )
             self._events.append(ConnectionTerminated(error_code=exc.error_code, reason=exc.reason))
 
     def _datagram_received(self, data: bytes, now: float, source: object) -> None:
@@ -476,7 +490,9 @@ class Connection:
             offset += consumed
         self._arm_idle_timer(now)
 
-    def _locate_packet(self, data: bytes) -> tuple[EncryptionLevel, int, bytes, int] | None:
+    def _locate_packet(
+        self, data: bytes, now: float
+    ) -> tuple[EncryptionLevel, int, bytes, int] | None:
         """Find one packet at the front of a datagram (§12.2).
 
         Returns its level, packet number offset, bytes, and where the
@@ -496,6 +512,7 @@ class Connection:
         if level is None:
             return None  # 0-RTT: not supported, stop parsing this datagram
         if not self.is_client and level is EncryptionLevel.INITIAL:
+            self._open_qlog(long_header.destination_cid, now)
             self._adopt_client_initial(long_header.destination_cid, long_header.source_cid)
         elif self.is_client and not self._peer_cid_confirmed:
             # §7.2: the client switches to the server's chosen source
@@ -505,52 +522,111 @@ class Connection:
         packet_end = long_header.pn_offset + long_header.length
         return level, long_header.pn_offset, data[:packet_end], packet_end
 
+    # --- qlog ------------------------------------------------------------------
+
+    def _open_qlog(self, group_id: bytes, now: float) -> None:
+        """Start a trace, keyed by the original destination CID."""
+        if self._qlog is not None or self.config.qlog is None:
+            return
+        self._qlog = self.config.qlog(group_id, self.is_client, now)
+        self._log(now, qlog.CONNECTION_STARTED, {"dst_cid": group_id.hex()})
+
+    def _log(self, now: float, name: str, data: dict[str, object]) -> None:
+        """Record one qlog event, when the caller asked for a trace."""
+        if self._qlog is not None:
+            self._qlog.log(now, name, data)
+
+    def _log_recovery_metrics(self, now: float) -> None:
+        """Record congestion window, bytes in flight, and RTT (§7.2)."""
+        controller = self.recovery.controller
+        self._log(
+            now,
+            qlog.RECOVERY_METRICS_UPDATED,
+            {
+                "congestion_window": controller.congestion_window,
+                "bytes_in_flight": controller.bytes_in_flight,
+                "smoothed_rtt": self.recovery.rtt.smoothed * 1000,
+                "rtt_variance": self.recovery.rtt.rttvar * 1000,
+                "latest_rtt": self.recovery.rtt.latest * 1000,
+                "pto_count": self.recovery.pto_count,
+            },
+        )
+
+    def _drop(
+        self,
+        now: float,
+        trigger: str,
+        length: int,
+        level: EncryptionLevel | None = None,
+        packet_number: int | None = None,
+    ) -> None:
+        """Record a discarded packet and why (events §5.7)."""
+        if self._qlog is None:
+            return
+        header: dict[str, object] = {}
+        if level is not None:
+            header["packet_type"] = _QLOG_PACKET_TYPE[level]
+        if packet_number is not None:
+            header["packet_number"] = packet_number
+        data: dict[str, object] = {"trigger": trigger, "raw": {"length": length}}
+        if header:
+            data["header"] = header
+        self._qlog.log(now, qlog.PACKET_DROPPED, data)
+
     def _process_packet(self, data: bytes, now: float) -> int:
         """Unprotect and handle one packet; returns bytes consumed."""
         try:
-            located = self._locate_packet(data)
+            located = self._locate_packet(data, now)
         except (HeaderParseError, BufferReadError, UnsupportedVersion):
             located = None
         if located is None:
             # §5.2: undecodable packets are discarded silently, and an
             # unsupported type ends the datagram, since without its
             # length the next packet cannot be found.
+            self._drop(now, qlog.DROP_INVALID, len(data))
             return 0
         level, pn_offset, packet, packet_end = located
 
         space = self._spaces[level]
         if space.keys_recv is None or space.discarded:
-            return packet_end  # no keys yet: drop, keep parsing the datagram
+            # No keys yet, or the space is retired: drop this packet and
+            # keep parsing the datagram.
+            self._drop(now, qlog.DROP_KEY_UNAVAILABLE, packet_end, level)
+            return packet_end
         if level is EncryptionLevel.ONE_RTT and self.state is ConnectionState.HANDSHAKING:
-            # RFC 9001 §5.7: 1-RTT packets MUST NOT be decrypted before
-            # the handshake completes, and a server MUST NOT process
-            # them: it has the keys but no assurance about the client
-            # until the Finished arrives. Dropping rather than
-            # acknowledging is the point, since an acknowledgement would
-            # claim the frames were handled; the peer retransmits. A
-            # peer that coalesces its 1-RTT packets behind a Handshake
-            # packet carrying Finished, as §5.7 recommends, completes
-            # the handshake earlier in this same loop and is unaffected.
+            # RFC 9001 §5.7: 1-RTT packets are neither decrypted nor
+            # processed before the handshake completes, and are not
+            # acknowledged, since an acknowledgement asserts the frames
+            # were handled. The peer retransmits.
+            self._drop(now, qlog.DROP_GENERAL, packet_end, level)
             return packet_end
         decrypted = self._decrypt(space, level, packet, pn_offset, now)
         if decrypted is None:
-            return packet_end  # §12.2: failed decryption is not fatal
+            # §12.2: failed decryption is not fatal.
+            self._drop(now, qlog.DROP_DECRYPTION_FAILURE, packet_end, level)
+            return packet_end
         packet_number, payload = decrypted
         if space.received.covers(packet_number, packet_number + 1):
-            return packet_end  # already processed
+            self._drop(now, qlog.DROP_DUPLICATE, packet_end, level, packet_number)
+            return packet_end
+        self._log(
+            now,
+            qlog.PACKET_RECEIVED,
+            {
+                "header": {"packet_type": _QLOG_PACKET_TYPE[level], "packet_number": packet_number},
+                "raw": {"length": packet_end},
+            },
+        )
         space.received.add(packet_number, packet_number + 1)
         if packet_number > space.largest_received:
             space.largest_received = packet_number
             self._largest_time_received[level] = now
         if not self.is_client and level is EncryptionLevel.HANDSHAKE:
             # RFC 9001 §4.9.1: the server discards Initial keys on the
-            # first successfully processed Handshake packet. RFC 9000
-            # §8.1: the same packet validates the client's address, since
-            # Handshake keys prove the client processed the server's
-            # Initial. Waiting for the handshake to complete instead
-            # would strand any server whose flight is larger than three
-            # times the client's, which a real certificate chain is.
-            self._discard_space(EncryptionLevel.INITIAL)
+            # first Handshake packet it processes. RFC 9000 §8.1: that
+            # packet also validates the client's address, since Handshake
+            # keys prove the client processed the server's Initial.
+            self._discard_space(EncryptionLevel.INITIAL, now)
             self._address_validated = True
         self._handle_payload(level, payload, now)
         return packet_end
@@ -612,7 +688,7 @@ class Connection:
             # §7.3: the client confirms the handshake on HANDSHAKE_DONE.
             if not self.is_client:
                 raise ConnectionError_(frames.PROTOCOL_VIOLATION, "client sent HANDSHAKE_DONE")
-            self._confirm_handshake()
+            self._confirm_handshake(now)
         elif isinstance(frame, ConnectionClose):
             self._on_connection_close(frame, now)
         # Frames for deferred features (NEW_CONNECTION_ID, PATH_CHALLENGE,
@@ -632,11 +708,22 @@ class Connection:
                 if isinstance(acked_frame, Stream) and self.streams is not None:
                     self.streams.send_stream(acked_frame.stream_id).on_frame_acked(acked_frame)
         for packet in outcome.lost:
+            self._log(
+                now,
+                qlog.PACKET_LOST,
+                {
+                    "header": {
+                        "packet_type": _QLOG_PACKET_TYPE[packet.level],
+                        "packet_number": packet.packet_number,
+                    }
+                },
+            )
             self._requeue_lost(packet)
+        self._log_recovery_metrics(now)
         if self.is_client and level is EncryptionLevel.HANDSHAKE:
             # §4.9.1: the client discards Initial keys once it sends a
             # Handshake packet; acknowledgment proves it did.
-            self._discard_space(EncryptionLevel.INITIAL)
+            self._discard_space(EncryptionLevel.INITIAL, now)
 
     def _requeue_lost(self, packet: SentPacket) -> None:
         """§13.3: resend the frames of a lost packet, not the packet."""
@@ -648,13 +735,8 @@ class Connection:
                 stream = self.streams.send_stream(frame.stream_id)
                 stream.requeue(frame)
             elif isinstance(frame, HandshakeDone):
-                # §13.3: "MUST be retransmitted until it is
-                # acknowledged". Dropping it strands the client, which
-                # confirms the handshake on this frame and nothing else:
-                # it keeps its Handshake keys and goes on probing a space
-                # the server has already discarded keys for, filling its
-                # congestion window with packets that can never be
-                # acknowledged.
+                # §13.3: retransmitted until acknowledged. The client
+                # confirms the handshake on this frame alone (§4.1.2).
                 self._handshake_done_pending = True
             elif isinstance(frame, MaxData) and self.streams is not None:
                 # §13.3: the current limit is sent, not the lost one.
@@ -668,17 +750,9 @@ class Connection:
     def _prepare_probe(self, level: EncryptionLevel) -> None:
         """§6.2.4: give a PTO probe something worth carrying.
 
-        A probe sends new data when there is any and retransmits the
-        unacknowledged data otherwise. A bare PING satisfies the
-        requirement to be ack-eliciting but redelivers nothing, so a lost
-        ClientHello would stall the handshake until the idle timer: PTO
-        is the only loss signal when no ACK ever arrives.
-
-        The whole outstanding flight is requeued, not just its oldest
-        packet. A handshake flight spans several packets, and resending
-        one per PTO recovers it only as fast as the backoff doubles: a
-        server rebuilding a lost certificate flight that way takes tens
-        of seconds, and the peer abandons the handshake first.
+        New data when there is any, the whole outstanding flight
+        otherwise. A PING is the fallback in _pending_frames when there
+        is neither.
         """
         if self._has_pending_data(level):
             return
@@ -737,11 +811,9 @@ class Connection:
             recv = self.streams.on_stream_frame(frame)
         except StreamError as exc:
             raise ConnectionError_(exc.error_code, str(exc)) from exc
-        # §13.3: a peer retransmits stream data until it is acknowledged,
-        # so the same frame arrives more than once as a matter of course.
-        # The end of a stream is reported exactly once even so: an
-        # application told twice that a request finished answers it
-        # twice, and the second answer is a write after FIN.
+        # §13.3: stream data is retransmitted until acknowledged, so a
+        # frame arrives more than once. The end of the stream is reported
+        # once: the state machine reaches Data Read only once (§3.2).
         was_fully_read = recv.is_fully_read
         data = recv.read()
         if data or (recv.is_fully_read and not was_fully_read):
@@ -782,6 +854,17 @@ class Connection:
     def _on_handshake_complete(self, event: HandshakeComplete, now: float) -> None:
         self.alpn = event.alpn
         self.peer_parameters = decode_transport_parameters(event.peer_transport_parameters)
+        self._log(
+            now,
+            qlog.PARAMETERS_SET,
+            {
+                # events §5.3
+                "initiator": "remote",
+                "initial_max_data": self.peer_parameters.initial_max_data,
+                "initial_max_streams_bidi": self.peer_parameters.initial_max_streams_bidi,
+                "max_idle_timeout": self.peer_parameters.max_idle_timeout_ms,
+            },
+        )
         self._validate_peer_parameters()
         local = self._local_parameters
         peer = self.peer_parameters
@@ -808,7 +891,7 @@ class Connection:
         if not self.is_client:
             # §7.3: the server confirms immediately and tells the client.
             self._handshake_done_pending = True
-            self._confirm_handshake()
+            self._confirm_handshake(now)
         self._arm_idle_timer(now)
 
     def _validate_peer_parameters(self) -> None:
@@ -828,13 +911,13 @@ class Connection:
                     "original_destination_connection_id mismatch",
                 )
 
-    def _confirm_handshake(self) -> None:
+    def _confirm_handshake(self, now: float) -> None:
         """§4.9.2: confirmation discards Handshake keys and enables the
         application-space PTO."""
         self.recovery.handshake_confirmed = True
-        self._discard_space(EncryptionLevel.HANDSHAKE)
+        self._discard_space(EncryptionLevel.HANDSHAKE, now)
         if self.is_client:
-            self._discard_space(EncryptionLevel.INITIAL)
+            self._discard_space(EncryptionLevel.INITIAL, now)
         self._events.append(HandshakeConfirmed(alpn=self.alpn))
 
     # --- send path ------------------------------------------------------------
@@ -911,7 +994,7 @@ class Connection:
                 # spaces forever, and every probe goes to a level the
                 # peer can no longer read while the Handshake flight sits
                 # unsent.
-                self._discard_space(EncryptionLevel.INITIAL)
+                self._discard_space(EncryptionLevel.INITIAL, now)
             if pad_to:
                 break
         if not payload:
@@ -1068,6 +1151,15 @@ class Connection:
         packet = protect(space.keys_send, header, payload, packet_number)
 
         ack_eliciting = any(is_ack_eliciting(frame) for frame in chosen)
+        self._log(
+            now,
+            qlog.PACKET_SENT,
+            {
+                "header": {"packet_type": _QLOG_PACKET_TYPE[level], "packet_number": packet_number},
+                "raw": {"length": len(packet)},
+                "frames": [{"frame_type": qlog.frame_type(frame)} for frame in chosen],
+            },
+        )
         self.recovery.on_packet_sent(
             SentPacket(
                 level=level,
@@ -1116,11 +1208,13 @@ class Connection:
         """§10.2.2: entering the draining state; no further packets are sent."""
         self.state = ConnectionState.DRAINING
         self._closing_deadline = now + 3 * self.recovery.pto()
-        self._events.append(
-            ConnectionTerminated(
-                error_code=frame.error_code, reason=frame.reason.decode("utf-8", "replace")
-            )
+        reason = frame.reason.decode("utf-8", "replace")
+        self._log(
+            now,
+            qlog.CONNECTION_CLOSED,
+            {"initiator": "remote", "error_code": frame.error_code, "reason": reason},
         )
+        self._events.append(ConnectionTerminated(error_code=frame.error_code, reason=reason))
 
     def _build_close_datagram(self, now: float) -> list[OutgoingDatagram]:
         """§10.2.1: CONNECTION_CLOSE is sent at the highest ready level."""
@@ -1213,6 +1307,11 @@ class Connection:
             return
         if self._idle_deadline is not None and now >= self._idle_deadline:
             self.state = ConnectionState.TERMINATED
+            self._log(
+                now,
+                qlog.CONNECTION_CLOSED,
+                {"initiator": "local", "trigger": "idle_timeout"},
+            )
             self._events.append(ConnectionTerminated(frames.NO_ERROR, "idle timeout"))
             return
         timeout = self.recovery.loss_detection_timeout()
@@ -1223,10 +1322,8 @@ class Connection:
             if outcome.probe_level is not None:
                 # §6.2.4: a PTO sends ack-eliciting data at that level.
                 self._probes_pending[outcome.probe_level] += PROBE_PACKETS
-                # Once per timeout, not once per probe packet: a probe is
-                # itself unacknowledged, so requeueing the outstanding
-                # flight per packet would compound, each probe adding
-                # itself to what the next one resends.
+                # Once per timeout: a probe is itself unacknowledged, so
+                # requeueing per packet would compound.
                 self._prepare_probe(outcome.probe_level)
 
     # --- application interface -------------------------------------------------
@@ -1234,6 +1331,7 @@ class Connection:
     def connect(self, now: float) -> None:
         """Client: start the handshake (§7)."""
         assert isinstance(self.tls, TlsClient)
+        self._open_qlog(self._initial_dcid, now)
         self.tls.start()
         self._drain_tls_events(now)
         self._arm_idle_timer(now)

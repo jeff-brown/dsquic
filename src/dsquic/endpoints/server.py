@@ -38,6 +38,7 @@ from dsquic.endpoints import (
     Address,
     keylog_writer,
     load_pem_certificates,
+    qlog_trace,
     send_pending,
     wait_for_readable,
 )
@@ -165,7 +166,7 @@ class Server:
         connection = Connection(
             is_client=False,
             server_config=self._server_config,
-            config=ConnectionConfig(keylog=keylog_writer()),
+            config=ConnectionConfig(keylog=keylog_writer(), qlog=qlog_trace),
         )
         session = _Session(connection, self._idle_timeout)
         self._sessions[cid] = session

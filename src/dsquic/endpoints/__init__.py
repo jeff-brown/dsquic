@@ -6,6 +6,7 @@ the clock. They drive the protocol core in connection.py and contain no
 protocol logic.
 """
 
+import datetime
 import os
 import selectors
 import socket
@@ -18,6 +19,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.x509 import Certificate, load_pem_x509_certificate
 
 from dsquic.connection import Connection
+from dsquic.qlog import QlogTrace
 
 MAX_DATAGRAM_RECV = 65536
 PEM_CERTIFICATE_MARKER = b"-----BEGIN CERTIFICATE-----"
@@ -61,6 +63,33 @@ def keylog_writer() -> Callable[[str], None] | None:
         handle.flush()
 
     return write
+
+
+def qlog_trace(group_id: bytes, is_client: bool, reference_time: float) -> QlogTrace | None:
+    """Open a qlog trace under $QLOGDIR, if set.
+
+    One file per connection, named for its group ID. Records are
+    appended and flushed as they are produced.
+    """
+    directory = os.environ.get("QLOGDIR")
+    if not directory:
+        return None
+    name = group_id.hex()
+    os.makedirs(directory, exist_ok=True)
+    handle = open(os.path.join(directory, f"{name}.sqlog"), "a", encoding="utf-8")
+
+    def write(record: str) -> None:
+        handle.write(record)
+        handle.flush()
+
+    return QlogTrace(
+        emit=write,
+        group_id=name,
+        is_client=is_client,
+        reference_time=reference_time,
+        # Reading a wall clock is I/O, so the anchor is supplied here.
+        wall_clock_time=datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+    )
 
 
 def send_pending(connection: Connection, sock: socket.socket) -> None:

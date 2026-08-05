@@ -9,7 +9,7 @@
 #   /www           server: the document root, served on port 443
 #   /certs         server: cert.pem and priv.key
 #   SSLKEYLOGFILE  NSS key log, for decrypting the runner's pcaps
-#   QLOGDIR        qlog output directory (dsquic does not emit qlog yet)
+#   QLOGDIR        qlog output directory; one .sqlog per connection
 #
 # This script adapts the environment and nothing else: it starts the
 # reference endpoints in dsquic.endpoints and adds no protocol or

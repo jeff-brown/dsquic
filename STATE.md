@@ -21,12 +21,12 @@ the open item recorded below.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  318 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  328 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
-  congestion, new_reno, hq, and the `endpoints/` subpackage (the only
-  I/O). Still docstring stubs: h3, qpack, masque, qlog.
+  congestion, new_reno, hq, qlog, and the `endpoints/` subpackage (the
+  only I/O). Still docstring stubs: h3, qpack, masque.
 - `endpoints.server.Server` serves many connections over one socket,
   routing by Destination Connection ID via
   `packet.destination_connection_id` (RFC 8999 §5.1, version
@@ -45,8 +45,7 @@ the open item recorded below.
   by probing for files, since the same image also runs on an ordinary
   bridge. `run_endpoint.sh` claims the eight cases listed under results
   below; interop/README.md tabulates why each of the runner's other cases
-  is not attempted. Gaps: IPv4 only, no qlog, and no client-initiated key
-  update.
+  is not attempted. Gaps: IPv4 only and no client-initiated key update.
 
 ## Running the Interop Runner locally
 
@@ -71,6 +70,57 @@ hardcodes `/tmp` for its working directories.
   `colima ssh -- bash -lc 'docker build -f interop/Dockerfile -t dsquic-interop:latest .'`
   then
   `cd ~/quic-interop-runner && .venv/bin/python run.py -s dsquic -c quic-go -t handshake,transfer`.
+
+## qlog (2026-08-05)
+
+`qlog.py` emits the sequential JSON-SEQ format,
+`urn:ietf:params:qlog:file:sequential`, declaring
+`urn:ietf:params:qlog:events:quic-13`. Both documents are still
+Internet-Drafts; the rationale for the format and the event set is in the
+design.md appendix. `endpoints/` writes one `.sqlog` per connection under
+QLOGDIR, named for the group ID, which is the original destination
+connection ID: quic-go names its own traces the same way, so the two
+endpoints' files line up by filename.
+
+Frame names follow the schema (`crypto`, `handshake_done`), not the
+Python class names, since a trace no reader recognises is worth about as
+much as none. A `handshakeloss` run as server produces 50 traces and
+shows what the format is for. The drops it records are the two the receive path makes
+silently: 50 `key_unavailable`, the client's late Handshake
+retransmissions arriving after the server discarded those keys, and 10
+`general`, the RFC 9001 §5.7 early-1-RTT drops. The §5.7 case is the bug
+that cost most of a session to find from packet captures, because a
+dropped packet leaves no trace on the wire. It is now a labelled line in
+a log.
+
+On readers, which took two rounds to get right. qvis rejected the first
+traces outright: it requires the pre-URN `qlog_version` and `qlog_format`
+header fields, which the current draft no longer mentions and which
+quic-go still emits for exactly this reason. Both spellings now go out.
+qvis then parses the file but renders little of it, because it
+implements qlog draft-02 (`QlogSchema02.ts` is its newest) and so knows
+`transport:packet_sent`, not the `quic:` namespace the drafts have used
+since draft-12. That is a stale tool rather than a defect here:
+pmeenan/waterfall-tools is maintained, reads both dialects and both
+serializations, and consumes exactly the fields emitted here
+(`header.packet_type`, `raw.length`, `initiator`), and renders these
+traces: both vantage points parse, report `anchored: true`, and expose
+RTT, congestion window and bytes-in-flight as series. A client and a
+server trace of the same connection carry one group ID and anchor within
+a millisecond of each other, so they lay over one timeline.
+
+Two defects that only a consumer could find, both fixed: the header
+lacked the pre-URI `qlog_version` and `qlog_format` fields, which readers
+predating the URI scheme require and without which qvis refused the file;
+and `parameters_set` and `connection_closed` used `owner` and
+`connection_code` where events §5.3 and §4.3 say `initiator` and
+`error_code`. Neither was reachable from the draft text alone or from
+our own parser. Coverage is partial by choice: `packet_received` records no frames, and
+`version_information`, `alpn_information`, `congestion_state_updated`,
+`recovery_parameters_set` and `stream_data_moved` are unimplemented.
+`parameters_set` logs the peer's parameters, not our own. The last of
+those is why a waterfall shows no entries: request-level rows come from
+`stream_data_moved` or HTTP/3 events.
 
 ## Reproducing loss locally, without the runner
 
@@ -334,16 +384,13 @@ And the one that mattered most, also found this way:
    happens is core, but "after N packets" is a configuration choice, so
    it probably belongs in `ConnectionConfig` rather than in the endpoint
    or the shim script.
-2. **`qlog.py`**, which the design doc treats as first-class output and
-   the foundation of the inspection-engine story. Also closes the
-   `QLOGDIR` gap in the interop shim.
-3. **MAX_STREAMS.** dsquic advertises 16 bidirectional streams and never
+2. **MAX_STREAMS.** dsquic advertises 16 bidirectional streams and never
    raises the limit, so the seventeenth stream fails. This blocks the
    runner's `multiplexing` case and is a real gap for any peer that opens
    many streams.
-4. **IPv6 in the endpoints.** Both open `AF_INET` sockets, so the runner's
+3. **IPv6 in the endpoints.** Both open `AF_INET` sockets, so the runner's
    `ipv6` case cannot pass.
-5. **Broaden the runner matrix.** Three implementations are exercised
+4. **Broaden the runner matrix.** Three implementations are exercised
    locally out of the 17 registered; each additional one is a `docker
    pull` and a row in the run. Submitting dsquic upstream additionally
    needs a linux/amd64 image, since the hosted runner builds for that

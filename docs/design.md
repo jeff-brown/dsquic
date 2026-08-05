@@ -316,3 +316,43 @@ Recorded here so the open questions above stay honest:
   sets no ceiling of its own. picoquic instead bounds the number of
   retransmissions rather than the interval; that needs more state and
   has no QUIC-spec citation, so it was not taken.
+- **qlog is emitted in the sequential JSON-SEQ format (2026-08-05)**:
+  `qlog.py` writes `urn:ietf:params:qlog:file:sequential`, media type
+  `application/qlog+json-seq`, declaring the event schema as
+  `urn:ietf:params:qlog:events:quic-13` (both documents are still
+  Internet-Drafts: main-schema-14 and quic-events-13, and events §2.1
+  requires the draft number to be appended until publication). The
+  sequential form was chosen over the contained one because it streams:
+  a record is appended and flushed per event, so a stalled connection can
+  be read while it is still stalled, and nothing has to be buffered until
+  close. quic-go emits the same family, and design.md §6.1 already treats
+  it as the reference point; aioquic still emits the legacy contained
+  0.3 format. The Interop Runner reads qlog for no test case, so this
+  choice is driven by the inspection-engine goal of §2 rather than by
+  interop. The event set is chosen for debugging value, not coverage:
+  `packet_dropped` first, because a silently discarded packet leaves no
+  trace on the wire, and every drop path in the receive loop reports one
+  with the §5.7 trigger that names its reason. Following §4.2, the core
+  emits and the `endpoints/` subpackage owns the files named by QLOGDIR,
+  the same split SSLKEYLOGFILE uses; `ConnectionConfig.qlog` is a factory
+  rather than a trace because the group ID is the original destination
+  connection ID, which a server only learns from the client's first
+  Initial. On tooling: qvis implements qlog draft-02 only (its schema
+  files stop at `QlogSchema02.ts`) and so understands the older
+  `transport:`/`recovery:`/`security:` event names, not the `quic:`
+  namespace the current drafts define; it parses our traces but renders
+  little of them. pmeenan/waterfall-tools, which is maintained, reads
+  both dialects and both serializations, and consumes exactly the fields
+  emitted here (`header.packet_type`, `raw.length`, `initiator`). The
+  current names are therefore kept: matching a stale tool would mean
+  emitting a vocabulary no draft has defined since 2021, and quic-go's
+  own traces are already inconsistent on this point, declaring
+  `events:quic-12` while emitting draft-02 names. Two further points
+  live here rather than in the code. The header carries the pre-URI
+  `qlog_version` and `qlog_format` fields alongside the current ones,
+  because readers that predate the URI scheme reject a file without
+  them outright, which is how qvis first refused these traces. And the
+  reference time carries a `wall_clock_time`: a monotonic clock has no
+  meaningful epoch, so without an anchor a reader cannot place the
+  trace on a real timeline or lay a client trace over a server one.
+  Supplying it is I/O, so it comes from `endpoints/`.

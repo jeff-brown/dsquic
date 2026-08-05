@@ -26,11 +26,7 @@ TIME_THRESHOLD = 9 / 8  # kTimeThreshold (§6.1.2)
 GRANULARITY = 0.001  # kGranularity, seconds (A.2)
 INITIAL_RTT = 0.333  # kInitialRtt, seconds (§6.2.2)
 PERSISTENT_CONGESTION_THRESHOLD = 3  # kPersistentCongestionThreshold (§7.6.1)
-# RFC 8961 §4, requirement 4: "A maximum value MAY be placed on the RTO.
-# The maximum RTO MUST NOT be less than 60 seconds." RFC 9002 sets no
-# ceiling of its own, so an unbounded backoff would let probe intervals
-# double past any useful timescale. quic-go truncates at the same value.
-MAX_PTO = 60.0
+MAX_PTO = 60.0  # RFC 8961 §4: a maximum MAY be set, and is at least 60s
 
 
 class AckOfUnsentPacket(Exception):
@@ -133,9 +129,8 @@ class LossDetection:
         self._max_ack_delay = max_ack_delay
         self._pto_count = 0
         self._spaces = {level: _Space() for level in EncryptionLevel}
-        # When this endpoint last did anything recovery cares about. A.8
-        # arms the anti-deadlock PTO at "now() + duration", and this is
-        # the most recent moment A.8 would have been evaluated at.
+        # The most recent recovery event, standing in for A.8's "now()"
+        # when arming the anti-deadlock PTO.
         self._last_event: float | None = None
 
     def on_packet_sent(self, packet: SentPacket) -> None:
@@ -154,11 +149,6 @@ class LossDetection:
         first.
 
         §6.2.4: what a PTO probe retransmits when there is no new data.
-        The whole flight, not just its oldest packet: a handshake flight
-        spans several packets, and resending one per PTO recovers it at
-        the rate the backoff doubles, which is far slower than the peer's
-        handshake timeout. aioquic reschedules all outstanding CRYPTO for
-        the same reason.
         """
         sent = self._spaces[level].sent
         return [sent[number] for number in sorted(sent)]
@@ -256,15 +246,16 @@ class LossDetection:
         span = eliciting[-1].time_sent - eliciting[0].time_sent
         return span > duration
 
+    @property
+    def pto_count(self) -> int:
+        """Consecutive PTO expirations (§6.2.1): the backoff exponent."""
+        return self._pto_count
+
     def pto(self) -> float:
         """The PTO interval without the §6.2.4 backoff.
 
-        This is what RFC 9000 §10.1 and §10.2 mean by "the PTO" when they
-        floor the idle timeout and the closing period at three of them.
-        Reading it as the backed-off value makes those deadlines recede
-        exactly as fast as the backoff grows, so a connection that keeps
-        losing probes never times out at all. quic-go and aioquic both
-        use the unscaled value here (design.md appendix).
+        What RFC 9000 §10.1 and §10.2 multiply by three to floor the
+        idle timeout and the closing period (design.md appendix).
         """
         return self.rtt.smoothed + max(4 * self.rtt.rttvar, GRANULARITY) + self._max_ack_delay
 
@@ -324,13 +315,9 @@ class LossDetection:
         """§6.2.2.1: a client arms a PTO even with nothing in flight, so a
         lost server flight cannot deadlock the handshake.
 
-        A.8 arms this one from the current time rather than from the last
-        ack-eliciting packet, and the difference matters: a client that
-        has only ever sent ACK-only Handshake packets has no such packet
-        to anchor to, and anchoring to one would leave it with no timer
-        at all, waiting on a flight that will never be retransmitted.
-        The last recovery event stands in for "now": it is the most
-        recent moment at which A.8 would have set this timer.
+        A.8 arms this one from the current time, not from the last
+        ack-eliciting packet. The last recovery event stands in for
+        "now": the most recent moment A.8 would have set the timer.
         """
         if self._last_event is None:
             return None  # nothing sent yet; the handshake has not started

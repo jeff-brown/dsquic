@@ -1,10 +1,12 @@
 """Tests for dsquic.connection: an in-memory dsquic-to-dsquic connection."""
 
 import datetime
+import json
+from collections.abc import Callable
 
 import pytest
 
-from dsquic import frames, hq
+from dsquic import frames, hq, qlog
 from dsquic.connection import (
     Connection,
     ConnectionConfig,
@@ -14,6 +16,7 @@ from dsquic.connection import (
     StreamDataReceived,
 )
 from dsquic.packet import parse_long_header
+from dsquic.qlog import QlogTrace
 from dsquic.recovery import MAX_PTO
 from dsquic.tls import ClientConfig, EncryptionLevel, ServerConfig
 from test_tls import Credentials, issue_leaf, make_ca
@@ -28,9 +31,25 @@ def credentials() -> Credentials:
     return Credentials(chain=[leaf_der], key=leaf_key, ca=[ca_der], ca_key=ca_key)
 
 
+def trace_into(sink: list[str]) -> Callable[[bytes, bool, float], QlogTrace]:
+    """A qlog factory that appends finished records to ``sink``."""
+
+    def open_trace(group_id: bytes, is_client: bool, reference_time: float) -> QlogTrace:
+        return QlogTrace(
+            emit=sink.append,
+            group_id=group_id.hex(),
+            is_client=is_client,
+            reference_time=reference_time,
+        )
+
+    return open_trace
+
+
 def make_pair(
     credentials: Credentials,
     client_keylog: list[str] | None = None,
+    client_qlog: list[str] | None = None,
+    server_qlog: list[str] | None = None,
 ) -> tuple[Connection, Connection]:
     client = Connection(
         is_client=True,
@@ -41,7 +60,10 @@ def make_pair(
             ca_certificates=credentials.ca,
             verification_time=VERIFICATION_TIME,
         ),
-        config=ConnectionConfig(keylog=client_keylog.append if client_keylog is not None else None),
+        config=ConnectionConfig(
+            keylog=client_keylog.append if client_keylog is not None else None,
+            qlog=trace_into(client_qlog) if client_qlog is not None else None,
+        ),
         destination="server",
     )
     server = Connection(
@@ -52,7 +74,9 @@ def make_pair(
             alpn=[hq.ALPN],
             transport_parameters=b"",
         ),
-        config=ConnectionConfig(),
+        config=ConnectionConfig(
+            qlog=trace_into(server_qlog) if server_qlog is not None else None,
+        ),
         destination="client",
     )
     return client, server
@@ -206,6 +230,60 @@ class TestStreams:
         assert b"".join(e.data for e in events) == b"push"
 
 
+class TestQlog:
+    """qlog output (draft-ietf-quic-qlog-quic-events-13)."""
+
+    def make_traced_pair(
+        self, credentials: Credentials
+    ) -> tuple[Connection, Connection, list[str], list[str]]:
+        client_lines: list[str] = []
+        server_lines: list[str] = []
+        client, server = make_pair(credentials, client_qlog=client_lines, server_qlog=server_lines)
+        return client, server, client_lines, server_lines
+
+    def names(self, lines: list[str]) -> list[str]:
+        events = [json.loads(line[1:]) for line in lines[1:]]
+        return [event["name"] for event in events]
+
+    def test_a_handshake_produces_both_traces(self, credentials: Credentials) -> None:
+        client, server, client_lines, server_lines = self.make_traced_pair(credentials)
+        client.connect(0.0)
+        pump(client, server)
+
+        group_ids: set[str] = set()
+        for lines, role in ((client_lines, "client"), (server_lines, "server")):
+            header = json.loads(lines[0][1:])
+            assert header["trace"]["vantage_point"] == {"type": role}
+            group_ids.add(header["trace"]["common_fields"]["group_id"])
+            assert "quic:packet_sent" in self.names(lines)
+            assert "quic:packet_received" in self.names(lines)
+
+        # §4.2: both endpoints key the trace on the original DCID.
+        assert len(group_ids) == 1
+
+    def test_a_silently_dropped_packet_is_recorded(self, credentials: Credentials) -> None:
+        """events §5.7: a discarded packet is recorded with its trigger."""
+        client, server, _, server_lines = self.make_traced_pair(credentials)
+        client.connect(0.0)
+        pump(client, server)
+
+        # A packet the server cannot authenticate: right shape, wrong bytes.
+        corrupt = bytes([0x40]) + client.peer_cid + bytes(64)
+        server.datagram_received(corrupt, 1.0, source="client")
+
+        dropped = [
+            json.loads(line[1:])
+            for line in server_lines[1:]
+            if json.loads(line[1:])["name"] == "quic:packet_dropped"
+        ]
+        assert dropped, "the discard was not recorded"
+        assert dropped[-1]["data"]["trigger"] in {
+            qlog.DROP_DECRYPTION_FAILURE,
+            qlog.DROP_KEY_UNAVAILABLE,
+            qlog.DROP_INVALID,
+        }
+
+
 class TestRecovery:
     def test_a_silent_peer_eventually_times_the_connection_out(
         self, credentials: Credentials
@@ -324,14 +402,11 @@ class TestRecovery:
     def test_one_rtt_is_not_processed_before_the_handshake_completes(
         self, credentials: Credentials
     ) -> None:
-        """RFC 9001 §5.7: a server MUST NOT process 1-RTT packets before
-        the TLS handshake is complete, and cannot acknowledge them.
+        """RFC 9001 §5.7: a server does not process 1-RTT packets before
+        the handshake completes, and does not acknowledge them.
 
-        It holds 1-RTT keys as soon as it has sent its own Finished, so
-        a client packet that overtakes the client's Finished decrypts
-        perfectly well. Acting on it means acting on a client that has
-        not yet been authenticated, and the frames arrive before there
-        is any application state to put them in.
+        It holds 1-RTT keys once it has sent its Finished, so a packet
+        overtaking the client's Finished decrypts successfully.
         """
         client, server = make_pair(credentials)
         client.connect(0.0)
@@ -364,14 +439,10 @@ class TestRecovery:
         assert server.state is ConnectionState.HANDSHAKING
 
     def test_lost_handshake_done_is_retransmitted(self, credentials: Credentials) -> None:
-        """§13.3: HANDSHAKE_DONE MUST be retransmitted until acknowledged.
+        """§13.3: HANDSHAKE_DONE is retransmitted until acknowledged.
 
-        The client confirms the handshake on this frame and nothing
-        else, and confirmation is what makes it discard its Handshake
-        keys (RFC 9001 §4.9.2). Drop it once and the client keeps
-        probing a space the server has already discarded keys for, so
-        the probes can never be acknowledged and eventually fill its
-        congestion window.
+        The client confirms the handshake on this frame alone, and
+        confirmation discards its Handshake keys (RFC 9001 §4.9.2).
         """
         client, server = make_pair(credentials)
         client.connect(0.0)

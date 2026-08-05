@@ -31,7 +31,7 @@ from dsquic.connection import (
     HandshakeConfirmed,
     StreamDataReceived,
 )
-from dsquic.endpoints import keylog_writer, load_pem_certificates, pump
+from dsquic.endpoints import keylog_writer, load_pem_certificates, pump, qlog_trace
 from dsquic.tls import ClientConfig
 
 DEFAULT_TIMEOUT = 30.0  # a whole fetch, not a single response
@@ -77,7 +77,7 @@ def fetch(
             insecure_skip_verify=options.insecure,
             verification_time=datetime.datetime.now(datetime.UTC),
         ),
-        config=ConnectionConfig(keylog=keylog_writer()),
+        config=ConnectionConfig(keylog=keylog_writer(), qlog=qlog_trace),
         destination=address,
     )
 
