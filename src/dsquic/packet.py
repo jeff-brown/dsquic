@@ -82,6 +82,22 @@ class LongHeader:
 
 
 @dataclass(frozen=True)
+class Retry:
+    """A Retry packet (§17.2.5).
+
+    It carries no packet number, no length, and no payload: the token
+    and the integrity tag are the whole content. The tag is checked
+    against the original destination connection ID by the caller, which
+    is the only party that knows it.
+    """
+
+    version: int
+    destination_cid: bytes
+    source_cid: bytes
+    token: bytes
+
+
+@dataclass(frozen=True)
 class ShortHeader:
     """The unprotected fields of a 1-RTT packet (RFC 9000 §17.3).
 
@@ -115,7 +131,7 @@ def parse_long_header(data: bytes) -> LongHeader:
         raise UnsupportedVersion(version)
     packet_type = PacketType((first & 0x30) >> 4)
     if packet_type is PacketType.RETRY:
-        raise HeaderParseError("Retry parsing not implemented")
+        raise HeaderParseError("a Retry packet has no Length field; use parse_retry")
     token = b""
     if packet_type is PacketType.INITIAL:
         token = buf.pull_bytes(buf.pull_varint())
