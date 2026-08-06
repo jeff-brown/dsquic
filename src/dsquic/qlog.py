@@ -76,6 +76,20 @@ FRAME_TYPES = {
 }
 
 
+# Frame fields the schema names as frames.py does (events §8).
+FRAME_FIELDS = ("stream_id", "offset", "fin", "maximum", "limit")
+
+
+def frame_detail(frame: object) -> dict[str, Any]:
+    """One frame as the schema describes it (events §8)."""
+    detail: dict[str, Any] = {"frame_type": frame_type(frame)}
+    for name in FRAME_FIELDS:
+        value = getattr(frame, name, None)
+        if value is not None:
+            detail[name] = value
+    return detail
+
+
 def frame_type(frame: object) -> str:
     """The schema's name for a frame (events §8).
 

@@ -24,6 +24,7 @@ the spec permits.
 """
 
 import enum
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -42,8 +43,10 @@ from dsquic.frames import (
     HandshakeDone,
     MaxData,
     MaxStreamData,
+    MaxStreams,
     Ping,
     Stream,
+    StreamsBlocked,
     is_ack_eliciting,
     parse_frames,
 )
@@ -76,7 +79,14 @@ from dsquic.protection import (
 )
 from dsquic.qlog import QlogTrace
 from dsquic.recovery import AckOfUnsentPacket, LossDetection, SentPacket
-from dsquic.streams import FlowControlLimits, RangeSet, RecvStream, StreamError, StreamManager
+from dsquic.streams import (
+    FlowControlLimits,
+    RangeSet,
+    RecvStream,
+    StreamError,
+    StreamLimitReached,
+    StreamManager,
+)
 from dsquic.tls import (
     ClientConfig,
     Direction,
@@ -97,7 +107,11 @@ CONNECTION_ID_LENGTH = 8
 AMPLIFICATION_FACTOR = 3  # §8.1: server send limit before address validation
 MAX_ACK_RANGES = 32  # bound the ACK frames we build
 MAX_CRYPTO_BUFFER = 65536  # §7.5: a receiver may bound CRYPTO reassembly
+MAX_STREAMS_LIMIT = 1 << 60  # §4.6: a larger count has no expressible stream ID
 PROBE_PACKETS = 2  # §6.2.4: up to two datagrams per PTO
+# RFC 9002 §7.7: bursts are limited to the initial congestion window,
+# which is ten datagrams (B.1).
+PACING_BURST_DATAGRAMS = 10
 
 LEVEL_TO_PACKET_TYPE = {
     EncryptionLevel.INITIAL: PacketType.INITIAL,
@@ -296,6 +310,11 @@ class Connection:
         # because a probe must go out at the level whose timer expired.
         self._probes_pending: dict[EncryptionLevel, int] = dict.fromkeys(EncryptionLevel, 0)
         self._handshake_done_pending = False
+        # Pacer state (§7.7): bytes of credit, when it was last filled,
+        # and when it will next hold enough for a datagram.
+        self._pacing_credit = 0.0
+        self._pacing_updated: float | None = None
+        self._pacing_deadline: float | None = None
         self._close_frame: ConnectionClose | None = None
         self._close_sent = False
         self._bytes_received = 0
@@ -609,14 +628,11 @@ class Connection:
         if space.received.covers(packet_number, packet_number + 1):
             self._drop(now, qlog.DROP_DUPLICATE, packet_end, level, packet_number)
             return packet_end
-        self._log(
-            now,
-            qlog.PACKET_RECEIVED,
-            {
-                "header": {"packet_type": _QLOG_PACKET_TYPE[level], "packet_number": packet_number},
-                "raw": {"length": packet_end},
-            },
-        )
+        # Logged in _handle_payload, once the frames it carries are parsed.
+        received: dict[str, object] = {
+            "header": {"packet_type": _QLOG_PACKET_TYPE[level], "packet_number": packet_number},
+            "raw": {"length": packet_end},
+        }
         space.received.add(packet_number, packet_number + 1)
         if packet_number > space.largest_received:
             space.largest_received = packet_number
@@ -628,7 +644,7 @@ class Connection:
             # keys prove the client processed the server's Initial.
             self._discard_space(EncryptionLevel.INITIAL, now)
             self._address_validated = True
-        self._handle_payload(level, payload, now)
+        self._handle_payload(level, payload, now, received)
         return packet_end
 
     def _parameters_for(self, initial_dcid: bytes) -> TransportParameters:
@@ -660,11 +676,15 @@ class Connection:
         if not self.peer_cid:
             self.peer_cid = scid
 
-    def _handle_payload(self, level: EncryptionLevel, payload: bytes, now: float) -> None:
+    def _handle_payload(
+        self, level: EncryptionLevel, payload: bytes, now: float, received: dict[str, object]
+    ) -> None:
         try:
             parsed = parse_frames(payload)
         except (FrameParseError, BufferReadError) as exc:
             raise ConnectionError_(frames.FRAME_ENCODING_ERROR, str(exc)) from exc
+        received["frames"] = [qlog.frame_detail(frame) for frame in parsed]
+        self._log(now, qlog.PACKET_RECEIVED, received)
         space = self._spaces[level]
         for frame in parsed:
             if is_ack_eliciting(frame):
@@ -678,12 +698,8 @@ class Connection:
             self._handle_crypto(level, frame, now)
         elif isinstance(frame, Stream):
             self._handle_stream(frame)
-        elif isinstance(frame, MaxData):
-            if self.streams is not None:
-                self.streams.on_max_data(frame.maximum)
-        elif isinstance(frame, MaxStreamData):
-            if self.streams is not None:
-                self.streams.send_stream(frame.stream_id).on_max_stream_data(frame.maximum)
+        elif isinstance(frame, MaxData | MaxStreamData | MaxStreams):
+            self._handle_limit(frame)
         elif isinstance(frame, HandshakeDone):
             # §7.3: the client confirms the handshake on HANDSHAKE_DONE.
             if not self.is_client:
@@ -693,6 +709,22 @@ class Connection:
             self._on_connection_close(frame, now)
         # Frames for deferred features (NEW_CONNECTION_ID, PATH_CHALLENGE,
         # NEW_TOKEN, DATAGRAM, blocked frames) are accepted and ignored.
+
+    def _handle_limit(self, frame: MaxData | MaxStreamData | MaxStreams) -> None:
+        """A peer raising one of our sending allowances (§4.1, §4.6)."""
+        if isinstance(frame, MaxStreams) and frame.maximum > MAX_STREAMS_LIMIT:
+            # §4.6: a larger count has no stream ID expressible as a varint (§16).
+            raise ConnectionError_(
+                frames.FRAME_ENCODING_ERROR, f"MAX_STREAMS {frame.maximum} exceeds 2^60"
+            )
+        if self.streams is None:
+            return
+        if isinstance(frame, MaxData):
+            self.streams.on_max_data(frame.maximum)
+        elif isinstance(frame, MaxStreamData):
+            self.streams.send_stream(frame.stream_id).on_max_stream_data(frame.maximum)
+        else:
+            self.streams.on_max_streams(frame.maximum, frame.bidirectional)
 
     def _handle_ack(self, level: EncryptionLevel, frame: Ack, now: float) -> None:
         exponent = (
@@ -746,6 +778,13 @@ class Connection:
                 self._queue_control(
                     MaxStreamData(stream_id=frame.stream_id, maximum=recv.max_stream_data)
                 )
+            elif isinstance(frame, MaxStreams) and self.streams is not None:
+                current = (
+                    self.streams.local_max_streams_bidi
+                    if frame.bidirectional
+                    else self.streams.local_max_streams_uni
+                )
+                self._queue_control(MaxStreams(maximum=current, bidirectional=frame.bidirectional))
 
     def _prepare_probe(self, level: EncryptionLevel) -> None:
         """§6.2.4: give a PTO probe something worth carrying.
@@ -834,6 +873,10 @@ class Connection:
         connection_limit = self.streams.max_data_update()
         if connection_limit is not None:
             self._queue_control(MaxData(maximum=connection_limit))
+        for bidirectional in (True, False):
+            streams_limit = self.streams.max_streams_update(bidirectional)
+            if streams_limit is not None:
+                self._queue_control(MaxStreams(maximum=streams_limit, bidirectional=bidirectional))
 
     def _queue_control(self, frame: Frame) -> None:
         self._control_frames.append(frame)
@@ -930,18 +973,71 @@ class Connection:
             return self._build_close_datagram(now)
 
         datagrams: list[OutgoingDatagram] = []
+        self._pacing_deadline = None
         while True:
-            datagram = self._build_datagram(now)
+            # §7.7: an acknowledgement is not paced, so a pacer-blocked
+            # connection still answers with one before it stops.
+            paced_out = self._pacing_blocked(now)
+            in_flight = self.recovery.controller.bytes_in_flight
+            datagram = self._build_datagram(now, ack_only=paced_out)
             if datagram is None:
                 break
             datagrams.append(datagram)
+            # §7.7 paces in-flight packets, so credit is spent on the
+            # bytes the datagram put in flight. A datagram carrying only
+            # an acknowledgement adds none and spends none.
+            self._pacing_credit -= self.recovery.controller.bytes_in_flight - in_flight
         self._pending.extend(datagrams)
         result, self._pending = self._pending, []
         return result
 
-    def _send_budget(self) -> int:
+    def _pacing_blocked(self, now: float) -> bool:
+        """Whether the pacer is holding back in-flight data (§7.7).
+
+        Sets the deadline at which credit covers another datagram.
+        """
+        allowance = self._pacing_allowance(now)
+        needed = float(self.config.max_datagram_size)
+        if allowance >= needed:
+            return False
+        if not self._in_flight_data_pending():
+            return False
+        rate = self.recovery.controller.pacing_rate(self.recovery.rtt.smoothed)
+        if rate is None or rate <= 0:
+            return False
+        self._pacing_deadline = now + (needed - allowance) / rate
+        return True
+
+    def _pacing_allowance(self, now: float) -> float:
+        """Bytes the pacer permits at ``now`` (§7.7).
+
+        A leaky bucket filled at the controller's rate, capped at the
+        burst limit. A controller that does not pace returns no rate and
+        the allowance is unbounded.
+        """
+        rate = self.recovery.controller.pacing_rate(self.recovery.rtt.smoothed)
+        if rate is None:
+            return math.inf
+        burst = float(PACING_BURST_DATAGRAMS * self.config.max_datagram_size)
+        if self._pacing_updated is None:
+            self._pacing_credit = burst
+        else:
+            elapsed = max(0.0, now - self._pacing_updated)
+            self._pacing_credit = min(self._pacing_credit + elapsed * rate, burst)
+        self._pacing_updated = now
+        return self._pacing_credit
+
+    def _in_flight_data_pending(self) -> bool:
+        """Whether anything queued would make a packet count as in flight."""
+        if any(self._probes_pending.values()):
+            return True
+        return any(self._has_pending_data(level) for level in EncryptionLevel)
+
+    def _send_budget(self, ack_only: bool = False) -> int:
         """§8.1 anti-amplification plus the congestion window.
 
+        RFC 9002 §2: a packet carrying only ACK frames is not in flight
+        and not congestion controlled, so the window does not bound it.
         RFC 9002 §7.5: a PTO probe is exempt from the congestion window.
         Without that exemption a connection that loses an entire window
         deadlocks, because the window is only freed by acknowledgements
@@ -950,6 +1046,8 @@ class Connection:
         """
         controller = self.recovery.controller
         budget = controller.congestion_window - controller.bytes_in_flight
+        if ack_only:
+            budget = self.config.max_datagram_size
         probes = sum(self._probes_pending.values())
         if probes:
             budget = max(budget, probes * self.config.max_datagram_size)
@@ -957,7 +1055,7 @@ class Connection:
             budget = min(budget, AMPLIFICATION_FACTOR * self._bytes_received - self._bytes_sent)
         return budget
 
-    def _build_datagram(self, now: float) -> OutgoingDatagram | None:
+    def _build_datagram(self, now: float, ack_only: bool = False) -> OutgoingDatagram | None:
         """Coalesce one packet per level into a single datagram (§12.2).
 
         §14.1: a datagram carrying an Initial packet is expanded to at
@@ -966,8 +1064,11 @@ class Connection:
         a packet with a short header runs to the end of the datagram, so
         trailing bytes would be read as part of it (or as a malformed
         packet) and fail authentication.
+
+        ``ack_only`` restricts the datagram to acknowledgements, which
+        RFC 9002 §7.7 exempts from pacing.
         """
-        budget = self._send_budget()
+        budget = self._send_budget(ack_only)
         if budget <= 0:
             return None
         size_limit = self.config.max_datagram_size
@@ -980,7 +1081,7 @@ class Connection:
             # An Initial fills its datagram to the floor, so nothing is
             # coalesced after it; the remaining levels take the next one.
             pad_to = min(MIN_INITIAL_DATAGRAM, budget) if level is EncryptionLevel.INITIAL else 0
-            packet = self._build_packet(level, room, now, pad_datagram_to=pad_to)
+            packet = self._build_packet(level, room, now, pad_to, ack_only)
             if packet is None:
                 continue
             payload += packet
@@ -1002,8 +1103,13 @@ class Connection:
         self._bytes_sent += len(payload)
         return OutgoingDatagram(data=bytes(payload), destination=self.destination)
 
-    def _pending_frames(self, level: EncryptionLevel, room: int) -> tuple[list[Frame], int]:
-        """Choose frames for one packet; returns frames and payload length."""
+    def _pending_frames(
+        self, level: EncryptionLevel, room: int, ack_only: bool = False
+    ) -> tuple[list[Frame], int]:
+        """Choose frames for one packet; returns frames and payload length.
+
+        ``ack_only`` stops after the ACK, leaving everything else queued.
+        """
         space = self._spaces[level]
         chosen: list[Frame] = []
         used = 0
@@ -1015,6 +1121,8 @@ class Connection:
                 chosen.append(ack)
                 used += encoded
                 space.ack_eliciting_pending = False
+        if ack_only:
+            return chosen, used
 
         overhead = 16  # type, offset, length varints, generously bounded
         available = max(0, room - used - overhead)
@@ -1090,7 +1198,12 @@ class Connection:
         return chosen, used
 
     def _build_packet(
-        self, level: EncryptionLevel, room: int, now: float, pad_datagram_to: int = 0
+        self,
+        level: EncryptionLevel,
+        room: int,
+        now: float,
+        pad_datagram_to: int = 0,
+        ack_only: bool = False,
     ) -> bytes | None:
         """Build one protected packet for a level, or None if nothing to send.
 
@@ -1102,7 +1215,7 @@ class Connection:
         header_overhead = 64  # bounded: long header, CIDs, length, PN
         if room <= header_overhead + AEAD_TAG_LENGTH:
             return None
-        chosen, _ = self._pending_frames(level, room - header_overhead - AEAD_TAG_LENGTH)
+        chosen, _ = self._pending_frames(level, room - header_overhead - AEAD_TAG_LENGTH, ack_only)
         if not chosen:
             return None
         payload = b"".join(frame.encode() for frame in chosen)
@@ -1157,7 +1270,7 @@ class Connection:
             {
                 "header": {"packet_type": _QLOG_PACKET_TYPE[level], "packet_number": packet_number},
                 "raw": {"length": len(packet)},
-                "frames": [{"frame_type": qlog.frame_type(frame)} for frame in chosen],
+                "frames": [qlog.frame_detail(frame) for frame in chosen],
             },
         )
         self.recovery.on_packet_sent(
@@ -1293,6 +1406,7 @@ class Connection:
                 self.recovery.loss_detection_timeout()
                 if self.state not in (ConnectionState.CLOSING, ConnectionState.DRAINING)
                 else None,
+                self._pacing_deadline,
             )
             if deadline is not None
         ]
@@ -1337,9 +1451,18 @@ class Connection:
         self._arm_idle_timer(now)
 
     def open_stream(self) -> int:
+        """Open the next bidirectional stream, or raise if the peer's
+        limit is reached (§4.6)."""
         if self.streams is None:
             raise RuntimeError("cannot open a stream before the handshake completes")
-        return self.streams.open_bidi()
+        try:
+            return self.streams.open_bidi()
+        except StreamLimitReached:
+            # §4.6: an endpoint unable to open a stream SHOULD report it.
+            self._queue_control(
+                StreamsBlocked(limit=self.streams.max_streams_bidi, bidirectional=True)
+            )
+            raise
 
     def send_stream_data(self, stream_id: int, data: bytes, end_stream: bool = False) -> None:
         if self.streams is None:

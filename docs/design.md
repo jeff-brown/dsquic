@@ -316,6 +316,29 @@ Recorded here so the open questions above stay honest:
   sets no ceiling of its own. picoquic instead bounds the number of
   retransmissions rather than the interval; that needs more state and
   has no QUIC-spec citation, so it was not taken.
+- **Sending is paced, and acknowledgements are exempt (2026-08-05)**:
+  RFC 9002 §7.7 requires a sender to either pace or limit bursts; dsquic
+  did neither, and emitted everything the congestion window allowed as
+  fast as the loop could build it. `connection.py` now holds a leaky
+  bucket filled at the rate the controller computes
+  (`CongestionController.pacing_rate(smoothed_rtt)`, which NewReno
+  derives as §7.7's `N * congestion_window / smoothed_rtt` with
+  N = 1.25) and capped at ten datagrams, the initial congestion window
+  (§7.7 "Senders SHOULD limit bursts to the initial congestion window",
+  sized by B.1). The RTT is passed in because recovery owns it while the
+  formula belongs to the controller: a rate-based controller derives it
+  differently. The core withholds datagrams and reports the release time
+  through `next_timer()` rather than stamping `txtime` on them; the §4.7
+  table permits either, and withholding keeps the transport a plain
+  sleep loop with no pacing logic of its own.
+  §7.7 exempts packets carrying only ACK frames ("Timely delivery of ACK
+  frames is important for efficient loss recovery"), so the builders take
+  an `ack_only` path that stops after the ACK. That path also skips the
+  congestion window, which fixed a separate defect: ACK-only datagrams
+  were being suppressed by a full window, though RFC 9002 §2 does not
+  count such a packet as in flight and §7 does not congestion-control it.
+  A cwnd-blocked connection therefore stopped acknowledging exactly when
+  its peer most needed acknowledgements to make progress.
 - **qlog is emitted in the sequential JSON-SEQ format (2026-08-05)**:
   `qlog.py` writes `urn:ietf:params:qlog:file:sequential`, media type
   `application/qlog+json-seq`, declaring the event schema as

@@ -21,7 +21,7 @@ the open item recorded below.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  328 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  341 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -66,6 +66,10 @@ hardcodes `/tmp` for its working directories.
   test fails with "Expected exactly one version. Got []". That failure
   reproduces for quic-go too, which is how it was identified as
   environmental rather than ours.
+- Container file descriptor limits default to 1024 here, which is low
+  enough to break `multiplexing` for any client; see "The file descriptor
+  limit that looked like a protocol bug" below for the daemon setting
+  that fixes it.
 - Build and run:
   `colima ssh -- bash -lc 'docker build -f interop/Dockerfile -t dsquic-interop:latest .'`
   then
@@ -122,6 +126,22 @@ our own parser. Coverage is partial by choice: `packet_received` records no fram
 those is why a waterfall shows no entries: request-level rows come from
 `stream_data_moved` or HTTP/3 events.
 
+## Stream limits (2026-08-05)
+
+`StreamManager` carries the cumulative stream counts of §4.6 as mutable
+state beside the flow control byte counts: an allowance the peer raises
+with MAX_STREAMS, and an advertisement extended as peer-initiated streams
+reach Data Read. §4.6 leaves the policy open and suggests extending as
+streams close, which is what `max_streams_update` does, keeping the count
+available to the peer roughly constant.
+
+`Connection.open_stream` raises `StreamLimitReached`, distinct from
+`StreamError`, because a reached limit is expected rather than a
+connection error; it queues STREAMS_BLOCKED on the way out (§4.6, a
+SHOULD). `endpoints.client.fetch` opens requests as credit allows rather
+than all at once, which is what the runner's `multiplexing` case needs:
+1999 files on one connection against an initial limit far below that.
+
 ## Reproducing loss locally, without the runner
 
 An Interop Runner cycle is 90 seconds and yields a pcap. The three
@@ -177,6 +197,62 @@ Two cautions about reading these results:
   server both pass; as client `handshakeloss` is intermittent, recorded
   below.
 
+## Pacing (2026-08-05)
+
+Sending is paced per RFC 9002 §7.7: a leaky bucket in `connection.py`
+filled at `CongestionController.pacing_rate(smoothed_rtt)` and capped at
+ten datagrams. The core withholds datagrams and publishes the release
+time through `next_timer()`; the endpoints already wake on that deadline
+and send afterwards, so neither loop needed a change. Rationale and the
+choice not to stamp `txtime` are in the design.md appendix.
+
+Implementing it found a second defect: ACK-only datagrams were blocked by
+a full congestion window. RFC 9002 §2 does not count an ACK-only packet
+as in flight, and §7.7 exempts it from pacing, so a cwnd-blocked
+connection had stopped acknowledging exactly when its peer needed the
+acknowledgements to open the window. `_send_budget(ack_only=True)` now
+skips the window while keeping the §8.1 anti-amplification limit.
+
+The reference client is deliberately **not** bounded in concurrent
+requests. It issues all 1999 of the `multiplexing` case at once, which is
+what quic-go's interop client (an `errgroup` goroutine per URL) and
+aioquic's (`asyncio.gather` over every URL) also do.
+
+## The file descriptor limit that looked like a protocol bug (2026-08-05)
+
+`multiplexing` failed with dsquic as client against an aioquic server,
+and a bound of 64 concurrent requests in `endpoints/client.py` made it
+pass. That bound was wrong, and the reasoning behind it was wrong twice
+over. What the aioquic server's own log said was
+`OSError: [Errno 24] Too many open files`, 773 times, which is exactly
+the number of the 1999 streams it never answered. It answers a request by
+opening a file and does not bound its own handlers.
+
+The discriminating experiment is to run **another client** against the
+same server: quic-go's client fails the same case in this environment,
+482 times over. The cause is that the Interop Runner's `docker-compose.yml`
+sets only `memlock`, so the file descriptor limit is whatever the Docker
+daemon defaults to, and in the colima VM that is 1024. Upstream hosts,
+where all 15 clients pass against aioquic, default far higher.
+
+Both directions of `multiplexing` were affected: quiche as client
+against a dsquic server failed the same way, since the reference server
+also opens a file per request. Fixed at the daemon rather than in the
+runner's compose file, since the limit is a property of this VM and not
+of the test:
+`/etc/docker/daemon.json` in the VM now carries
+`"default-ulimits": {"nofile": {"Name": "nofile", "Soft": 1048576,
+"Hard": 1048576}}`, followed by `sudo systemctl restart docker`. With
+that in place `multiplexing` passes in **all eight pairings**, dsquic in
+both roles against quic-go, aioquic, picoquic and quiche, with the client
+unbounded. The dsquic image was identical across the failing and passing
+runs; only the daemon setting changed.
+
+Worth remembering as a method: when one implementation appears uniquely
+broken against a peer, run a known-good implementation against that peer
+in the same environment before believing it. Two of the three conclusions
+drawn here before that experiment were wrong.
+
 ## Open: handshakeloss and handshakecorruption as client, vs aioquic
 
 As **server** these are fixed and confirmed against four peers. As
@@ -225,13 +301,10 @@ uses. Two differences worth chasing, in order:
 
 ## In-flight work
 
-`origin/main` is at c24c855, "Add multiconnect; fix six defects it
-uncovered under handshake loss". Staged and awaiting
-commit are the three server-side defects: HANDSHAKE_DONE (and the
-flow control frames) retransmitted on loss per §13.3, 1-RTT packets not
-processed before the handshake completes per RFC 9001 §5.7, and Data
-Read made terminal so a retransmitted final frame cannot report the end
-of a stream twice.
+`origin/main` is at 2db788f, "Add qlog structured event output in the
+sequential format". Staged and awaiting commit: the §4.6 stream limit
+state in `StreamManager`, RFC 9002 §7.7 pacing, and the ACK-only send
+path that pacing exposed.
 
 ## What interop and the wire found that self-testing did not
 
@@ -377,20 +450,16 @@ And the one that mattered most, also found this way:
 ## Next steps
 
 1. **The roadmap past the MVP** (design.md §6.1), in order: retry,
-   resumption, multiplexing, http3, ecn, zerortt. Each climbs all three
+   resumption, http3, ecn, zerortt. Each climbs all three
    rungs of the ladder (design.md §6.2). `keyupdate` has left the list
    for the server role and needs only a policy for the client role: when
    to call `Connection.initiate_key_update`. Deciding that a key update
    happens is core, but "after N packets" is a configuration choice, so
    it probably belongs in `ConnectionConfig` rather than in the endpoint
    or the shim script.
-2. **MAX_STREAMS.** dsquic advertises 16 bidirectional streams and never
-   raises the limit, so the seventeenth stream fails. This blocks the
-   runner's `multiplexing` case and is a real gap for any peer that opens
-   many streams.
-3. **IPv6 in the endpoints.** Both open `AF_INET` sockets, so the runner's
+2. **IPv6 in the endpoints.** Both open `AF_INET` sockets, so the runner's
    `ipv6` case cannot pass.
-4. **Broaden the runner matrix.** Three implementations are exercised
+3. **Broaden the runner matrix.** Three implementations are exercised
    locally out of the 17 registered; each additional one is a `docker
    pull` and a row in the run. Submitting dsquic upstream additionally
    needs a linux/amd64 image, since the hosted runner builds for that

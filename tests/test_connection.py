@@ -8,6 +8,8 @@ import pytest
 
 from dsquic import frames, hq, qlog
 from dsquic.connection import (
+    DEFAULT_MAX_DATAGRAM_SIZE,
+    PACING_BURST_DATAGRAMS,
     Connection,
     ConnectionConfig,
     ConnectionState,
@@ -282,6 +284,34 @@ class TestQlog:
             qlog.DROP_KEY_UNAVAILABLE,
             qlog.DROP_INVALID,
         }
+
+
+class TestStreamLimits:
+    """§4.6: MAX_STREAMS keeps a long-lived connection from running out."""
+
+    def test_more_streams_than_the_initial_limit(self, credentials: Credentials) -> None:
+        """The initial limit is 16 bidirectional streams, so without
+        MAX_STREAMS the seventeenth request fails."""
+        client, server, now = handshake(credentials)
+        client.take_events()
+        server.take_events()
+
+        wanted = 40
+        answered: set[int] = set()
+        for index in range(wanted):
+            stream_id = client.open_stream()
+            client.send_stream_data(stream_id, hq.encode_request(f"/{index}"), end_stream=True)
+            now = pump(client, server, now)
+            for event in server.take_events():
+                if isinstance(event, StreamDataReceived) and event.end_stream:
+                    answered.add(event.stream_id)
+                    server.send_stream_data(event.stream_id, b"body", end_stream=True)
+            now = pump(client, server, now)
+            for event in client.take_events():
+                if isinstance(event, StreamDataReceived):
+                    pass  # drain, so the receiving halves reach Data Read
+
+        assert len(answered) == wanted
 
 
 class TestRecovery:
@@ -643,3 +673,42 @@ class TestKeyUpdate:
         the packet is undecryptable rather than merely late."""
         _, received = self.reorder_across_update(credentials, delay=3600.0)
         assert received == b""
+
+
+class TestPacing:
+    """RFC 9002 §7.7."""
+
+    def paced_client(self, credentials: Credentials) -> tuple[Connection, Connection, float, int]:
+        """A client with more to send than the window, past slow start's
+        first round so the window exceeds the burst limit."""
+        client, server, now = handshake(credentials)
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, b"x" * 400_000)
+        return client, server, pump(client, server, now, rounds=1), stream_id
+
+    def test_a_burst_is_limited_to_the_initial_window(self, credentials: Credentials) -> None:
+        client, _, now, _ = self.paced_client(credentials)
+        burst = client.datagrams_to_send(now)
+        assert burst
+        assert sum(len(d.data) for d in burst) <= PACING_BURST_DATAGRAMS * DEFAULT_MAX_DATAGRAM_SIZE
+
+    def test_credit_refills_over_time(self, credentials: Credentials) -> None:
+        """Time alone releases more data. No acknowledgement arrives in
+        between, so the window does not move: the pacer held it back."""
+        client, _, now, _ = self.paced_client(credentials)
+        assert client.datagrams_to_send(now)
+        assert client.datagrams_to_send(now) == []
+        deadline = client.next_timer()
+        assert deadline is not None
+        assert client.datagrams_to_send(deadline)
+
+    def test_acknowledgements_are_not_paced(self, credentials: Credentials) -> None:
+        client, server, now, stream_id = self.paced_client(credentials)
+        client.datagrams_to_send(now)
+        assert client.datagrams_to_send(now) == []
+        server.send_stream_data(stream_id, b"pong")
+        for datagram in server.datagrams_to_send(now):
+            client.datagram_received(datagram.data, now, source="server")
+        answer = client.datagrams_to_send(now)
+        assert answer
+        assert all(len(d.data) < DEFAULT_MAX_DATAGRAM_SIZE for d in answer)

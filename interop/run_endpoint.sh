@@ -24,10 +24,6 @@ set -e
 # and handshakecorruption cases: one connection per file rather than one
 # connection carrying every request.
 #
-# multiplexing is deliberately absent: it transfers thousands of files
-# over one connection and expects the server to raise stream limits with
-# MAX_STREAMS, which dsquic does not send yet. It advertises 16
-# bidirectional streams and the seventeenth fails.
 SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit"
 
 case " $SUPPORTED " in

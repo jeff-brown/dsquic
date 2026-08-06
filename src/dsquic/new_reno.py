@@ -9,6 +9,7 @@ from dsquic.recovery import SentPacket
 
 LOSS_REDUCTION_FACTOR = 0.5  # kLossReductionFactor (B.1)
 MINIMUM_WINDOW_DATAGRAMS = 2  # kMinimumWindow (B.1)
+PACING_GAIN = 1.25  # §7.7: N, at least 1, so RTT variation does not idle the window
 INITIAL_WINDOW_FLOOR = 14720  # B.1: initial window upper clamp interacts with this floor
 
 
@@ -33,9 +34,11 @@ class NewReno:
     def bytes_in_flight(self) -> int:
         return self._bytes_in_flight
 
-    @property
-    def pacing_rate(self) -> float | None:
-        return None
+    def pacing_rate(self, smoothed_rtt: float) -> float | None:
+        """§7.7: N * congestion_window / smoothed_rtt."""
+        if smoothed_rtt <= 0:
+            return None
+        return PACING_GAIN * self._congestion_window / smoothed_rtt
 
     def _in_recovery(self, sent_time: float) -> bool:
         """B.4: a packet sent before recovery began does not exit recovery."""

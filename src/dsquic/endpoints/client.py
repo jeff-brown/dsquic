@@ -32,6 +32,7 @@ from dsquic.connection import (
     StreamDataReceived,
 )
 from dsquic.endpoints import keylog_writer, load_pem_certificates, pump, qlog_trace
+from dsquic.streams import StreamLimitReached
 from dsquic.tls import ClientConfig
 
 DEFAULT_TIMEOUT = 30.0  # a whole fetch, not a single response
@@ -55,8 +56,9 @@ def fetch(
 ) -> dict[str, bytes]:
     """Fetch paths over one connection; returns path to body bytes.
 
-    One request per bidirectional stream, all issued once the handshake
-    confirms, per hq-interop.
+    One request per bidirectional stream, per hq-interop. Requests are
+    issued as stream credit allows: the peer's initial limit may be
+    smaller than the number of paths, and rises as streams close (§4.6).
     """
     options = options if options is not None else ClientOptions()
     server_name = options.server_name
@@ -84,7 +86,8 @@ def fetch(
     bodies: dict[int, bytearray] = {}
     stream_paths: dict[int, str] = {}
     finished: set[int] = set()
-    requested = False
+    pending = list(paths)
+    connected = False
     deadline = time.monotonic() + timeout
 
     try:
@@ -92,22 +95,26 @@ def fetch(
         while time.monotonic() < deadline:
             pump(connection, sock, selector, deadline)
             for event in connection.take_events():
-                if isinstance(event, HandshakeConfirmed) and not requested:
-                    requested = True
-                    for path in paths:
+                match event:
+                    case ConnectionTerminated():
+                        raise RuntimeError(f"connection closed: {event.reason or event.error_code}")
+                    case HandshakeConfirmed():
+                        connected = True
+                    case StreamDataReceived():
+                        bodies.setdefault(event.stream_id, bytearray()).extend(event.data)
+                        if event.end_stream:
+                            finished.add(event.stream_id)
+            if connected:
+                while pending:
+                    try:
                         stream_id = connection.open_stream()
-                        stream_paths[stream_id] = path
-                        bodies[stream_id] = bytearray()
-                        connection.send_stream_data(
-                            stream_id, hq.encode_request(path), end_stream=True
-                        )
-                elif isinstance(event, StreamDataReceived):
-                    bodies.setdefault(event.stream_id, bytearray()).extend(event.data)
-                    if event.end_stream:
-                        finished.add(event.stream_id)
-                elif isinstance(event, ConnectionTerminated):
-                    raise RuntimeError(f"connection closed: {event.reason or event.error_code}")
-            if requested and len(finished) == len(paths):
+                    except StreamLimitReached:
+                        break  # wait for the peer to raise the limit
+                    path = pending.pop(0)
+                    stream_paths[stream_id] = path
+                    bodies[stream_id] = bytearray()
+                    connection.send_stream_data(stream_id, hq.encode_request(path), end_stream=True)
+            if connected and not pending and len(finished) == len(paths):
                 break
         else:
             raise TimeoutError(f"no response within {timeout}s")

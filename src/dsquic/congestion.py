@@ -29,9 +29,13 @@ class CongestionController(Protocol):
         """Bytes of in-flight packets not yet acked, lost, or discarded."""
         ...
 
-    @property
-    def pacing_rate(self) -> float | None:
-        """Bytes per second to pace at, or None for no pacing."""
+    def pacing_rate(self, smoothed_rtt: float) -> float | None:
+        """Bytes per second to pace at, or None for no pacing (§7.7).
+
+        The RTT is supplied because recovery owns it; the formula is the
+        controller's, since a window-based controller and a rate-based
+        one derive it differently.
+        """
         ...
 
     def on_packet_sent(self, packet: "SentPacket") -> None: ...

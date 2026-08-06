@@ -34,6 +34,11 @@ STREAM_SERVER_INITIATED_BIT = 0x01  # §2.1, Table 1
 STREAM_UNIDIRECTIONAL_BIT = 0x02
 
 
+class StreamLimitReached(Exception):
+    """The peer's stream limit is reached; opening waits for MAX_STREAMS
+    (§4.6). Not a connection error: the limit is expected to move."""
+
+
 class StreamError(Exception):
     """A peer violated stream rules; carries the §20.1 error code."""
 
@@ -305,6 +310,14 @@ class StreamManager:
         self.max_data = peer.max_data  # our sending allowance (§4.1)
         self.local_max_data = local.max_data  # what we advertised
         self._data_window = local.max_data
+        # §4.6: cumulative stream counts, allowance and advertisement,
+        # extended by MAX_STREAMS as peer-initiated streams close.
+        self.max_streams_bidi = peer.max_streams_bidi
+        self.max_streams_uni = peer.max_streams_uni
+        self.local_max_streams_bidi = local.max_streams_bidi
+        self.local_max_streams_uni = local.max_streams_uni
+        self._streams_window_bidi = local.max_streams_bidi
+        self._streams_window_uni = local.max_streams_uni
         self.data_sent = 0
         self.data_received = 0
 
@@ -312,8 +325,8 @@ class StreamManager:
 
     def open_bidi(self) -> int:
         """Open the next locally-initiated bidirectional stream (§2.1)."""
-        if self._next_bidi_sequence >= self._peer.max_streams_bidi:
-            raise ValueError("peer's bidirectional stream limit reached")
+        if self._next_bidi_sequence >= self.max_streams_bidi:
+            raise StreamLimitReached("peer's bidirectional stream limit reached")
         type_bits = 0 if self._is_client else STREAM_SERVER_INITIATED_BIT
         stream_id = (self._next_bidi_sequence << 2) | type_bits
         self._next_bidi_sequence += 1
@@ -344,13 +357,13 @@ class StreamManager:
             raise StreamError(STREAM_STATE_ERROR, f"stream {stream_id} was never opened")
         sequence = stream_id >> 2
         if is_bidirectional(stream_id):
-            if sequence >= self._local.max_streams_bidi:
+            if sequence >= self.local_max_streams_bidi:
                 raise StreamError(STREAM_LIMIT_ERROR, f"stream {stream_id} exceeds stream limit")
             return _Half(
                 send=SendStream(stream_id, self._peer.max_stream_data_bidi_local),
                 recv=RecvStream(stream_id, self._local.max_stream_data_bidi_remote),
             )
-        if sequence >= self._local.max_streams_uni:
+        if sequence >= self.local_max_streams_uni:
             raise StreamError(STREAM_LIMIT_ERROR, f"stream {stream_id} exceeds stream limit")
         return _Half(send=None, recv=RecvStream(stream_id, self._local.max_stream_data_uni))
 
@@ -397,6 +410,48 @@ class StreamManager:
 
     def on_max_data(self, maximum: int) -> None:
         self.max_data = max(self.max_data, maximum)
+
+    def on_max_streams(self, maximum: int, bidirectional: bool) -> None:
+        """§4.6: raise our opening allowance. A limit that does not
+        increase is ignored."""
+        if bidirectional:
+            self.max_streams_bidi = max(self.max_streams_bidi, maximum)
+        else:
+            self.max_streams_uni = max(self.max_streams_uni, maximum)
+
+    def max_streams_update(self, bidirectional: bool) -> int | None:
+        """A new MAX_STREAMS limit once half the window is consumed
+        (§4.6), or None while the advertisement suffices.
+
+        §4.6 leaves the policy open and suggests extending as streams
+        close, which keeps the count available to the peer roughly
+        constant. A stream counts as closed once its receiving half is
+        fully read (§3.2).
+        """
+        window = self._streams_window_bidi if bidirectional else self._streams_window_uni
+        advertised = self.local_max_streams_bidi if bidirectional else self.local_max_streams_uni
+        opened = closed = 0
+        for stream_id, half in self._streams.items():
+            if is_client_initiated(stream_id) == self._is_client:
+                continue  # ours to open; the peer's limit does not apply
+            if is_bidirectional(stream_id) != bidirectional:
+                continue
+            opened += 1
+            if half.recv is not None and half.recv.is_fully_read:
+                closed += 1
+        if advertised - opened >= window / 2:
+            return None
+        limit = closed + window
+        if limit <= advertised:
+            # The peer holds a full window open, so there is no credit to
+            # grant until it closes some. Re-sending the limit it already
+            # has would crowd out the responses that let it do so.
+            return None
+        if bidirectional:
+            self.local_max_streams_bidi = limit
+        else:
+            self.local_max_streams_uni = limit
+        return limit
 
     def max_data_update(self) -> int | None:
         """A new MAX_DATA limit when half the connection window is consumed

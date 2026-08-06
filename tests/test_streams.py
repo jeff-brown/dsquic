@@ -19,6 +19,7 @@ from dsquic.streams import (
     SendState,
     SendStream,
     StreamError,
+    StreamLimitReached,
     StreamManager,
     is_bidirectional,
     is_client_initiated,
@@ -230,7 +231,7 @@ class TestStreamManager:
     def test_open_respects_peer_stream_limit(self) -> None:
         manager = make_manager(max_streams_bidi=1)
         manager.open_bidi()
-        with pytest.raises(ValueError, match="limit"):
+        with pytest.raises(StreamLimitReached):
             manager.open_bidi()
 
     def test_peer_opens_stream_on_first_frame(self) -> None:
@@ -285,3 +286,68 @@ class TestStreamManager:
         with pytest.raises(StreamError) as excinfo:
             manager.send_stream(2)
         assert excinfo.value.error_code == STREAM_STATE_ERROR
+
+
+class TestStreamLimits:
+    """§4.6: cumulative stream counts, extended by MAX_STREAMS."""
+
+    def make(self, bidi: int = 2, uni: int = 2) -> StreamManager:
+        limits = FlowControlLimits(
+            max_data=1 << 20,
+            max_stream_data_bidi_local=1 << 16,
+            max_stream_data_bidi_remote=1 << 16,
+            max_stream_data_uni=1 << 16,
+            max_streams_bidi=bidi,
+            max_streams_uni=uni,
+        )
+        return StreamManager(is_client=False, local=limits, peer=limits)
+
+    def test_peer_beyond_the_limit_is_a_stream_limit_error(self) -> None:
+        manager = self.make(bidi=2)
+        for stream_id in (0, 4):
+            manager.on_stream_frame(Stream(stream_id=stream_id, offset=0, data=b"x", fin=True))
+        with pytest.raises(StreamError) as excinfo:
+            manager.on_stream_frame(Stream(stream_id=8, offset=0, data=b"x", fin=True))
+        assert excinfo.value.error_code == STREAM_LIMIT_ERROR
+
+    def test_reading_streams_extends_the_limit(self) -> None:
+        """The peer gets more credit as its streams close, which is what
+        keeps a long-lived connection from running out (§4.6)."""
+        manager = self.make(bidi=2)
+        for stream_id in (0, 4):  # the peer spends its whole allowance
+            manager.on_stream_frame(Stream(stream_id=stream_id, offset=0, data=b"x", fin=True))
+        manager.recv_stream(0).read()  # one of them closes
+
+        limit = manager.max_streams_update(bidirectional=True)
+        assert limit == 3  # one closed, plus a window of two
+        assert manager.local_max_streams_bidi == 3
+
+        # The stream that was refused before now fits under the new limit.
+        manager.on_stream_frame(Stream(stream_id=8, offset=0, data=b"x", fin=True))
+
+    def test_no_update_while_the_peer_holds_a_full_window(self) -> None:
+        """A limit the peer already has is not re-sent: repeating it
+        would crowd out the responses that let it close streams."""
+        manager = self.make(bidi=2)
+        for stream_id in (0, 4):  # opened, none closed
+            manager.on_stream_frame(Stream(stream_id=stream_id, offset=0, data=b"x", fin=True))
+        assert manager.max_streams_update(bidirectional=True) is None
+        assert manager.max_streams_update(bidirectional=True) is None
+
+    def test_an_update_is_withheld_while_credit_remains(self) -> None:
+        manager = self.make(bidi=8)
+        assert manager.max_streams_update(bidirectional=True) is None
+
+    def test_a_lower_limit_is_ignored(self) -> None:
+        """§4.6: MAX_STREAMS frames that do not increase the limit MUST
+        be ignored."""
+        manager = self.make(bidi=2)
+        manager.on_max_streams(10, bidirectional=True)
+        manager.on_max_streams(4, bidirectional=True)
+        assert manager.max_streams_bidi == 10
+
+    def test_bidirectional_and_unidirectional_limits_are_separate(self) -> None:
+        manager = self.make(bidi=2, uni=2)
+        manager.on_max_streams(9, bidirectional=True)
+        assert manager.max_streams_bidi == 9
+        assert manager.max_streams_uni == 2

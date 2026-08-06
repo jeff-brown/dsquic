@@ -38,6 +38,11 @@ recorded in `docs/design.md`.
 `transfercorruption`, `blackhole`, `longrtt`, and `amplificationlimit`.
 Everything else exits 127.
 
+`multiplexing` is not in that list and does not need to be: the runner
+gives both containers the name `transfer` for it, and it is the request
+count, 1999 files on one connection, that makes it a test of
+MAX_STREAMS.
+
 `multiconnect` is the name the runner gives the client container for the
 `handshakeloss` and `handshakecorruption` cases: 50 files, one connection
 each, so that what is being lost is handshake packets rather than data
@@ -89,9 +94,11 @@ including `handshakeloss` and `handshakecorruption`. `keyupdate` passes
 too, which the runner verifies by reading key phase bits out of the
 pcap.
 
-As **client**, everything passes against picoquic and quiche;
-`handshakeloss` and `handshakecorruption` fail against aioquic and
-`handshakeloss` is intermittent against quic-go. That pairing is hard
+As **client**, everything passes against picoquic and quiche except as
+noted; `handshakeloss` and `handshakecorruption` fail against aioquic and
+`handshakeloss` is intermittent against quic-go. `multiplexing` passes in
+six of eight pairings, failing as client against aioquic and as server
+against a quiche client; see STATE.md. That pairing is hard
 across the ecosystem: in the public run of 2026-08-03, aioquic as server
 is failed on `handshakeloss` by quic-go, ngtcp2, lsquic and go-x-net.
 See STATE.md for the detail and the next diagnostic step.
@@ -105,7 +112,6 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 
 | Case | Reason |
 |---|---|
-| `multiplexing` | Needs MAX_STREAMS to raise limits; dsquic advertises 16 bidirectional streams and never increases them |
 | `retry`, `v2` | Retry packets are not generated or parsed, and only QUIC v1 is offered |
 | `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
 | `resumption`, `zerortt` | No session tickets, no 0-RTT |

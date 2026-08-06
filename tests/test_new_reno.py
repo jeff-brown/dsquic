@@ -1,7 +1,7 @@
 """Tests for dsquic.new_reno."""
 
 from dsquic.frames import Ping
-from dsquic.new_reno import NewReno
+from dsquic.new_reno import PACING_GAIN, NewReno
 from dsquic.recovery import SentPacket
 from dsquic.tls import EncryptionLevel
 
@@ -103,5 +103,11 @@ def test_no_growth_for_packets_sent_in_recovery() -> None:
     assert reno.congestion_window == window
 
 
-def test_pacing_rate_is_unset() -> None:
-    assert NewReno(MDS).pacing_rate is None
+def test_pacing_rate_spreads_the_window_over_the_rtt() -> None:
+    """§7.7: rate = N * congestion_window / smoothed_rtt."""
+    reno = NewReno(MDS)
+    assert reno.pacing_rate(0.1) == PACING_GAIN * reno.congestion_window / 0.1
+
+
+def test_no_pacing_rate_without_an_rtt() -> None:
+    assert NewReno(MDS).pacing_rate(0.0) is None
