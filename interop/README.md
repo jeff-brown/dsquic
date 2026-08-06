@@ -80,19 +80,92 @@ without it every case fails with "Expected exactly one version. Got []".
 That failure reproduces for quic-go as well, which is how it was
 identified as environmental rather than ours.
 
-Cases are timing sensitive on a four-CPU VM. A case that fails in a long
-combined run and passes on its own is usually contention, not a protocol
-bug, but it is worth re-running rather than assuming.
+Cases are timing sensitive, so a case that fails in a long combined run
+and passes on its own is usually contention rather than a protocol bug.
+Re-run a single red square before believing it.
+
+### VM sizing and settings
+
+`colima start --cpu 8 --memory 16` on a 10-core, 32GB host. The amd64
+peer images (aioquic, picoquic, quiche) run emulated on Apple silicon,
+which is what the cores are for; at four CPUs the loss cases contend
+badly enough to change results.
+
+Container file descriptors must be raised or `multiplexing` fails for
+*any* client: the runner's `docker-compose.yml` sets only `memlock`, so
+the limit is the Docker default of 1024, and a peer serving 1999
+concurrent requests opens a file per request and dies with
+`OSError: [Errno 24] Too many open files`. Set it in
+`~/.colima/default/colima.yaml`, whose `docker:` mapping is colima's
+daemon.json passthrough, then `colima restart`:
+
+```yaml
+docker:
+  default-ulimits:
+    nofile:
+      Name: nofile
+      Soft: 1048576
+      Hard: 1048576
+```
+
+Editing `/etc/docker/daemon.json` inside the VM appears to work and does
+not survive: colima regenerates that file on every start, so the limit
+reverts to 1024 and the case fails again for a reason that looks new.
+
+### Disk and log retention
+
+The VM has two disks. Lima's base disk, 19GB, holds `/` and the home
+directory where the runner and its `logs_<timestamp>` directories live.
+Colima's data disk, 60GB, is mounted at `/var/lib/docker` and is mostly
+empty. `colima start --disk` sizes the second one, so growing it does
+nothing for log pressure.
+
+A run's artifacts are dominated by pcaps, then container stderr, then
+the peers' own qlogs; dsquic's `.sqlog` traces are the smallest part and
+the most useful. Keep the three most recent runs whole, pcaps included,
+since the phase gates call for independent capture verification, and
+delete the rest:
+
+```
+colima ssh -- bash -lc 'cd ~/quic-interop-runner && ls -dt logs_* | tail -n +4 | xargs rm -rf'
+```
+
+### Keeping the host awake
+
+macOS idle sleep suspends the VM mid-run. This host is configured with
+`sleep 1`, one minute, on both AC and battery (`pmset -g custom`), which
+is shorter than every case. Launch the run under `caffeinate`:
+
+```
+caffeinate -ims colima ssh -- bash -lc 'cd ~/quic-interop-runner && .venv/bin/python run.py ...'
+```
+
+or attach an assertion to a run already in flight, which releases itself
+when that process exits:
+
+```
+caffeinate -ims -w <pid>
+```
+
+Two limits to know. `-s`, which prevents system sleep outright, is
+ignored on battery, so only `-i` applies there; run on AC power, where
+`powernap` and `standby` are also less likely to suspend the VM. And no
+flag defeats clamshell sleep on Apple silicon, so the lid stays open
+unless an external display is attached on AC.
+
+A sweep that slept should be discarded rather than interpreted: the VM
+comes back with a clock jump, and these cases already flip on CPU
+contention alone.
 
 ## Results
 
 Through the ns-3 simulator, against quic-go, aioquic, picoquic and
 quiche.
 
-As **server**, every case attempted passes against all four peers,
-including `handshakeloss` and `handshakecorruption`. `keyupdate` passes
-too, which the runner verifies by reading key phase bits out of the
-pcap.
+As **server**, all twelve claimed cases pass against all four peers,
+with no failures. `keyupdate` is verified by the runner reading key
+phase bits out of the pcap, and quiche reports it unsupported because
+its client does not implement key update.
 
 As **client**, `handshake`, `transfer`, `multiplexing`, `handshakeloss`,
 `handshakecorruption`, `ipv6` and `keyupdate` pass against all four

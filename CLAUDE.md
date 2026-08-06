@@ -128,7 +128,9 @@ it exists to teach QUIC.
   this; do not weaken it.
 - New modules need: RFC-mapping docstring, mirror test file, entry in the
   `__init__.py` module map.
-- Text is ASCII except the section sign (§) in RFC citations.
+- Text is ASCII except the section sign (§) in RFC citations, verbatim
+  tool output (the Interop Runner's `✓` result notation), and proper
+  names spelled correctly.
 
 ## Git
 
