@@ -103,12 +103,13 @@ test sequence:
 Primary interop targets are quic-go first, then picoquic as the conformance
 ratchet. See `interop/` for the runner shim and current results.
 
-The runner has been run locally against quic-go and aioquic through its
-ns-3 simulator. `handshake` and `transfer` pass in every pairing of the
-three implementations, in both roles; `transferloss`,
-`transfercorruption`, `blackhole`, `longrtt` and `amplificationlimit`
-pass against quic-go in both roles; and `keyupdate` passes with dsquic as
-server.
+The runner has been run locally against quic-go, aioquic, picoquic and
+quiche through its ns-3 simulator. As client, `handshake`, `transfer`,
+`multiplexing`, `handshakeloss`, `handshakecorruption`, `ipv6` and
+`keyupdate` pass against all four; as server, every case attempted
+passes against all four. `interop/README.md` tabulates the cases that
+are not attempted yet and why, and `STATE.md` records what each rung of
+the ladder found.
 
 ## Development
 

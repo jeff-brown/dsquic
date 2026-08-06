@@ -45,7 +45,7 @@ the open item recorded below.
   by probing for files, since the same image also runs on an ordinary
   bridge. `run_endpoint.sh` claims the eight cases listed under results
   below; interop/README.md tabulates why each of the runner's other cases
-  is not attempted. Gaps: IPv4 only and no client-initiated key update.
+  is not attempted.
 
 ## Running the Interop Runner locally
 
@@ -253,58 +253,78 @@ broken against a peer, run a known-good implementation against that peer
 in the same environment before believing it. Two of the three conclusions
 drawn here before that experiment were wrong.
 
-## Open: handshakeloss and handshakecorruption as client, vs aioquic
+## handshakeloss and handshakecorruption as client (2026-08-05)
 
-As **server** these are fixed and confirmed against four peers. As
-**client** they fail consistently against aioquic, pass against picoquic
-and quiche, and are intermittent against quic-go.
+Three defects, each hidden behind the one before it, found by pointing
+the qlog at the case rather than by reading captures. All three are
+client-side and all three need loss during the handshake, so nothing
+below the runner reached them.
 
-It is not the VM and it is not emulation. aioquic, picoquic and quiche
-are all amd64 images running emulated on an aarch64 host, and two of the
-three pass, so emulation is controlled for. It is also **not a
-regression**: an image built from the previous commit fails the same two
-cases against aioquic in the same way, so the three server-side fixes
-revealed this rather than caused it. It had never been run before,
-because client-versus-aioquic loss cases were not part of any earlier
-matrix.
+- **The second PTO probe carried a bare PING.** §6.2.4 allows two probe
+  datagrams; `_prepare_probe` requeued the outstanding flight once, so
+  the first probe carried the lost CRYPTO and the second fell back to a
+  PING. When the ClientHello is lost, that probe is the first Initial
+  the server sees, and RFC 9000 §17.2.2 says "The first packet sent by a
+  client always includes a CRYPTO frame": aioquic answered it with
+  PROTOCOL_VIOLATION, `Error: 10, reason: Packet contains no CRYPTO
+  frame`, killing the connection a millisecond after creating it. The
+  probe fallback is now a copy of the oldest unacknowledged CRYPTO frame
+  and a PING only when none is outstanding.
+- **A PTO doubled the outstanding flight.** `_prepare_probe` requeued
+  *every* unacknowledged packet, and the send loop transmitted all of
+  them, so each expiry sent twice what the last one did: 2, 3, 6, 12, 24
+  and 48 datagrams were observed, against §6.2.4's limit of two. The
+  congestion window never braked it because retransmitted CRYPTO
+  fragments are small, roughly 160 bytes, so a flight of 48 of them
+  still fits in the initial window. A PTO now requeues at most one
+  packet per probe; loss detection retransmits the rest.
+- **Application data waited on handshake confirmation.** RFC 9001 §4.1.1
+  makes 1-RTT data sendable once the handshake is *complete*; §4.1.2
+  confirmation is a later event that governs discarding Handshake keys
+  and initiating key updates. The client emitted only
+  `HandshakeConfirmed`, on HANDSHAKE_DONE, and `endpoints.client.fetch`
+  gated requests on it. HANDSHAKE_DONE can be lost, and when it was, the
+  client sat retransmitting Handshake CRYPTO for 38 seconds into a space
+  the server had already discarded keys for, while the server, long since
+  in 1-RTT, waited for a request that the client refused to send. The
+  connection now emits `HandshakeCompleted` (§4.1.1) as well, and the
+  endpoints gate on that.
 
-This pairing is hard across the ecosystem, which lowers the priority. In
-the public run at
-`https://interop.seemann.io/logs/quic/2026-08-03T17:17/result.json`,
-aioquic as server is failed on `handshakeloss` by quic-go, ngtcp2, lsquic
-and go-x-net, and on `handshakecorruption` by lsquic, quinn and
-go-x-net. aioquic sits mid-pack among servers for these two cases, 4 of
-14 and 3 of 14; mvfst fails 13 of 14 and quiche fails 9 of 14 on
-corruption, while picoquic and neqo are clean. Note that dsquic passes
-both against quiche, which most clients do not, and against picoquic.
+The qlog earned its keep here, but only after `acked_ranges` was added
+(events §8): without the ranges an ACK says nothing about which packets
+a peer confirmed, and two rounds of analysis were guesswork because of
+it.
 
-That said, 10 of the 14 clients that attempt it do pass against aioquic,
-so this is not an exoneration: most stacks handle whatever the
-interaction is.
+With all three fixed, `handshakeloss` and `handshakecorruption` pass as
+client against all four peers, `✓(L1,C1)` in every column. quic-go passes
+both in this environment, which is what identified the fault as ours
+rather than an aioquic quirk: the same discriminating experiment that
+settled the file descriptor question.
 
-Nor is it reproducible with the loss relay: fifty sequential connections
-complete 50/50, twice over, at a higher uniform loss rate than the runner
-uses. Two differences worth chasing, in order:
+## IPv6 and client-initiated key update (2026-08-06)
 
-- The runner drops three datagrams consecutively (`burst_to_server=3`)
-  where the relay drops every third and so never drops two in a row. A
-  PTO sends its two probes back-to-back, so a burst can take both, which
-  is exactly the case two probes exist to survive. Teaching the relay to
-  drop in bursts is the cheapest next experiment, and aioquic can be
-  driven locally since it is already a dev dependency.
-- dsquic does not coalesce a copy of the Finished ahead of its 1-RTT
-  packets, which RFC 9001 §5.7 recommends "until one of the Handshake
-  packets is acknowledged". Once our Finished is sent, a retransmitted
-  request goes out as a bare 1-RTT datagram. Against a server enforcing
-  §5.7 strictly that costs a round trip per attempt rather than
-  breaking, but under burst loss the round trips compound.
+Both endpoints take their address family from the name they are given,
+via `getaddrinfo`, rather than hardcoding `AF_INET`. A server given an
+IPv6 bind address sets `IPV6_V6ONLY` off, so one socket serves IPv4
+peers too, arriving as `::ffff:a.b.c.d`. `Address` covers both sockaddr
+shapes, since IPv6 adds flow info and scope id. The runner's `ipv6` case
+passes in both roles against quic-go and aioquic, `✓(6)`.
+
+`ConnectionConfig.key_update_interval` is the client-side key update
+policy: packets sent in a phase before starting the next (§6.1).
+Deciding that an update happens is core, which is why the check lives in
+the send path and defers to `initiate_key_update`, whose §6.1
+preconditions can still refuse it; how often is policy, which is why the
+number is configuration. The reference client exposes it as
+`--key-update-interval` and the shim passes 100 for the `keyupdate`
+case, the same figure quic-go's interop client uses.
 
 ## In-flight work
 
-`origin/main` is at 2db788f, "Add qlog structured event output in the
-sequential format". Staged and awaiting commit: the §4.6 stream limit
-state in `StreamManager`, RFC 9002 §7.7 pacing, and the ACK-only send
-path that pacing exposed.
+`origin/main` is at 9e90e1f, "Pace sending per RFC 9002 §7.7; exempt
+ACK-only packets from the window". Staged and awaiting commit: the three
+client-side handshake-loss defects, `acked_ranges` in the qlog, IPv6 in
+both endpoints, and the client-side key update policy.
 
 ## What interop and the wire found that self-testing did not
 
@@ -451,14 +471,13 @@ And the one that mattered most, also found this way:
 
 1. **The roadmap past the MVP** (design.md §6.1), in order: retry,
    resumption, http3, ecn, zerortt. Each climbs all three
-   rungs of the ladder (design.md §6.2). `keyupdate` has left the list
-   for the server role and needs only a policy for the client role: when
-   to call `Connection.initiate_key_update`. Deciding that a key update
-   happens is core, but "after N packets" is a configuration choice, so
-   it probably belongs in `ConnectionConfig` rather than in the endpoint
-   or the shim script.
-2. **IPv6 in the endpoints.** Both open `AF_INET` sockets, so the runner's
-   `ipv6` case cannot pass.
+   rungs of the ladder (design.md §6.2). `http3` is the largest and the
+   one that unblocks MASQUE, since `h3.py` is still a stub and carries
+   the last open MASQUE readiness constraint.
+2. **Re-run the full case list.** Pacing changed the send path for every
+   case and only a subset has been re-run since; the loss cases, the
+   server role, and `blackhole`, `longrtt` and `amplificationlimit` are
+   unverified against the current build.
 3. **Broaden the runner matrix.** Three implementations are exercised
    locally out of the 17 registered; each additional one is a `docker
    pull` and a row in the run. Submitting dsquic upstream additionally

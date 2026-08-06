@@ -25,7 +25,8 @@ MAX_DATAGRAM_RECV = 65536
 PEM_CERTIFICATE_MARKER = b"-----BEGIN CERTIFICATE-----"
 
 # What an opaque core destination is, once a socket endpoint owns it.
-Address = tuple[str, int] | None
+# IPv4 sockaddrs are (host, port); IPv6 adds flow info and scope id.
+Address = tuple[str, int] | tuple[str, int, int, int] | None
 
 
 def split_pem_chain(data: bytes) -> list[Certificate]:

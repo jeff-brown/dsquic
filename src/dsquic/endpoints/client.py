@@ -28,6 +28,7 @@ from dsquic.connection import (
     Connection,
     ConnectionConfig,
     ConnectionTerminated,
+    HandshakeCompleted,
     HandshakeConfirmed,
     StreamDataReceived,
 )
@@ -46,6 +47,29 @@ class ClientOptions:
     insecure: bool = False
     server_name: str | None = None
     timeout: float = DEFAULT_TIMEOUT
+    key_update_interval: int | None = None
+
+
+def issue_requests(
+    connection: Connection,
+    pending: list[str],
+    stream_paths: dict[int, str],
+    bodies: dict[int, bytearray],
+) -> None:
+    """Open a stream per pending path, as far as stream credit allows.
+
+    §4.6 limits are cumulative, so the peer's initial allowance can be
+    smaller than the number of paths and rises as streams close.
+    """
+    while pending:
+        try:
+            stream_id = connection.open_stream()
+        except StreamLimitReached:
+            return  # wait for the peer to raise the limit
+        path = pending.pop(0)
+        stream_paths[stream_id] = path
+        bodies[stream_id] = bytearray()
+        connection.send_stream_data(stream_id, hq.encode_request(path), end_stream=True)
 
 
 def fetch(
@@ -63,8 +87,10 @@ def fetch(
     options = options if options is not None else ClientOptions()
     server_name = options.server_name
     timeout = options.timeout
-    address = (host, port)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # §6.1: the address family follows the name, so an AAAA-only host
+    # is reached over IPv6 without a flag.
+    family, _, _, _, address = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0]
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.setblocking(False)
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
@@ -79,7 +105,11 @@ def fetch(
             insecure_skip_verify=options.insecure,
             verification_time=datetime.datetime.now(datetime.UTC),
         ),
-        config=ConnectionConfig(keylog=keylog_writer(), qlog=qlog_trace),
+        config=ConnectionConfig(
+            keylog=keylog_writer(),
+            qlog=qlog_trace,
+            key_update_interval=options.key_update_interval,
+        ),
         destination=address,
     )
 
@@ -98,22 +128,18 @@ def fetch(
                 match event:
                     case ConnectionTerminated():
                         raise RuntimeError(f"connection closed: {event.reason or event.error_code}")
-                    case HandshakeConfirmed():
+                    case HandshakeCompleted():
                         connected = True
+                    case HandshakeConfirmed():
+                        # RFC 9001 §4.1.2: not the gate for sending; the
+                        # frame it waits on can be lost.
+                        pass
                     case StreamDataReceived():
                         bodies.setdefault(event.stream_id, bytearray()).extend(event.data)
                         if event.end_stream:
                             finished.add(event.stream_id)
             if connected:
-                while pending:
-                    try:
-                        stream_id = connection.open_stream()
-                    except StreamLimitReached:
-                        break  # wait for the peer to raise the limit
-                    path = pending.pop(0)
-                    stream_paths[stream_id] = path
-                    bodies[stream_id] = bytearray()
-                    connection.send_stream_data(stream_id, hq.encode_request(path), end_stream=True)
+                issue_requests(connection, pending, stream_paths, bodies)
             if connected and not pending and len(finished) == len(paths):
                 break
         else:
@@ -167,6 +193,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, help="write bodies here instead of stdout")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument(
+        "--key-update-interval",
+        type=int,
+        help="start a new key phase after this many 1-RTT packets (RFC 9001 §6.1)",
+    )
+    parser.add_argument(
         "--connection-per-request",
         action="store_true",
         help="one connection per path, in sequence, instead of one for all of them",
@@ -186,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             insecure=args.insecure,
             server_name=args.server_name,
             timeout=args.timeout,
+            key_update_interval=args.key_update_interval,
         ),
     )
     for path, body in bodies.items():

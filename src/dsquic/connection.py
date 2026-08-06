@@ -170,7 +170,21 @@ class StreamDataReceived:
 
 
 @dataclass(frozen=True)
+class HandshakeCompleted:
+    """RFC 9001 §4.1.1: the TLS handshake is complete, so 1-RTT packets
+    may carry application data. This is the gate for sending requests,
+    not confirmation: a client that waits for HANDSHAKE_DONE waits on a
+    frame that can be lost."""
+
+    alpn: str
+
+
+@dataclass(frozen=True)
 class HandshakeConfirmed:
+    """RFC 9001 §4.1.2: confirmed at the server on completion, at the
+    client on HANDSHAKE_DONE. Governs discarding Handshake keys (§4.9.2)
+    and initiating a key update (§6.1), not application data."""
+
     alpn: str
 
 
@@ -180,7 +194,9 @@ class ConnectionTerminated:
     reason: str
 
 
-ConnectionEvent = StreamDataReceived | HandshakeConfirmed | ConnectionTerminated
+ConnectionEvent = (
+    StreamDataReceived | HandshakeCompleted | HandshakeConfirmed | ConnectionTerminated
+)
 
 
 @dataclass
@@ -250,6 +266,10 @@ class ConnectionConfig:
             initial_max_streams_uni=16,
         )
     )
+    # §6.1: packets sent in a phase before starting the next one, or
+    # None never to initiate. Whether to update is protocol; how often
+    # is policy, so it is configured rather than decided here.
+    key_update_interval: int | None = None
     keylog: Callable[[str], None] | None = None
     # Opens a trace, given the group ID, the role, and the reference
     # clock reading. A factory because a server learns the group ID from
@@ -442,6 +462,20 @@ class Connection:
         # still in flight from the peer belong to the old one (§6.5).
         space.key_phase_first = None
         self._log(now, qlog.KEY_UPDATED, {"key_type": "1RTT", "key_phase": int(space.key_phase)})
+
+    def _maybe_update_keys(self, now: float) -> None:
+        """Start the next phase once the configured interval of packets
+        has been sent in this one (§6.1).
+
+        An update refused by §6.1's preconditions is simply retried on
+        the next send.
+        """
+        interval = self.config.key_update_interval
+        if interval is None:
+            return
+        space = self._spaces[EncryptionLevel.ONE_RTT]
+        if space.next_packet_number - space.key_phase_send_first >= interval:
+            self.initiate_key_update(now)
 
     def initiate_key_update(self, now: float) -> bool:
         """Start the next key phase, reporting whether it started (§6.1).
@@ -789,13 +823,15 @@ class Connection:
     def _prepare_probe(self, level: EncryptionLevel) -> None:
         """§6.2.4: give a PTO probe something worth carrying.
 
-        New data when there is any, the whole outstanding flight
-        otherwise. A PING is the fallback in _pending_frames when there
-        is neither.
+        New data when there is any, otherwise the oldest unacknowledged
+        packets, at most one per probe. A PTO sends up to two datagrams,
+        so requeueing the whole outstanding flight would instead double
+        it on every expiry; loss detection, not the PTO, is what
+        retransmits the rest.
         """
         if self._has_pending_data(level):
             return
-        for packet in self.recovery.unacked(level):
+        for packet in self.recovery.unacked(level)[:PROBE_PACKETS]:
             self._requeue_lost(packet)
 
     def _has_pending_data(self, level: EncryptionLevel) -> bool:
@@ -931,6 +967,7 @@ class Connection:
             ),
         )
         self.state = ConnectionState.CONNECTED
+        self._events.append(HandshakeCompleted(alpn=self.alpn))
         if not self.is_client:
             # §7.3: the server confirms immediately and tells the client.
             self._handshake_done_pending = True
@@ -972,6 +1009,7 @@ class Connection:
         if self._close_frame is not None:
             return self._build_close_datagram(now)
 
+        self._maybe_update_keys(now)
         datagrams: list[OutgoingDatagram] = []
         self._pacing_deadline = None
         while True:
@@ -1157,12 +1195,27 @@ class Connection:
 
         if self._probes_pending[level]:
             # §6.2.4: the probe must be ack-eliciting. Anything already
-            # chosen that elicits an ACK serves; a PING is the fallback.
+            # chosen that elicits an ACK serves.
             if not any(is_ack_eliciting(frame) for frame in chosen):
-                chosen.append(Ping())
-                used += 1
+                filler = self._probe_filler(level, room - used)
+                chosen.append(filler)
+                used += len(filler.encode())
             self._probes_pending[level] -= 1
         return chosen, used
+
+    def _probe_filler(self, level: EncryptionLevel, room: int) -> Frame:
+        """§6.2.4: what a probe carries when nothing else is queued.
+
+        A copy of the oldest unacknowledged CRYPTO frame, because RFC 9000
+        §17.2.2 says the first packet a client sends includes a CRYPTO
+        frame, and under loss a probe is the first packet the server
+        receives. A PING only when no CRYPTO is outstanding.
+        """
+        for packet in self.recovery.unacked(level):
+            for frame in packet.frames:
+                if isinstance(frame, Crypto) and len(frame.encode()) <= room:
+                    return frame
+        return Ping()
 
     def _application_frames(self, room: int) -> tuple[list[Frame], int]:
         """Choose the frames only the application space carries.

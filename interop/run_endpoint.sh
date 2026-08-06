@@ -24,7 +24,7 @@ set -e
 # and handshakecorruption cases: one connection per file rather than one
 # connection carrying every request.
 #
-SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit"
+SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate"
 
 case " $SUPPORTED " in
     *" $TESTCASE "*) ;;
@@ -79,6 +79,10 @@ if [ "$ROLE" == "client" ]; then
     # pays for 50 handshakes under heavy loss instead of one.
     if [ "$TESTCASE" == "multiconnect" ]; then
         MODE="--connection-per-request --timeout 280"
+    elif [ "$TESTCASE" == "keyupdate" ]; then
+        # RFC 9001 §6.1: the case requires the client to start a new
+        # phase mid-transfer, which the runner checks in the capture.
+        MODE="--timeout 55 --key-update-interval 100"
     else
         MODE="--timeout 55"
     fi
@@ -92,7 +96,7 @@ if [ "$ROLE" == "client" ]; then
 else
     echo "dsquic server: $TESTCASE, serving /www on port 443" >&2
     exec python -m dsquic.endpoints.server \
-        --host 0.0.0.0 \
+        --host :: \
         --port 443 \
         --certificate /certs/cert.pem \
         --private-key /certs/priv.key \

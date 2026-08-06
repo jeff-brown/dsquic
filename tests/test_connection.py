@@ -3,6 +3,7 @@
 import datetime
 import json
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -10,10 +11,12 @@ from dsquic import frames, hq, qlog
 from dsquic.connection import (
     DEFAULT_MAX_DATAGRAM_SIZE,
     PACING_BURST_DATAGRAMS,
+    PROBE_PACKETS,
     Connection,
     ConnectionConfig,
     ConnectionState,
     ConnectionTerminated,
+    HandshakeCompleted,
     HandshakeConfirmed,
     StreamDataReceived,
 )
@@ -47,11 +50,18 @@ def trace_into(sink: list[str]) -> Callable[[bytes, bool, float], QlogTrace]:
     return open_trace
 
 
+def qlog_events(records: list[str]) -> list[dict[str, Any]]:
+    """Parse JSON-SEQ records, skipping the header (main-schema §5)."""
+    events = [json.loads(record[1:]) for record in records]
+    return [event for event in events if "name" in event]
+
+
 def make_pair(
     credentials: Credentials,
     client_keylog: list[str] | None = None,
     client_qlog: list[str] | None = None,
     server_qlog: list[str] | None = None,
+    key_update_interval: int | None = None,
 ) -> tuple[Connection, Connection]:
     client = Connection(
         is_client=True,
@@ -65,6 +75,7 @@ def make_pair(
         config=ConnectionConfig(
             keylog=client_keylog.append if client_keylog is not None else None,
             qlog=trace_into(client_qlog) if client_qlog is not None else None,
+            key_update_interval=key_update_interval,
         ),
         destination="server",
     )
@@ -133,6 +144,32 @@ class TestHandshake:
         client, server, _ = handshake(credentials)
         assert any(isinstance(e, HandshakeConfirmed) for e in client.take_events())
         assert any(isinstance(e, HandshakeConfirmed) for e in server.take_events())
+
+    def test_completion_precedes_confirmation_at_the_client(self, credentials: Credentials) -> None:
+        """RFC 9001 §4.1.1 vs §4.1.2. A client is complete when its TLS
+        handshake finishes and confirmed only on HANDSHAKE_DONE, which
+        can be lost. Gating application data on confirmation strands the
+        connection: one was seen retransmitting Handshake CRYPTO for 38
+        seconds while the server, already in 1-RTT, waited for a request.
+        """
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        now = 0.0
+        # Deliver the server's flight but none of the 1-RTT packets that
+        # would carry HANDSHAKE_DONE.
+        for datagram in client.datagrams_to_send(now):
+            server.datagram_received(datagram.data, now, source="client")
+        now = 0.1
+        for datagram in server.datagrams_to_send(now):
+            client.datagram_received(datagram.data, now, source="server")
+
+        events = client.take_events()
+        assert any(isinstance(event, HandshakeCompleted) for event in events)
+        assert not any(isinstance(event, HandshakeConfirmed) for event in events)
+        # Complete is enough to open a stream and send on it.
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, hq.encode_request("/index"), end_stream=True)
+        assert client.datagrams_to_send(now)
 
     def test_transport_parameters_exchanged(self, credentials: Credentials) -> None:
         client, server, _ = handshake(credentials)
@@ -413,9 +450,10 @@ class TestRecovery:
 
         The PTO doubles on every expiry, so one unlucky probe costs more
         than a round trip: it doubles the wait for every attempt after
-        it. The first probe carries the outstanding flight; the second
-        carries whatever is left of it, or a PING once it is drained,
-        since every probe packet must be ack-eliciting.
+        it. Both probes carry the outstanding flight: the first from the
+        retransmit queue, the second as a copy, since every probe packet
+        must be ack-eliciting and RFC 9000 §17.2.2 requires a CRYPTO
+        frame in the first packet a client sends.
         """
         client, _ = make_pair(credentials)
         client.connect(0.0)
@@ -428,6 +466,54 @@ class TestRecovery:
         assert len(probes) == 2
         for probe in probes:
             assert len(probe.data) >= 1200  # §14.1 still applies to a probe
+
+    def test_a_pto_never_grows_the_flight(self, credentials: Credentials) -> None:
+        """§6.2.4 allows up to two datagrams per PTO. Requeueing the whole
+        outstanding flight instead doubles it at every expiry: 2, 3, 6,
+        12, 24 datagrams were observed against aioquic, since the small
+        CRYPTO fragments never fill the congestion window.
+        """
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        for datagram in client.datagrams_to_send(0.0):
+            server.datagram_received(datagram.data, 0.0, source="client")
+        for datagram in server.datagrams_to_send(0.1):
+            client.datagram_received(datagram.data, 0.1, source="server")
+        client.datagrams_to_send(0.2)  # the client's flight, black holed
+
+        for _ in range(5):
+            deadline = client.next_timer()
+            assert deadline is not None
+            client.handle_timer(deadline)
+            assert len(client.datagrams_to_send(deadline)) <= PROBE_PACKETS
+
+    def test_every_initial_probe_carries_crypto(self, credentials: Credentials) -> None:
+        """RFC 9000 §17.2.2: "The first packet sent by a client always
+        includes a CRYPTO frame". When the ClientHello is lost, a probe
+        is the first Initial the server sees, and a bare PING leaves it
+        with a connection it cannot advance: aioquic closes one with
+        PROTOCOL_VIOLATION, which is the runner's handshakeloss failure.
+        """
+        records: list[str] = []
+        client, _ = make_pair(credentials, client_qlog=records)
+        client.connect(0.0)
+        client.datagrams_to_send(0.0)  # the ClientHello, lost
+
+        probe_at = client.next_timer()
+        assert probe_at is not None
+        client.handle_timer(probe_at)
+        assert len(client.datagrams_to_send(probe_at)) == 2
+
+        probes = [
+            event
+            for event in qlog_events(records)
+            if event["name"] == "quic:packet_sent"
+            and event["data"]["header"]["packet_type"] == "initial"
+            and event["time"] > 0
+        ]
+        assert len(probes) == 2
+        for probe in probes:
+            assert "crypto" in [frame["frame_type"] for frame in probe["data"]["frames"]]
 
     def test_one_rtt_is_not_processed_before_the_handshake_completes(
         self, credentials: Credentials
@@ -712,3 +798,44 @@ class TestPacing:
         answer = client.datagrams_to_send(now)
         assert answer
         assert all(len(d.data) < DEFAULT_MAX_DATAGRAM_SIZE for d in answer)
+
+
+class TestClientKeyUpdate:
+    """RFC 9001 §6.1, driven by ConnectionConfig.key_update_interval."""
+
+    def transfer(self, client: Connection, server: Connection, now: float) -> tuple[bytes, float]:
+        """Send one request and read the answer back; returns the body."""
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, hq.encode_request("/index"), end_stream=True)
+        now = pump(client, server, now)
+        for event in server.take_events():
+            if isinstance(event, StreamDataReceived):
+                server.send_stream_data(event.stream_id, b"body", end_stream=True)
+        now = pump(client, server, now)
+        body = b"".join(
+            event.data for event in client.take_events() if isinstance(event, StreamDataReceived)
+        )
+        return body, now
+
+    def test_the_client_starts_a_new_phase_and_data_keeps_flowing(
+        self, credentials: Credentials
+    ) -> None:
+        client, server = make_pair(credentials, key_update_interval=1)
+        client.connect(0.0)
+        now = pump(client, server)
+        phase = client.key_phase()
+        body, now = self.transfer(client, server, now)
+        assert body == b"body"
+        assert client.key_phase() is not phase
+        # The peer followed, and the next exchange runs in the new phase.
+        body, _ = self.transfer(client, server, now)
+        assert body == b"body"
+        assert server.key_phase() is client.key_phase()
+
+    def test_no_update_without_the_policy(self, credentials: Credentials) -> None:
+        client, server = make_pair(credentials)
+        client.connect(0.0)
+        now = pump(client, server)
+        phase = client.key_phase()
+        self.transfer(client, server, now)
+        assert client.key_phase() is phase

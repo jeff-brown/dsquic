@@ -233,9 +233,16 @@ def main(argv: list[str] | None = None) -> int:
         certificate_chain=chain, signing_key=key, alpn=[hq.ALPN], transport_parameters=b""
     )
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    family, _, _, _, address = socket.getaddrinfo(
+        args.host, args.port, type=socket.SOCK_DGRAM, flags=socket.AI_PASSIVE
+    )[0]
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    if family is socket.AF_INET6:
+        # Serve IPv4 peers on the same socket, which arrive as
+        # ::ffff:a.b.c.d, rather than running two listeners.
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((args.host, args.port))
+    sock.bind(address)
     sock.setblocking(False)
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)

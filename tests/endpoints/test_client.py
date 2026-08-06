@@ -37,7 +37,10 @@ def document_root(tmp_path: Path) -> Path:
 
 @contextmanager
 def running_server(
-    credentials: PemCredentials, document_root: Path, connection_limit: int
+    credentials: PemCredentials,
+    document_root: Path,
+    connection_limit: int,
+    family: socket.AddressFamily = socket.AF_INET,
 ) -> Generator[tuple[int, Server], None, None]:
     """A dsquic server on a loopback port, serving a fixed number of
     connections and then exiting. Yields the port and the server, whose
@@ -47,8 +50,8 @@ def running_server(
     server_config = ServerConfig(
         certificate_chain=chain, signing_key=key, alpn=[hq.ALPN], transport_parameters=b""
     )
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", 0))
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.bind(("::1" if family is socket.AF_INET6 else "127.0.0.1", 0))
     sock.setblocking(False)
     port = sock.getsockname()[1]
     selector = selectors.DefaultSelector()
@@ -76,6 +79,16 @@ def server(credentials: PemCredentials, document_root: Path) -> Iterator[int]:
 
 
 @pytest.fixture
+def ipv6_server(credentials: PemCredentials, document_root: Path) -> Iterator[int]:
+    """The same server on IPv6 loopback."""
+    with running_server(credentials, document_root, connection_limit=1, family=socket.AF_INET6) as (
+        port,
+        _,
+    ):
+        yield port
+
+
+@pytest.fixture
 def sequential_server(
     credentials: PemCredentials, document_root: Path
 ) -> Iterator[tuple[int, Server]]:
@@ -88,6 +101,21 @@ def test_loopback_transfer(credentials: PemCredentials, server: int) -> None:
     bodies = fetch(
         host="127.0.0.1",
         port=server,
+        paths=["/index.html"],
+        options=ClientOptions(
+            ca_certificates=load_pem_certificates(credentials.ca_pem),
+            server_name="localhost",
+        ),
+    )
+    assert bodies == {"/index.html": INDEX_BODY}
+
+
+def test_loopback_transfer_over_ipv6(credentials: PemCredentials, ipv6_server: int) -> None:
+    """The endpoints take their address family from the name they are
+    given, which is what the runner's ipv6 case exercises."""
+    bodies = fetch(
+        host="::1",
+        port=ipv6_server,
         paths=["/index.html"],
         options=ClientOptions(
             ca_certificates=load_pem_certificates(credentials.ca_pem),

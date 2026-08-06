@@ -79,6 +79,9 @@ FRAME_TYPES = {
 # Frame fields the schema names as frames.py does (events §8).
 FRAME_FIELDS = ("stream_id", "offset", "fin", "maximum", "limit")
 
+# Frame fields the schema gives another name (events §8).
+RENAMED_FRAME_FIELDS = {"ranges": "acked_ranges"}
+
 
 def frame_detail(frame: object) -> dict[str, Any]:
     """One frame as the schema describes it (events §8)."""
@@ -87,6 +90,10 @@ def frame_detail(frame: object) -> dict[str, Any]:
         value = getattr(frame, name, None)
         if value is not None:
             detail[name] = value
+    for name, schema_name in RENAMED_FRAME_FIELDS.items():
+        value = getattr(frame, name, None)
+        if value is not None:
+            detail[schema_name] = value
     return detail
 
 

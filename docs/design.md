@@ -161,7 +161,7 @@ Wire into the runner's client/server interface early (a thin shim). Every milest
 
 HelloRetryRequest is not one of the runner's cases but is inserted after `transfer`, for the reason given below.
 
-Two milestones arrived out of this order because interop forced them, which is the roadmap working as intended rather than a departure from it. Version Negotiation came first of all: the simulator's readiness probe offers an unknown version specifically to elicit a VN packet, so nothing at all ran until dsquic answered it. `keyupdate` came next, because RFC 9001 §6.2 makes responding to a peer's key update mandatory, and quic-go updates keys mid-transfer; without it `transfer` itself could not pass. Responding is implemented and validated; initiating is not, and that is what the `keyupdate` case still needs for the client role.
+Two milestones arrived out of this order because interop forced them, which is the roadmap working as intended rather than a departure from it. Version Negotiation came first of all: the simulator's readiness probe offers an unknown version specifically to elicit a VN packet, so nothing at all ran until dsquic answered it. `keyupdate` came next, because RFC 9001 §6.2 makes responding to a peer's key update mandatory, and quic-go updates keys mid-transfer; without it `transfer` itself could not pass. Responding is implemented and validated, and initiating followed: `ConnectionConfig.key_update_interval` starts a new phase after so many packets, which is what the `keyupdate` case needs for the client role.
 
 Also note ECN validation is one of QUIC's more commonly botched corners: a trustworthy reference for correct ECN counting has value well beyond the pedagogical case.
 
@@ -316,6 +316,37 @@ Recorded here so the open questions above stay honest:
   sets no ceiling of its own. picoquic instead bounds the number of
   retransmissions rather than the interval; that needs more state and
   has no QUIC-spec citation, so it was not taken.
+- **Completion and confirmation are separate events (2026-08-06)**:
+  RFC 9001 §4.1.1 makes 1-RTT data sendable once the TLS handshake is
+  complete, while §4.1.2 confirmation is a later event that governs
+  discarding Handshake keys (§4.9.2) and initiating a key update (§6.1).
+  `connection.py` emits `HandshakeCompleted` and `HandshakeConfirmed`
+  for the two, and the endpoints gate application data on the former.
+  Collapsing them, which is what the code did first, made a client wait
+  on HANDSHAKE_DONE before sending anything: that frame can be lost, and
+  when it was, the client retransmitted Handshake CRYPTO for 38 seconds
+  into a space the server had already discarded keys for while the
+  server waited in 1-RTT for a request. Keeping the RFC's two names is
+  also the clearer teaching artifact, since the distinction is one of
+  the easier things to get wrong.
+- **Address family follows the name (2026-08-06)**: both endpoints take
+  the family from `getaddrinfo` rather than hardcoding `AF_INET`, so an
+  AAAA-only host is reached over IPv6 with no flag. A server given an
+  IPv6 bind address turns `IPV6_V6ONLY` off, serving IPv4 peers on the
+  same socket as `::ffff:a.b.c.d`, rather than running two listeners:
+  one socket keeps the demux path (§4.7's CID parsing for routing)
+  single. Family selection is socket mechanics and stays in
+  `endpoints/`; the core's destinations remain opaque.
+- **Key update policy is configuration, the update itself is core
+  (2026-08-06)**: `ConnectionConfig.key_update_interval` names how many
+  packets a phase lasts, and the send path consults it and calls
+  `initiate_key_update`, whose §6.1 preconditions (handshake confirmed,
+  and the current phase acknowledged) can still refuse. That split
+  follows §4.7's rule for what has to be core: *whether* an update
+  happens changes the bytes on the wire, while *how often* is a
+  deployment choice. The reference client exposes it as
+  `--key-update-interval`; the interop shim passes 100 for the
+  `keyupdate` case, the figure quic-go's interop client uses.
 - **Sending is paced, and acknowledgements are exempt (2026-08-05)**:
   RFC 9002 §7.7 requires a sender to either pace or limit bursts; dsquic
   did neither, and emitted everything the congestion window allowed as

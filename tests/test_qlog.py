@@ -140,3 +140,10 @@ def test_every_frame_class_has_a_schema_name() -> None:
     }
     missing = {name for name in classes if name not in qlog.FRAME_TYPES}
     assert not missing, f"frames with no qlog name: {sorted(missing)}"
+
+
+def test_ack_frame_records_the_ranges_it_covers() -> None:
+    """events §8: an ACK reports `acked_ranges`, without which a trace
+    cannot say which packets a peer confirmed."""
+    detail = qlog.frame_detail(frames.Ack(largest=9, delay=0, ranges=[(7, 9), (2, 3)]))
+    assert detail == {"frame_type": "ack", "acked_ranges": [(7, 9), (2, 3)]}

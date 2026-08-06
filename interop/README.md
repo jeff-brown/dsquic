@@ -94,14 +94,13 @@ including `handshakeloss` and `handshakecorruption`. `keyupdate` passes
 too, which the runner verifies by reading key phase bits out of the
 pcap.
 
-As **client**, everything passes against picoquic and quiche except as
-noted; `handshakeloss` and `handshakecorruption` fail against aioquic and
-`handshakeloss` is intermittent against quic-go. `multiplexing` passes in
-six of eight pairings, failing as client against aioquic and as server
-against a quiche client; see STATE.md. That pairing is hard
-across the ecosystem: in the public run of 2026-08-03, aioquic as server
-is failed on `handshakeloss` by quic-go, ngtcp2, lsquic and go-x-net.
-See STATE.md for the detail and the next diagnostic step.
+As **client**, `handshake`, `transfer`, `multiplexing`, `handshakeloss`,
+`handshakecorruption`, `ipv6` and `keyupdate` pass against all four
+peers. Three client-side defects behind the two handshake-loss cases,
+and one environmental limit behind `multiplexing`, are recorded in
+STATE.md; the multiplexing failure turned out to be the container file
+descriptor limit rather than a protocol defect, which was established by
+running quic-go's client against the same peer.
 
 ## Before a real runner submission
 
@@ -115,12 +114,10 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 | `retry`, `v2` | Retry packets are not generated or parsed, and only QUIC v1 is offered |
 | `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
 | `resumption`, `zerortt` | No session tickets, no 0-RTT |
-| `keyupdate` | Passes as server. Not claimed as client: the runner's server container runs this case under the name `transfer`, so the server side needs only to respond, while the client side must start an update and nothing calls `Connection.initiate_key_update` yet |
 | `chacha20` | AES-128-GCM only |
 | `ecn` | No ECN codepoints on send, no ECN validation |
 | `http3` | `h3.py` and `qpack.py` are stubs |
 | `connectionmigration` | No path validation or migration |
-| `ipv6` | Both endpoints open `AF_INET` sockets |
 | `goodput`, `crosstraffic` | Measurements rather than pass/fail, and performance is an explicit non-goal |
 
 ## Scale, for reference
@@ -132,8 +129,6 @@ interactive one.
 
 ## Known gaps
 
-- **IPv4 only.** Both endpoints open `AF_INET` sockets, so `ipv6` cannot
-  pass.
 - **linux/amd64 for upstream.** See above; local runs are aarch64.
 
 ## Verifying the image contract by hand
