@@ -49,31 +49,29 @@ the open item recorded below.
 
 ## Running the Interop Runner locally
 
-The runner drives `docker compose` with a fixed network topology, and it
-hardcodes `/tmp` for its working directories.
+The runbook lives in `interop/README.md`: VM sizing, the container file
+descriptor limit that has to go in `colima.yaml` rather than
+`daemon.json`, the two-disk layout and log retention, and keeping macOS
+from sleeping through a sweep. Only what is currently true of this
+machine is recorded here.
 
-- **Apple's `container` cannot drive it**, and this was established
-  rather than assumed: it has no compose support (interop.py shells out
-  to `docker compose` in five places), `--network` has no static-IP
-  option while the topology pins 193.167.0.100 and friends, and it
-  attaches one network per container where the simulator needs two.
-- **colima is what works** (`colima start`). The runner is cloned and
-  run *inside* the VM at `~/quic-interop-runner`, reached with
-  `colima ssh`, because colima refuses to mount host `/tmp` ("must not
-  be a system path") and the runner insists on it. A stale `mounts:`
-  entry in `~/.colima/default/colima.yaml` had to be cleared by hand.
+- The VM runs at `--cpu 8 --memory 16` on a 10-core, 32GB host, with
+  container `nofile` raised to 1048576 through colima's `docker:`
+  passthrough. The host disk is small (256GB, and near full), so runner
+  logs are pruned to the three most recent runs.
+- **Apple's `container` cannot drive it**, established rather than
+  assumed: no compose support (interop.py shells out to `docker compose`
+  in five places), `--network` has no static-IP option while the topology
+  pins 193.167.0.100 and friends, and it attaches one network per
+  container where the simulator needs two.
+- The runner is cloned and run *inside* the VM at `~/quic-interop-runner`
+  because colima refuses to mount host `/tmp` ("must not be a system
+  path") and the runner insists on it. A stale `mounts:` entry in
+  `~/.colima/default/colima.yaml` had to be cleared by hand.
 - pyshark needs the `tshark` binary present in the VM, otherwise every
   test fails with "Expected exactly one version. Got []". That failure
   reproduces for quic-go too, which is how it was identified as
   environmental rather than ours.
-- Container file descriptor limits default to 1024 here, which is low
-  enough to break `multiplexing` for any client; see "The file descriptor
-  limit that looked like a protocol bug" below for the daemon setting
-  that fixes it.
-- Build and run:
-  `colima ssh -- bash -lc 'docker build -f interop/Dockerfile -t dsquic-interop:latest .'`
-  then
-  `cd ~/quic-interop-runner && .venv/bin/python run.py -s dsquic -c quic-go -t handshake,transfer`.
 
 ## qlog (2026-08-05)
 
@@ -164,38 +162,104 @@ Worth rebuilding rather than rediscovering. The pieces are a relay that
 keys one upstream socket per client address, and a server harness that
 prints per-connection state whenever it changes.
 
-## Interop Runner results (2026-08-03)
+## Interop Runner results
 
-Every pairing of dsquic, quic-go and aioquic, each as both client and
-server, passes `handshake` and `transfer` through the ns-3 simulator: a
-full 3x3 matrix of `✓(H,DC)`.
+**Server role, every claimed case against all four peers, 2026-08-06.**
+Twelve cases (`handshake`, `transfer`, `multiplexing`, `transferloss`,
+`transfercorruption`, `blackhole`, `longrtt`, `amplificationlimit`,
+`ipv6`, `keyupdate`, `handshakeloss`, `handshakecorruption`) pass against
+quic-go, aioquic, picoquic and quiche, with no failures:
+`✓(H,DC,M,L2,C2,B,LR,A,6,U,L1,C1)` in three columns and the same minus
+`U` against quiche, whose client does not implement key update and so
+reports it unsupported rather than failed. This is the first full
+server-role sweep since pacing, both PTO fixes, and the dual-stack bind,
+all of which change the server's send path.
 
-Against quic-go, dsquic as client passes `✓(H,DC,C1,L2,C2,LR,A,B)` and
-as server `✓(H,DC,L1,C1,L2,C2,LR,A)`. `keyupdate` passes with dsquic as
-server, `✓(U)`, which the runner verifies by reading key phase bits out
-of the pcap with Wireshark.
+`keyupdate` is verified by the runner reading key phase bits out of the
+pcap, and `amplificationlimit` and `blackhole` exercise the §8.1 and
+recovery paths that earlier sessions found bugs in.
 
-Against aioquic, picoquic and quiche on `handshake`, `transfer`,
-`handshakeloss`, `handshakecorruption` and `transferloss`, dsquic as
-**server** passes all five against all three, `✓(H,DC,L1,C1,L2)` in every
-column. That is four independent implementations behind the server-side
-fixes, picoquic among them, which design.md picks as the conformance
-ratchet. As **client** picoquic and quiche also pass all five; aioquic
-does not, and that is the open item below.
+**Client role, same twelve cases, 2026-08-06.** All twelve pass against
+quic-go, aioquic and picoquic. Against quiche, eleven pass and
+`handshakeloss` failed in the combined sweep and passed on its own
+re-run. That re-run is not the whole story: see the open item below.
 
-Two cautions about reading these results:
+Two cautions about reading any of this:
 
-- The cases are timing sensitive on a four-CPU VM. `transferloss` and
-  `blackhole` have each failed inside a long combined run and passed on
-  their own and in a later combined run. Contention, not protocol, but
-  it means a single red square is worth re-running before believing.
+- The cases are timing sensitive. `transferloss` and `blackhole` have
+  each failed inside a long combined run and passed on their own, and
+  `handshakeloss` and `handshakecorruption` traded places across two
+  consecutive runs while they sat near the time budget. A single red
+  square is worth re-running alone before believing it.
 - `handshakeloss` and `handshakecorruption` run as `multiconnect`: 50
   files, one connection each, which is what makes them the only cases
   that lose *handshake* packets. `endpoints.client.fetch_each` provides
   that, bounding the whole run rather than each connection so one slow
-  handshake cannot spend a budget the remaining files still need. As
-  server both pass; as client `handshakeloss` is intermittent, recorded
-  below.
+  handshake cannot spend a budget the remaining files still need.
+
+## Connection stalls under handshake loss (2026-08-06)
+
+A green square on `handshakeloss` means 50 connections finished inside
+the budget, not that none of them stalled. Scanning per-connection
+durations across the traces is what shows the difference, and it is
+cheap now that every connection leaves a `.sqlog`:
+
+    for each trace: last event time minus first event time
+
+**One cause found and fixed.** The client coalesces its Finished and its
+first request into one datagram (§12.2), so losing that datagram loses
+both. The Handshake PTO resends the Finished, but nothing resends the
+request: RFC 9002 A.6 arms no application PTO at a client until the
+handshake is confirmed, and §4.1.2 confirmation waits on a
+HANDSHAKE_DONE that can itself be lost. The peer, already in 1-RTT, sends
+PING probes that the client acknowledges while waiting for a request it
+never received. One connection against quiche sat still for 54 seconds
+this way. `_resend_early_application_data` now puts unacknowledged 1-RTT
+packets in the Handshake probe's datagram, where §12.2 coalescing places
+the CRYPTO the peer is waiting for ahead of them, which is the ordering
+RFC 9001 §5.7 describes. quic-go arms its PTO the same way dsquic does
+(`getPTOTimeAndSpace` skips the application space until confirmation), so
+this is not a rule the ecosystem has and dsquic lacked.
+
+Client-role stall counts over 10 seconds, same pairings, before and
+after:
+
+| pairing, case | before | after |
+|---|---|---|
+| aioquic, `handshakeloss` | max 20.3s, 1 stall | max 5.6s, none |
+| quiche, `handshakeloss` | max 20.4s, 4 stalls | max 10.1s, 1 |
+| quiche, `handshakecorruption` | max 16.7s, 2 stalls | max 13.0s, 1 |
+| aioquic, `handshakecorruption` | max 12.5s, 1 stall | max 11.6s, 1 |
+
+Each run draws a fresh loss pattern, so one pairing improving could be
+luck; four moving together is not.
+
+**The residual stalls are not ours, and that was established rather
+than assumed.** Stalls of 10 to 13 seconds survive the fix, and
+`handshakecorruption` barely moved, so the obvious next step looked like
+more debugging. Running the peers against each other instead settled it
+in two runs:
+
+| pairing | `handshakeloss` | `handshakecorruption` |
+|---|---|---|
+| quic-go client vs quiche server | fails | fails |
+| dsquic client vs quiche server | passes | passes |
+| quiche client vs quic-go server | fails, 35.3s stall | passes |
+| quiche client vs aioquic server | fails, 30.4s and 27.1s | passes, 85.8s stall |
+| quiche client vs dsquic server | passes | passes |
+
+quic-go's client also stalls 12.3s against aioquic on
+`handshakecorruption`, where dsquic stalls 11.6s. So the stalls travel
+with quiche and aioquic under handshake loss, against every peer, and
+dsquic currently handles both better than quic-go and aioquic do: our
+client passes against quiche's server where quic-go's does not, and our
+server is passed by quiche's client where quic-go's and aioquic's servers
+are not. Further chasing would be debugging other implementations.
+
+Worth keeping as method: a stall inside a *passing* square is invisible
+to the runner's pass/fail and obvious in one scan of connection
+durations, and the question "is this us?" is answered by running a peer
+against a peer, not by reading more of our own code.
 
 ## Pacing (2026-08-05)
 
@@ -237,16 +301,14 @@ where all 15 clients pass against aioquic, default far higher.
 
 Both directions of `multiplexing` were affected: quiche as client
 against a dsquic server failed the same way, since the reference server
-also opens a file per request. Fixed at the daemon rather than in the
-runner's compose file, since the limit is a property of this VM and not
-of the test:
-`/etc/docker/daemon.json` in the VM now carries
-`"default-ulimits": {"nofile": {"Name": "nofile", "Soft": 1048576,
-"Hard": 1048576}}`, followed by `sudo systemctl restart docker`. With
-that in place `multiplexing` passes in **all eight pairings**, dsquic in
-both roles against quic-go, aioquic, picoquic and quiche, with the client
-unbounded. The dsquic image was identical across the failing and passing
-runs; only the daemon setting changed.
+also opens a file per request. It is fixed in the VM rather than in the
+runner's compose file, since the limit is a property of this machine and
+not of the test; `interop/README.md` carries the setting and the reason
+it has to go in `colima.yaml` rather than `daemon.json`. With it in place
+`multiplexing` passes in **all eight pairings**, dsquic in both roles
+against quic-go, aioquic, picoquic and quiche, with the client unbounded.
+The dsquic image was identical across the failing and passing runs; only
+the daemon setting changed.
 
 Worth remembering as a method: when one implementation appears uniquely
 broken against a peer, run a known-good implementation against that peer

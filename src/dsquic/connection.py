@@ -829,9 +829,27 @@ class Connection:
         it on every expiry; loss detection, not the PTO, is what
         retransmits the rest.
         """
+        if level is EncryptionLevel.HANDSHAKE and not self.recovery.handshake_confirmed:
+            self._resend_early_application_data()
         if self._has_pending_data(level):
             return
         for packet in self.recovery.unacked(level)[:PROBE_PACKETS]:
+            self._requeue_lost(packet)
+
+    def _resend_early_application_data(self) -> None:
+        """Send unacknowledged 1-RTT data again alongside a Handshake probe.
+
+        RFC 9001 §5.7: a peer that has not completed its handshake must
+        not process 1-RTT packets, and may drop rather than buffer them.
+        Nothing else would resend those packets, because RFC 9002 A.6
+        arms no application PTO until the handshake is confirmed, and
+        confirmation waits on a HANDSHAKE_DONE that can itself be lost.
+        They ride in the probe's datagram, where §12.2 coalescing puts
+        the CRYPTO the peer is waiting for ahead of them.
+        """
+        if self._has_pending_data(EncryptionLevel.ONE_RTT):
+            return
+        for packet in self.recovery.unacked(EncryptionLevel.ONE_RTT)[:PROBE_PACKETS]:
             self._requeue_lost(packet)
 
     def _has_pending_data(self, level: EncryptionLevel) -> bool:

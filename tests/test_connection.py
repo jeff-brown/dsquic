@@ -487,6 +487,49 @@ class TestRecovery:
             client.handle_timer(deadline)
             assert len(client.datagrams_to_send(deadline)) <= PROBE_PACKETS
 
+    def test_a_lost_finished_does_not_strand_the_request(self, credentials: Credentials) -> None:
+        """RFC 9001 §5.7 with RFC 9002 A.6. The client coalesces its
+        Finished and its first request into one datagram (§12.2), so
+        losing it loses both. The Handshake PTO resends the Finished, but
+        no application PTO is armed until the handshake is confirmed, and
+        confirmation waits on a HANDSHAKE_DONE that can also be lost. One
+        connection against quiche sat still for 54 seconds this way.
+        """
+        records: list[str] = []
+        client, server = make_pair(credentials, client_qlog=records)
+        client.connect(0.0)
+        now = 0.0
+        for datagram in client.datagrams_to_send(now):
+            server.datagram_received(datagram.data, now, source="client")
+        now = 0.1
+        for datagram in server.datagrams_to_send(now):
+            client.datagram_received(datagram.data, now, source="server")
+
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, hq.encode_request("/index"), end_stream=True)
+        assert client.datagrams_to_send(now)  # Finished plus request, dropped
+        before_probe = len(records)
+
+        deadline = client.next_timer()
+        assert deadline is not None
+        client.handle_timer(deadline)
+        assert client.datagrams_to_send(deadline)
+
+        # The probe carries the CRYPTO the server waits on and the request
+        # it never saw, so delivering it alone completes the exchange.
+        probe = [
+            event
+            for event in qlog_events(records[before_probe:])
+            if event["name"] == "quic:packet_sent"
+        ]
+        kinds = {
+            (event["data"]["header"]["packet_type"], frame["frame_type"])
+            for event in probe
+            for frame in event["data"]["frames"]
+        }
+        assert ("handshake", "crypto") in kinds
+        assert ("1RTT", "stream") in kinds
+
     def test_every_initial_probe_carries_crypto(self, credentials: Credentials) -> None:
         """RFC 9000 §17.2.2: "The first packet sent by a client always
         includes a CRYPTO frame". When the ClientHello is lost, a probe
