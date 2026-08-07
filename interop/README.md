@@ -162,10 +162,12 @@ contention alone.
 Through the ns-3 simulator, against quic-go, aioquic, picoquic and
 quiche.
 
-As **server**, all twelve claimed cases pass against all four peers,
-with no failures. `keyupdate` is verified by the runner reading key
-phase bits out of the pcap, and quiche reports it unsupported because
-its client does not implement key update.
+As **server**, all twelve cases claimed at the time pass against all
+four peers, with no failures. `keyupdate` is verified by the runner
+reading key phase bits out of the pcap, and quiche reports it
+unsupported because its client does not implement key update.
+`resumption` has been claimed since that sweep and has not been run
+through the simulator yet.
 
 As **client**, `handshake`, `transfer`, `multiplexing`, `handshakeloss`,
 `handshakecorruption`, `ipv6` and `keyupdate` pass against all four
@@ -186,7 +188,7 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 |---|---|
 | `v2` | Only QUIC v1 is offered |
 | `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
-| `resumption`, `zerortt` | No session tickets, no 0-RTT |
+| `zerortt` | No 0-RTT; `resumption` is claimed, 0-RTT data is not |
 | `chacha20` | AES-128-GCM only |
 | `ecn` | No ECN codepoints on send, no ECN validation |
 | `http3` | `h3.py` and `qpack.py` are stubs |

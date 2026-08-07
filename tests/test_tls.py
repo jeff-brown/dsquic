@@ -341,7 +341,7 @@ def pump(client: TlsClient, server: TlsServer) -> tuple[list[TlsEvent], list[Tls
     client_events: list[TlsEvent] = []
     server_events: list[TlsEvent] = []
     if client.state is ClientState.START:
-        client.start()
+        client.start(0.0)
     for _ in range(10):
         moved = False
         for event in client.take_events():
@@ -403,7 +403,7 @@ def test_handshake_secrets_feed_packet_protection(credentials: Credentials) -> N
 def test_handshake_bytes_survive_fragmentation(credentials: Credentials) -> None:
     client = make_client(credentials)
     server = make_server(credentials)
-    client.start()
+    client.start(0.0)
     for event in client.take_events():
         if isinstance(event, SendData):
             for i in range(len(event.data)):  # one byte at a time
@@ -488,7 +488,7 @@ def test_client_config_requires_trust_anchors() -> None:
 def test_alpn_mismatch_raises(credentials: Credentials) -> None:
     client = make_client(credentials, alpn=["h3"])
     server = make_server(credentials, alpn=["hq-interop"])
-    client.start()
+    client.start(0.0)
     send = next(e for e in client.take_events() if isinstance(e, SendData))
     with pytest.raises(TlsAlert) as excinfo:
         server.receive(send.level, send.data, 0.0)
@@ -498,7 +498,7 @@ def test_alpn_mismatch_raises(credentials: Credentials) -> None:
 def test_tampered_server_finished_raises(credentials: Credentials) -> None:
     client = make_client(credentials)
     server = make_server(credentials)
-    client.start()
+    client.start(0.0)
     for event in client.take_events():
         if isinstance(event, SendData):
             server.receive(event.level, event.data, 0.0)
@@ -514,7 +514,7 @@ def test_tampered_server_finished_raises(credentials: Credentials) -> None:
 def test_message_at_wrong_level_raises(credentials: Credentials) -> None:
     client = make_client(credentials)
     server = make_server(credentials)
-    client.start()
+    client.start(0.0)
     send = next(e for e in client.take_events() if isinstance(e, SendData))
     with pytest.raises(TlsAlert) as excinfo:
         server.receive(EncryptionLevel.HANDSHAKE, send.data, 0.0)
@@ -561,7 +561,7 @@ class TestHelloRetryRequest:
     def test_server_sends_a_real_hello_retry_request(self, credentials: Credentials) -> None:
         client = self.make_withholding_client(credentials)
         server = make_server(credentials)
-        client.start()
+        client.start(0.0)
         for event in client.take_events():
             if isinstance(event, SendData):
                 server.receive(event.level, event.data, 0.0)
@@ -598,7 +598,7 @@ class TestHelloRetryRequest:
         a second HelloRetryRequest (§4.1.4 forbids the loop)."""
         client = self.make_withholding_client(credentials)
         server = make_server(credentials)
-        client.start()
+        client.start(0.0)
         first = next(e for e in client.take_events() if isinstance(e, SendData))
         server.receive(first.level, first.data, 0.0)
         server.take_events()
@@ -609,7 +609,7 @@ class TestHelloRetryRequest:
     def test_client_refuses_a_pointless_retry(self, credentials: Credentials) -> None:
         """A retry asking for a group the client already shared would loop."""
         client = make_client(credentials)  # sends an x25519 share
-        client.start()
+        client.start(0.0)
         client.take_events()
         retry = encode_server_hello(
             ServerHello(
@@ -628,7 +628,7 @@ class TestHelloRetryRequest:
 
     def test_client_refuses_an_unoffered_group(self, credentials: Credentials) -> None:
         client = self.make_withholding_client(credentials)
-        client.start()
+        client.start(0.0)
         client.take_events()
         retry = encode_server_hello(
             ServerHello(
@@ -648,7 +648,7 @@ class TestHelloRetryRequest:
 
 def test_unexpected_message_order_raises(credentials: Credentials) -> None:
     client = make_client(credentials)
-    client.start()
+    client.start(0.0)
     client.take_events()
     finished = encode_finished(Finished(verify_data=bytes(32)))
     with pytest.raises(TlsAlert) as excinfo:
@@ -819,7 +819,7 @@ def test_a_client_offers_a_ticket_with_a_verifiable_binder(credentials: Credenti
             session_ticket=ticket,
         )
     )
-    resuming.start()
+    resuming.start(0.0)
     sent = [e for e in resuming.take_events() if isinstance(e, SendData)]
     hello = sent[0].data
 
@@ -866,7 +866,7 @@ def obtain_ticket(credentials: Credentials, ticket_key: bytes) -> SessionTicket:
 
 def resuming_hello(credentials: Credentials, ticket: SessionTicket) -> bytes:
     client = make_resuming_client(credentials, ticket)
-    client.start()
+    client.start(0.0)
     return next(e for e in client.take_events() if isinstance(e, SendData)).data
 
 
@@ -908,7 +908,7 @@ class TestServerPskSelection:
         server_key = X25519PrivateKey.generate()
         client = make_resuming_client(credentials, ticket, key=client_key)
         server = make_server(credentials, ticket_key=self.KEY, key=server_key)
-        client.start()
+        client.start(0.0)
         hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
         server.receive(EncryptionLevel.INITIAL, hello, 0.0)
         events = server.take_events()
@@ -1043,7 +1043,7 @@ def test_a_retried_hello_recomputes_its_binder(credentials: Credentials) -> None
         )
     )
     server = make_server(credentials, ticket_key=key)
-    client.start()
+    client.start(0.0)
     hello1 = next(e for e in client.take_events() if isinstance(e, SendData)).data
     server.receive(EncryptionLevel.INITIAL, hello1, 0.0)
     retry = next(e for e in server.take_events() if isinstance(e, SendData)).data
@@ -1070,7 +1070,7 @@ def test_an_unsolicited_selected_identity_aborts(credentials: Credentials) -> No
     """§4.2.11: a server may only answer an offer that was made."""
     client = make_client(credentials)
     server = make_server(credentials)
-    client.start()
+    client.start(0.0)
     hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
     server.receive(EncryptionLevel.INITIAL, hello, 0.0)
     server_hello = next(e for e in server.take_events() if isinstance(e, SendData)).data
@@ -1092,7 +1092,7 @@ def test_a_selected_identity_out_of_range_aborts(credentials: Credentials) -> No
     ticket = obtain_ticket(credentials, key)
     client = make_resuming_client(credentials, ticket)
     server = make_server(credentials, ticket_key=key)
-    client.start()
+    client.start(0.0)
     hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
     server.receive(EncryptionLevel.INITIAL, hello, 0.0)
     server_hello = next(e for e in server.take_events() if isinstance(e, SendData)).data

@@ -1594,7 +1594,7 @@ class Connection:
         """Client: start the handshake (§7)."""
         assert isinstance(self.tls, TlsClient)
         self._open_qlog(self._initial_dcid, now)
-        self.tls.start()
+        self.tls.start(now)
         self._drain_tls_events(now)
         self._arm_idle_timer(now)
 

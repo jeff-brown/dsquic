@@ -34,7 +34,7 @@ from dsquic.connection import (
 )
 from dsquic.endpoints import keylog_writer, load_pem_certificates, pump, qlog_trace
 from dsquic.streams import StreamLimitReached
-from dsquic.tls import ClientConfig
+from dsquic.tls import ClientConfig, SessionTicket, TlsClient
 
 DEFAULT_TIMEOUT = 30.0  # a whole fetch, not a single response
 
@@ -48,6 +48,10 @@ class ClientOptions:
     server_name: str | None = None
     timeout: float = DEFAULT_TIMEOUT
     key_update_interval: int | None = None
+    # RFC 8446 §2.2: carry session tickets across the sequential
+    # connections of fetch_each, each resuming from the newest ticket
+    # the ones before it produced.
+    resume: bool = False
 
 
 def issue_requests(
@@ -77,12 +81,17 @@ def fetch(
     port: int,
     paths: list[str],
     options: ClientOptions | None = None,
+    session_tickets: list[SessionTicket] | None = None,
 ) -> dict[str, bytes]:
     """Fetch paths over one connection; returns path to body bytes.
 
     One request per bidirectional stream, per hq-interop. Requests are
     issued as stream credit allows: the peer's initial limit may be
     smaller than the number of paths, and rises as streams close (§4.6).
+
+    ``session_tickets`` is the caller's ticket store (RFC 8446 §4.6.1):
+    the newest entry is offered for resumption, and tickets received on
+    this connection are appended. None disables both.
     """
     options = options if options is not None else ClientOptions()
     server_name = options.server_name
@@ -104,6 +113,7 @@ def fetch(
             ca_certificates=[] if options.insecure else options.ca_certificates,
             insecure_skip_verify=options.insecure,
             verification_time=datetime.datetime.now(datetime.UTC),
+            session_ticket=session_tickets[-1] if session_tickets else None,
         ),
         config=ConnectionConfig(
             keylog=keylog_writer(),
@@ -145,6 +155,8 @@ def fetch(
         else:
             raise TimeoutError(f"no response within {timeout}s")
 
+        if session_tickets is not None and isinstance(connection.tls, TlsClient):
+            session_tickets.extend(connection.tls.session_tickets)
         connection.close()
         pump(connection, sock, selector, time.monotonic())
         return {stream_paths[stream_id]: bytes(body) for stream_id, body in bodies.items()}
@@ -166,9 +178,14 @@ def fetch_each(
     rather than loss of data packets. ``options.timeout`` bounds the
     whole run rather than each connection, so one slow handshake cannot
     spend a budget the remaining paths still need.
+
+    With ``options.resume``, each connection offers the newest ticket
+    the ones before it produced, so the first handshake is full and the
+    rest resume (RFC 8446 §2.2): the runner's resumption case.
     """
     options = options if options is not None else ClientOptions()
     deadline = time.monotonic() + options.timeout
+    session_tickets: list[SessionTicket] | None = [] if options.resume else None
     bodies: dict[str, bytes] = {}
     for path in paths:
         remaining = deadline - time.monotonic()
@@ -176,7 +193,9 @@ def fetch_each(
             raise TimeoutError(
                 f"fetched {len(bodies)} of {len(paths)} paths within {options.timeout}s"
             )
-        bodies.update(fetch(host, port, [path], replace(options, timeout=remaining)))
+        bodies.update(
+            fetch(host, port, [path], replace(options, timeout=remaining), session_tickets)
+        )
     return bodies
 
 
@@ -202,10 +221,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="one connection per path, in sequence, instead of one for all of them",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume each connection from the previous one's session ticket (RFC 8446 §2.2)",
+    )
     args = parser.parse_args(argv)
 
     if not args.insecure and args.ca is None:
         parser.error("--ca is required unless --insecure is given")
+    if args.resume and not args.connection_per_request:
+        parser.error("--resume requires --connection-per-request")
     ca_certificates = load_pem_certificates(args.ca) if args.ca is not None else []
 
     bodies = (fetch_each if args.connection_per_request else fetch)(
@@ -218,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             server_name=args.server_name,
             timeout=args.timeout,
             key_update_interval=args.key_update_interval,
+            resume=args.resume,
         ),
     )
     for path, body in bodies.items():

@@ -22,7 +22,7 @@ import os
 import selectors
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -62,7 +62,7 @@ from dsquic.retry import (
     mint_token,
     validate_token,
 )
-from dsquic.tls import ServerConfig, SigningKey
+from dsquic.tls import TICKET_KEY_LENGTH, ServerConfig, SigningKey, TlsServer
 
 TOKEN_LIFETIME = 60.0  # §8.1.4: how long a Retry token proves an address
 
@@ -142,6 +142,12 @@ class Server:
         self._sock = sock
         self._selector = selector
         self._server_config = server_config
+        if server_config.ticket_key is None:
+            # §4.6.1: the key that seals session tickets is process
+            # state like the Retry token key below: generated, not
+            # configured. A ticket resumes only against the process
+            # that issued it, which is what resumption promises.
+            self._server_config = replace(server_config, ticket_key=os.urandom(TICKET_KEY_LENGTH))
         self._document_root = options.document_root
         self._idle_timeout = options.idle_timeout
         self._sessions: dict[bytes, _Session] = {}
@@ -150,6 +156,8 @@ class Server:
         # rather than configured. None means addresses are not validated.
         self._retry_key = os.urandom(TOKEN_KEY_LENGTH) if options.retry else None
         self.connections_served = 0
+        # Of those, the handshakes that resumed a session via a PSK (§2.2).
+        self.connections_resumed = 0
 
     def serve(self, connection_limit: int | None = None) -> None:
         """Serve until ``connection_limit`` connections have finished.
@@ -303,12 +311,18 @@ class Server:
         }
         if not finished:
             return
-        gone = {id(self._sessions[cid]) for cid in finished}
+        departing = {id(self._sessions[cid]): self._sessions[cid] for cid in finished}
         for cid in finished:
             del self._sessions[cid]
         # A connection is served once, however many CIDs pointed at it.
         remaining = {id(session) for session in self._sessions.values()}
-        self.connections_served += len(gone - remaining)
+        for session_id, session in departing.items():
+            if session_id in remaining:
+                continue
+            self.connections_served += 1
+            tls = session.connection.tls
+            if isinstance(tls, TlsServer) and tls.resumed:
+                self.connections_resumed += 1
 
 
 def serve_one(

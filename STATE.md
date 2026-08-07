@@ -21,7 +21,7 @@ the open item recorded below.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  394 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  395 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -256,13 +256,29 @@ not against our own output, in `tests/rfc8448_vectors.py`:
   a test pins byte for byte. Full resumption and decline handshakes now
   pass in memory end to end.
 
-**Next, endpoint wiring plus the ladder**, in order:
+- Endpoint wiring, staged. `fetch` takes a caller-owned ticket store:
+  it offers the newest entry and appends what the connection receives;
+  `fetch_each` threads one store through its sequence when
+  `ClientOptions.resume` is set (`--resume` on the CLI, requiring
+  `--connection-per-request`). The reference server seals tickets under
+  a per-process key generated in `Server.__init__` when the config
+  carries none, like the Retry token key, so every reference server
+  issues tickets; `Server.connections_resumed` counts PSK handshakes
+  beside `connections_served`. `TlsClient.start` now takes the caller's
+  clock so obfuscated_ticket_age is real (§4.2.11.1), and both TLS
+  machines expose a public `resumed` flag. The shim claims `resumption`
+  and passes `--connection-per-request --resume` for it.
+- Ladder so far: unit (RFC 8448 vectors, selection and accept paths)
+  and loopback (`test_loopback_resumption`: two connections over real
+  UDP, the second resumed, asserted via `connections_resumed`). The
+  server issuing tickets everywhere also puts 1-RTT server-side CRYPTO
+  (NewSessionTicket) on every loopback and interop-harness handshake,
+  a previously idle send path.
 
-1. Endpoints: tickets surviving between connections in
-   `endpoints.client.fetch_each`; `--connection-per-request` for this
-   case; add `resumption` to `SUPPORTED` in `interop/run_endpoint.sh`.
-2. Ladder: loopback through the reference endpoints over real UDP, then
-   the runner in both directions (unit rung is done).
+**Next**: the Interop Runner's `resumption` case in both directions,
+plus the wire capture check the phase gates require (a decrypted
+capture of the second connection showing pre_shared_key and no
+Certificate).
 
 **Three traps already paid for, worth not repeating.**
 

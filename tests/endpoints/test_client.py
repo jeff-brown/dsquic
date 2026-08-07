@@ -253,6 +253,30 @@ def test_loopback_connection_per_request(
     assert running.connections_served == 3
 
 
+def test_loopback_resumption(credentials: PemCredentials, document_root: Path) -> None:
+    """The runner's resumption case over real UDP: the first connection
+    is a full handshake whose ticket the second offers, and the server
+    counts the second as resumed, meaning it selected the PSK and sent
+    no Certificate (RFC 8446 §2.2)."""
+    with running_server(credentials, document_root, connection_limit=2) as (port, running):
+        bodies = fetch_each(
+            host="127.0.0.1",
+            port=port,
+            paths=["/index.html", "/large.bin"],
+            options=ClientOptions(
+                ca_certificates=load_pem_certificates(credentials.ca_pem),
+                server_name="localhost",
+                resume=True,
+            ),
+        )
+        assert bodies == {"/index.html": INDEX_BODY, "/large.bin": LARGE_BODY}
+        deadline = time.monotonic() + 5.0
+        while running.connections_served < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert running.connections_served == 2
+    assert running.connections_resumed == 1
+
+
 def test_fetch_each_enforces_a_total_deadline(credentials: PemCredentials) -> None:
     """The timeout bounds the whole run, so an exhausted budget stops the
     remaining paths instead of granting each a fresh one. Nothing is

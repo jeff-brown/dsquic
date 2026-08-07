@@ -75,7 +75,7 @@ RSA_PSS_RSAE_SHA256 = 0x0804
 ECDSA_SECP256R1_SHA256 = 0x0403
 
 TICKET_NONCE_LENGTH = 12  # AES-GCM nonce for a sealed ticket
-TICKET_KEY_LENGTH = 32
+TICKET_KEY_LENGTH = 32  # AES-256-GCM key that seals session tickets (§4.6.1)
 PSK_DHE_KE = 1  # §4.2.9: resumption with an ECDHE exchange
 SESSION_TICKET_LIFETIME = 7200  # seconds; §4.6.1 caps this at 7 days
 MESSAGE_HASH_TYPE = 254  # §4.4.1, the HelloRetryRequest transcript stand-in
@@ -998,7 +998,8 @@ class TlsClient(_Handshake):
         # them once the connection is up and keeps them for next time.
         self.session_tickets: list[SessionTicket] = []
         self._fallback_schedule: KeySchedule | None = None
-        self._resumed = False
+        # §2.2: whether the server took the PSK offer; its ServerHello decides.
+        self.resumed = False
         if config.session_ticket is not None:
             # §7.1: resuming extracts the PSK into the Early Secret, and
             # the binder is derived from it, so the schedule has to carry
@@ -1063,8 +1064,13 @@ class TlsClient(_Handshake):
             ],
         )
 
-    def start(self) -> None:
-        """Send the ClientHello at the Initial level."""
+    def start(self, now: float) -> None:
+        """Send the ClientHello at the Initial level.
+
+        ``now`` is the caller's clock reading; a resumption offer
+        measures its ticket's age from it (§4.2.11.1).
+        """
+        self._now = now
         raw = encode_client_hello(self._build_client_hello())
         if self._config.session_ticket is not None:
             raw = self._fill_psk_binder(raw)
@@ -1199,7 +1205,7 @@ class TlsClient(_Handshake):
                 # §4.2.11: selected_identity indexes the offered list,
                 # which held exactly one identity.
                 raise TlsAlert(ILLEGAL_PARAMETER, "selected_identity is out of range")
-            self._resumed = True
+            self.resumed = True
         elif self._fallback_schedule is not None:
             # §4.2.11: the offer was declined, so this is a full
             # handshake and the Early Secret extracts zeros rather than
@@ -1228,7 +1234,7 @@ class TlsClient(_Handshake):
         self.schedule.update_transcript(raw)
         # §2.2: a PSK authenticates the connection, so a resumed
         # handshake carries no Certificate or CertificateVerify.
-        self.state = ClientState.WAIT_FINISHED if self._resumed else ClientState.WAIT_CERTIFICATE
+        self.state = ClientState.WAIT_FINISHED if self.resumed else ClientState.WAIT_CERTIFICATE
 
     def _on_certificate(self, message: Certificate, raw: bytes) -> None:
         if not message.entries:
@@ -1314,6 +1320,8 @@ class TlsServer(_Handshake):
         self._hello_retry_sent = False
         self._alpn = ""
         self._client_transport_parameters = b""
+        # §2.2: whether this handshake resumed a session via a PSK.
+        self.resumed = False
         self.state = ServerState.START
 
     def _handle(self, level: EncryptionLevel, message: HandshakeMessage, raw: bytes) -> None:
@@ -1440,6 +1448,7 @@ class TlsServer(_Handshake):
         self._client_random = hello.random
 
         selected = self._select_psk(hello, raw)
+        self.resumed = selected is not None
         if selected is not None:
             # §7.1: resuming extracts the PSK into the Early Secret, so
             # the schedule is rebuilt before it sees this ClientHello.
