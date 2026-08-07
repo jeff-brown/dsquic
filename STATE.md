@@ -592,7 +592,12 @@ And the one that mattered most, also found this way:
    which in turn is what makes NEW_TOKEN (§8.1.3) worth having.
 2. **HTTP/3 after that** (design.md §6.1). The largest piece and the one
    that unblocks MASQUE, since `h3.py` is a stub and carries the last
-   open MASQUE readiness constraint.
+   open MASQUE readiness constraint. `h3.py` is written against a
+   transport `typing.Protocol` rather than against `Connection` (see the
+   design.md appendix), which specifies three gaps to close first:
+   `open_stream` cannot ask for a unidirectional stream, there is no
+   `reset_stream` or `stop_sending` for request cancellation (RFC 9114
+   §4.1), and there is no datagram send for RFC 9221.
 3. **Broaden the runner matrix.** Four implementations are exercised
    locally out of the 18 registered; each additional one is a `docker
    pull` and a row in the run. Submitting dsquic upstream additionally

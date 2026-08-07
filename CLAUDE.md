@@ -128,6 +128,10 @@ it exists to teach QUIC.
   this; do not weaken it.
 - New modules need: RFC-mapping docstring, mirror test file, entry in the
   `__init__.py` module map.
+- `h3.py` and `qpack.py` import nothing from `dsquic` but `buffer`, so
+  either can be published on its own later without a refactor. The
+  transport is a `typing.Protocol`, and arriving data comes in as method
+  calls, not dsquic event types. `tests/test_scaffold.py` enforces this.
 - Text is ASCII except the section sign (§) in RFC citations, verbatim
   tool output (the Interop Runner's `✓` result notation), and proper
   names spelled correctly.

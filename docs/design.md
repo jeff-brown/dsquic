@@ -40,6 +40,12 @@ The first question anyone will ask. Defensible differentiators:
 - **MASQUE (CONNECT-UDP, CONNECT-IP) as a day-one design input**, not a layer bolted onto an H3 stack that never anticipated it.
 - **Explicit state machine tables** rather than conditionals scattered across thousand-line files.
 
+Checked in August 2026, and stronger than expected on the first point. Python has no standalone sans-IO HTTP/3 or QPACK library: the options are aioquic and qh3, and qh3 is a fork of aioquic, so it is one lineage rather than two. Neither packages h3 separately from the transport; qh3's package is `quic/`, `h3/`, `tls.py` and `asyncio/`, so taking its h3 means taking its QUIC, its TLS and its event model.
+
+Nor is QPACK packaged by anyone, which is the telling asymmetry: HTTP/2 has `hpack`, a pure-Python sans-IO header codec, and HTTP/3 has no equivalent. aioquic delegates QPACK to `pylsqpack`, a C binding to ls-qpack; its own issue on the question framed the choice as wrapping C or writing pure Python, called the latter "more debugable but probably more work", and took the wrapper (https://github.com/aiortc/aioquic/issues/15). qh3 goes further in the same direction: a Rust extension holds not only crypto but `packet.rs`, `buffer.rs`, `rangeset.rs`, `recovery.rs`, `stream_sender.rs` and `headers.rs`, which is to say packet parsing, buffers, ACK ranges, loss recovery and header compression.
+
+The direction of travel in that lineage is therefore *more* compiled code in the protocol path, not less, and the modules it has moved out of Python are precisely the ones this project writes out longhand. A readable pure-Python QPACK is a gap in the ecosystem rather than a wheel being reinvented, and it is the part of HTTP/3 a Python reader is least able to inspect today.
+
 ---
 
 ## 4. Core design principles
@@ -199,6 +205,7 @@ Each step is a gate: the next phase starts only after the previous phase passes 
 - [ ] 0-RTT: in the MVP scope, or deferred?
 - [ ] When (and whether) to add an asyncio transport layer over the sans-IO core
 - [ ] PyPI distribution name: publish as `dsquic`, or stay git-install only for the academic phase?
+- [ ] Whether `h3.py` and `qpack.py` ever ship as separate artifacts usable with other QUIC implementations. Only the packaging is open: the dependency discipline that keeps it possible is settled and enforced (see appendix).
 - [ ] MASQUE surface for v1: CONNECT-UDP only, or CONNECT-IP alongside?
 
 ---
@@ -316,6 +323,58 @@ Recorded here so the open questions above stay honest:
   sets no ceiling of its own. picoquic instead bounds the number of
   retransmissions rather than the interval; that needs more state and
   has no QUIC-spec citation, so it was not taken.
+- **h3.py and qpack.py stay liftable (2026-08-06)**: they import nothing
+  from this package but `buffer`, the RFC 9000 §16 varint codec that
+  RFC 9114 and RFC 9204 both build on. The transport reaches them through
+  the Protocol above, and arriving data through method calls on the H3
+  connection rather than as dsquic event types, so neither direction is
+  an import. `qpack.py` needs no transport at all: it is a codec taking
+  bytes and returning bytes, which is why §3 identifies it as the gap
+  nobody in Python fills.
+  Packaging is *not* decided and deliberately left alone (§7): there are
+  no users, and splitting distributions would collide with the flat
+  module layout. What is decided is the discipline that keeps the choice
+  available, because the cost of adopting it now is nothing and the cost
+  of retrofitting it is every call site. `tests/test_scaffold.py` asserts
+  it, so the constraint fails a test rather than eroding quietly; an
+  import of `connection.py` there is what ties every other Python HTTP/3
+  stack to one QUIC implementation.
+  Weigh against it, when the packaging question is finally answered: a
+  published artifact acquires stability promises, which is the opposite
+  of §4's "refactor over backward compatibility". A split promise, stable
+  for the two codecs and fluid for the transport core, is coherent but is
+  a commitment rather than a detail.
+- **h3.py is generic over the transport, from before it exists
+  (2026-08-06)**: `h3.py` is written against a `typing.Protocol` naming
+  what HTTP/3 requires of a QUIC transport, not against `Connection`.
+  Three things follow. The reader sees HTTP/3's whole demand on QUIC in
+  one screen, which is the layering stated rather than implied. A test
+  satisfies it with a dictionary of buffers, so h3 is testable without a
+  handshake. And a second transport, QMux over TCP being the case in
+  view, is another implementation of the Protocol rather than a fork,
+  which is how every Python HTTP/3 stack has ended up entangled with one
+  QUIC implementation (see §3).
+  The surface is `open_stream(bidirectional=)`, `send_stream_data`,
+  `reset_stream`, `stop_sending`, `send_datagram`, `close`, and
+  `max_datagram_size`. Each entry cites the RFC 9114 clause that demands
+  it, and nothing enters without one: a Protocol that mirrors whatever
+  `Connection` happens to offer would buy nothing.
+  Two things deliberately stay out. Incoming stream data and datagrams
+  are events, a data vocabulary the h3 layer is fed, not calls it makes,
+  which is what keeps a fake transport to a dictionary. And whether a
+  stream ID is unidirectional or peer-initiated is arithmetic on the ID
+  (RFC 9000 §2.1), so it lives in h3 as pure helpers rather than making
+  every transport reimplement it.
+  Writing it first turned out to specify work rather than describe it:
+  `Connection.open_stream()` cannot express a unidirectional stream, and
+  there is no request cancellation and no datagram send. Those are the
+  transport gaps h3 needs closed.
+  The open question is whether a transport without QUIC's stream model
+  can satisfy it honestly. Unidirectional streams can be emulated over a
+  bidirectional mux, but datagrams cannot be made unreliable over TCP, so
+  `send_datagram` is where the abstraction either earns its keep or
+  leaks. Recording it now so the answer is designed rather than
+  discovered.
 - **Retry lives in its own module, and the address never reaches the
   core (2026-08-06)**: `retry.py` holds the Retry packet (RFC 9000
   §17.2.5) and the address validation tokens (§8.1.2-§8.1.4); the Retry
