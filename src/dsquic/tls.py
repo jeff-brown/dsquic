@@ -219,6 +219,67 @@ class KeySchedule:
         return self._derive(b"s ap traffic")
 
 
+@dataclass(frozen=True)
+class PskIdentity:
+    """One offered ticket (RFC 8446 §4.2.11).
+
+    ``obfuscated_ticket_age`` is the ticket's age in milliseconds plus
+    the ``age_add`` it was issued with, so an observer cannot correlate
+    offers by age.
+    """
+
+    identity: bytes
+    obfuscated_ticket_age: int
+
+
+def encode_offered_psks(identities: list[PskIdentity], binders: list[bytes]) -> bytes:
+    """The pre_shared_key extension a client offers (§4.2.11).
+
+    It is the last extension in a ClientHello, because the binders cover
+    everything before them and nothing can follow.
+    """
+    offered = b"".join(
+        _vec(2, identity.identity) + identity.obfuscated_ticket_age.to_bytes(4, "big")
+        for identity in identities
+    )
+    return _vec(2, offered) + _vec(2, b"".join(_vec(1, binder) for binder in binders))
+
+
+def parse_offered_psks(data: bytes) -> tuple[list[PskIdentity], list[bytes]]:
+    """Read a client's pre_shared_key extension (§4.2.11)."""
+    buf = Buffer(data)
+    identities_block = Buffer(buf.pull_bytes(buf.pull_uint16()))
+    identities: list[PskIdentity] = []
+    while not identities_block.is_empty:
+        identity = identities_block.pull_bytes(identities_block.pull_uint16())
+        identities.append(
+            PskIdentity(
+                identity=identity,
+                obfuscated_ticket_age=identities_block.pull_uint32(),
+            )
+        )
+    binders_block = Buffer(buf.pull_bytes(buf.pull_uint16()))
+    binders: list[bytes] = []
+    while not binders_block.is_empty:
+        binders.append(binders_block.pull_bytes(binders_block.pull_uint8()))
+    if len(identities) != len(binders):
+        raise TlsAlert(ILLEGAL_PARAMETER, "one binder per identity is required")
+    return identities, binders
+
+
+def binder_transcript(client_hello: bytes, binder_count: int = 1) -> bytes:
+    """§4.2.11.2: the ClientHello bytes a binder is computed over.
+
+    Everything up to the binders, which a binder cannot cover since it is
+    one of them. The header's length field still counts them, so this
+    truncates the encoded message rather than encoding a shorter one.
+    """
+    trailing = 2 + binder_count * (1 + SHA256_LENGTH)
+    if len(client_hello) <= trailing:
+        raise TlsAlert(DECODE_ERROR, "ClientHello is too short to carry its binders")
+    return client_hello[:-trailing]
+
+
 def resumption_psk(resumption_master_secret: bytes, ticket_nonce: bytes) -> bytes:
     """§4.6.1: the PSK a ticket stands for.
 
@@ -555,6 +616,7 @@ UNEXPECTED_MESSAGE = 10
 HANDSHAKE_FAILURE = 40
 BAD_CERTIFICATE = 42
 ILLEGAL_PARAMETER = 47
+DECODE_ERROR = 50
 DECRYPT_ERROR = 51
 PROTOCOL_VERSION = 70
 MISSING_EXTENSION = 109

@@ -1,6 +1,7 @@
 """Tests for dsquic.tls: RFC 8448 trace vectors and the in-memory handshake."""
 
 import datetime
+import hashlib
 from dataclasses import dataclass
 
 import pytest
@@ -43,6 +44,7 @@ from dsquic.tls import (
     HandshakeParseError,
     KeySchedule,
     NewSessionTicket,
+    PskIdentity,
     SecretAvailable,
     SendData,
     ServerConfig,
@@ -52,17 +54,20 @@ from dsquic.tls import (
     TlsClient,
     TlsEvent,
     TlsServer,
+    binder_transcript,
     encode_certificate,
     encode_certificate_verify,
     encode_client_hello,
     encode_encrypted_extensions,
     encode_finished,
     encode_new_session_ticket,
+    encode_offered_psks,
     encode_server_hello,
     finished_verify_data,
     hkdf_expand_label,
     hkdf_label,
     parse_handshake_message,
+    parse_offered_psks,
     resumption_psk,
 )
 
@@ -688,3 +693,37 @@ def test_new_session_ticket_round_trips_the_spec_vector() -> None:
     assert encode_new_session_ticket(message) == rfc8448.NEW_SESSION_TICKET
     # §4.2.10: the ticket says how much early data it permits.
     assert [ext.type for ext in message.extensions] == [ExtensionType.EARLY_DATA]
+
+
+class TestPskBinder:
+    """RFC 8446 §4.2.11 against RFC 8448 §4."""
+
+    def test_binder_covers_the_hello_up_to_the_binders(self) -> None:
+        """The binder cannot cover itself, so the transcript stops where
+        the binders start. The header's length field still counts them,
+        which is why this truncates rather than re-encodes."""
+        binders = b"\x00\x21" + b"\x20" + rfc8448.BINDER
+        complete = rfc8448.CLIENT_HELLO_BINDER_PREFIX + binders
+        assert binder_transcript(complete) == rfc8448.CLIENT_HELLO_BINDER_PREFIX
+        # The prefix keeps the length of the whole message, not its own.
+        assert int.from_bytes(complete[1:4], "big") + 4 == len(complete)
+
+    def test_binder_over_that_prefix_matches_the_vector(self) -> None:
+        schedule = KeySchedule(psk=rfc8448.RESUMPTION_PSK)
+        transcript = hashlib.sha256(rfc8448.CLIENT_HELLO_BINDER_PREFIX).digest()
+        assert finished_verify_data(schedule.binder_key(), transcript) == rfc8448.BINDER
+
+    def test_offered_psks_round_trip(self) -> None:
+        identities = [PskIdentity(identity=b"ticket-bytes", obfuscated_ticket_age=0x01020304)]
+        binders = [rfc8448.BINDER]
+        encoded = encode_offered_psks(identities, binders)
+        assert parse_offered_psks(encoded) == (identities, binders)
+
+    def test_a_missing_binder_is_rejected(self) -> None:
+        """§4.2.11: exactly one binder per identity."""
+        identities = [
+            PskIdentity(identity=b"one", obfuscated_ticket_age=0),
+            PskIdentity(identity=b"two", obfuscated_ticket_age=0),
+        ]
+        with pytest.raises(TlsAlert):
+            parse_offered_psks(encode_offered_psks(identities, [rfc8448.BINDER]))
