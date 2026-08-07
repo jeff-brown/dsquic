@@ -20,7 +20,8 @@ from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.asyncio.server import serve
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import QuicEvent, StreamDataReceived
+from aioquic.quic.events import HandshakeCompleted, QuicEvent, StreamDataReceived
+from aioquic.tls import SessionTicket
 
 ALPN = ["hq-interop"]
 
@@ -28,12 +29,15 @@ ALPN = ["hq-interop"]
 class HqServerProtocol(QuicConnectionProtocol):
     """Serves files from a document root over hq-interop."""
 
-    def __init__(self, *args: Any, document_root: Path, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, document_root: Path, resumed: list[bool], **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._document_root = document_root
         self._requests: dict[int, bytearray] = {}
+        self._resumed = resumed
 
     def quic_event_received(self, event: QuicEvent) -> None:
+        if isinstance(event, HandshakeCompleted):
+            self._resumed.append(event.session_resumed)
         if not isinstance(event, StreamDataReceived):
             return
         buffer = self._requests.setdefault(event.stream_id, bytearray())
@@ -65,6 +69,17 @@ class AioquicServer:
         self._ready = threading.Event()
         self._stop: asyncio.Event | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
+        # One entry per completed handshake: whether it resumed a session.
+        self.resumed: list[bool] = []
+        # RFC 8446 §4.6.1: aioquic issues session tickets only when given
+        # somewhere to keep them, which is how its interop image runs.
+        self._tickets: dict[bytes, SessionTicket] = {}
+
+    def _store_ticket(self, ticket: SessionTicket) -> None:
+        self._tickets[ticket.ticket] = ticket
+
+    def _fetch_ticket(self, label: bytes) -> SessionTicket | None:
+        return self._tickets.pop(label, None)
 
     def _run(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -76,10 +91,17 @@ class AioquicServer:
         configuration.load_cert_chain(self._certificate, self._private_key)
 
         def create_protocol(*args: Any, **kwargs: Any) -> HqServerProtocol:
-            return HqServerProtocol(*args, document_root=self._document_root, **kwargs)
+            return HqServerProtocol(
+                *args, document_root=self._document_root, resumed=self.resumed, **kwargs
+            )
 
         await serve(
-            self._host, self._port, configuration=configuration, create_protocol=create_protocol
+            self._host,
+            self._port,
+            configuration=configuration,
+            create_protocol=create_protocol,
+            session_ticket_fetcher=self._fetch_ticket,
+            session_ticket_handler=self._store_ticket,
         )
         self._stop = asyncio.Event()
         self._ready.set()

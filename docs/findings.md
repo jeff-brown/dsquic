@@ -7,6 +7,40 @@ is now, and this says what it cost to get there. Kept because the
 failures are the pedagogical payload, and because the methods that
 found them are worth reusing.
 
+## Three servers issued no tickets to a modes-less client (2026-08-07)
+
+The first `resumption` sweep as client passed only against quic-go;
+aioquic, picoquic and quiche all sent a Certificate in the second
+handshake. The pcap showed why in one line: the second ClientHello
+carried no `pre_shared_key` at all, so the first connection had never
+been given a ticket to offer.
+
+The client sent `psk_key_exchange_modes` only alongside an offer, and
+RFC 8446 §4.2.9 gives the extension a second job: it "restricts both
+the use of PSKs offered in this ClientHello and those which the server
+might supply via NewSessionTicket", and servers SHOULD NOT issue
+tickets incompatible with the advertised modes. aioquic reads a hello
+with no modes as "issue nothing" (its server gates NewSessionTicket on
+a negotiated mode), and picoquic and quiche behave the same. quic-go
+issues tickets regardless, which both §4.6.1 permits and is why it
+alone resumed. The fix: advertise `psk_dhe_ke` in every ClientHello,
+offer `pre_shared_key` only with a ticket; the server got the matching
+SHOULD and issues nothing to a client that advertised no usable mode.
+
+Two lessons beyond the fix. The unit and loopback rungs could not have
+caught it, because dsquic agreed with itself on both halves of the
+mistake; it took a peer that implements the SHOULD. And the local
+reproduction was two orders of magnitude faster than the runner: an
+aioquic server is a dev dependency, and wiring its session-ticket
+store into the interop harness turned a 90-second simulator cycle
+into a 0.4-second pytest case, `test_resumption` in
+`tests/interop/test_aioquic.py`, which now pins the behaviour.
+
+The same sweep's one server-role failure, quiche as client, was
+`wait-for-it: timeout ... sim:57832`: the simulator never came up and
+no QUIC packet was sent. Re-run alone, it passed, as the standing
+caution about single red squares predicts.
+
 ## Connection stalls under handshake loss (2026-08-06)
 
 A green square on `handshakeloss` means 50 connections finished inside

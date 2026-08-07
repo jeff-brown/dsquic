@@ -12,16 +12,12 @@ real UDP and through the runner's ns-3 simulator. This is design.md §6.3
 step 5, the recorded definition of MVP done.
 
 Runner results, locally hosted (see "Interop Runner results" below):
-`handshake` and `transfer` pass in every pairing of dsquic, quic-go and
-aioquic, in both roles. As **server** dsquic passes every case it
-attempts against quic-go, aioquic, picoquic and quiche, plus `keyupdate`.
-As **client** it passes everything against picoquic and quiche, and all
-but `handshakeloss` and `handshakecorruption` against aioquic, which are
-the open item recorded below.
+every claimed case, now including `resumption`, passes in both roles
+against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  395 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  397 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -43,9 +39,9 @@ the open item recorded below.
   `/setup.sh` routes traffic through the simulator; the script detects
   the simulator by the topology's 193.167.0.0/16 addressing rather than
   by probing for files, since the same image also runs on an ordinary
-  bridge. `run_endpoint.sh` claims the eight cases listed under results
-  below; interop/README.md tabulates why each of the runner's other cases
-  is not attempted.
+  bridge. `run_endpoint.sh` claims the twelve cases listed in
+  interop/README.md, which also tabulates why each of the runner's
+  other cases is not attempted.
 
 ## Running the Interop Runner locally
 
@@ -184,6 +180,13 @@ quic-go, aioquic and picoquic. Against quiche, eleven pass and
 `handshakeloss` failed in the combined sweep and passed on its own
 re-run. That re-run is not the whole story: see the open item below.
 
+**Resumption, both roles, 2026-08-07.** `✓(R)` against all four peers
+in both directions, run as its own case. The first sweep failed as
+client against everyone but quic-go, which was a real §4.2.9 defect
+(docs/findings.md), and once as server against quiche's client, which
+was the simulator failing to start (`wait-for-it: timeout` before any
+QUIC packet), passing on re-run.
+
 Two cautions about reading any of this:
 
 - The cases are timing sensitive. `transferloss` and `blackhole` have
@@ -205,92 +208,44 @@ that looked like a protocol bug, and the connection stalls that turned
 out to belong to other implementations. History, retrievable when
 wanted, rather than resident in every session.
 
-## Resumption, in progress (2026-08-06)
+## Resumption (2026-08-07)
 
-**Acceptance criterion**, read from the runner's `TestCaseResumption`:
-exactly 2 handshakes, a Certificate message in the first and **none** in
-the second, both files downloaded. It is checked from the pcap, so the
-Certificate skip is the thing that has to actually happen.
-`testname()` is not overridden, so the shim receives `TESTCASE=resumption`
-and the client must make two connections carrying a ticket between them.
+`resumption` passes in both roles against quic-go, aioquic, picoquic
+and quiche, `✓(R)` in every column: exactly two handshakes, a
+Certificate in the first and none in the second, verified by the
+runner from the pcap. Every rung is done except the independent wire
+capture check the phase gates assign to the human; the runner's pcaps
+and SSLKEYLOGFILE logs from these runs are retained in the VM for it.
 
-**Done and committed.** Every derivation is checked against RFC 8448,
-not against our own output, in `tests/rfc8448_vectors.py`:
+How it is built, briefly. Session tickets are sealed with a per-process
+AES-256-GCM key (`ServerConfig.ticket_key`; `Server.__init__` generates
+one when unset), so the server keeps no per-ticket state. Every
+derivation is pinned to RFC 8448 vectors in `tests/rfc8448_vectors.py`.
+The client carries a zero-PSK fallback schedule beside the PSK schedule
+until the ServerHello resolves the offer, recomputes its binder over
+message_hash + HelloRetryRequest + truncated hello after a retry
+(§4.2.11.2), and validates `selected_identity`. The server verifies
+binders from a `KeySchedule(psk=...)`, declines unusable tickets to a
+full handshake, aborts on a bad binder (DECRYPT_ERROR), and after its
+own HelloRetryRequest declines PSKs rather than rebuilding a transcript
+it no longer holds. `fetch` takes a caller-owned ticket store;
+`fetch_each` threads it under `ClientOptions.resume` (`--resume`,
+requiring `--connection-per-request`); `Server.connections_resumed`
+counts PSK handshakes for tests and logs.
 
-- `KeySchedule(psk=...)` extracts a PSK into the Early Secret;
-  `binder_key()`, `resumption_master_secret()`, `resumption_psk()`.
-- `NewSessionTicket` with real fields, round-tripping §3's 205-octet
-  vector; `encode_new_session_ticket` / `_parse_new_session_ticket`.
-- `PskIdentity`, `encode_offered_psks`, `parse_offered_psks`,
-  `binder_transcript`, plus `PRE_SHARED_KEY` and `EARLY_DATA` extension
-  types and the `DECODE_ERROR` alert.
-- `seal_ticket` / `open_ticket`, `ServerConfig.ticket_key`, and
-  `TlsServer._issue_session_ticket` sending the ticket at the 1-RTT
-  level after the client's Finished, which is where the resumption
-  master secret's transcript ends.
-- `TlsClient.session_tickets`, filled by `_store_session_ticket`.
-- `ClientConfig.session_ticket`, `_psk_extensions`, `_fill_psk_binder`:
-  a client offers a stored ticket with a verifiable binder.
-- Server-side PSK selection, staged: `TlsServer._select_psk` opens the
-  first offered identity that unseals, verifies its binder from a
-  `KeySchedule(psk=...)` (mismatch is a DECRYPT_ERROR abort, §4.2.11.2),
-  enforces pre_shared_key-is-last (§4.2.11) and the psk_key_exchange_modes
-  requirement (§4.2.9), and declines to a full handshake when the ticket
-  cannot be used. On selection `_on_client_hello` rebuilds the schedule
-  with the PSK before the transcript sees the hello, answers with
-  `selected_identity`, and sends a flight with no Certificate or
-  CertificateVerify (§2.2), which is what the runner inspects.
-  `TestServerPskSelection` in tests/test_tls.py covers all of it.
+The defect the runner found, recorded in docs/findings.md: the client
+sent `psk_key_exchange_modes` only when offering a ticket, and
+spec-following servers (aioquic, picoquic, quiche) issue no
+NewSessionTicket to a client that advertised no modes (§4.2.9). The
+extension now goes out on every ClientHello, and the server got the
+matching SHOULD: no ticket for a client without `psk_dhe_ke`. The
+aioquic interop harness now wires a session-ticket store, so
+`test_resumption` in tests/interop/test_aioquic.py reproduces in 0.4
+seconds what took a runner cycle to see.
 
-- Client-side accept, staged: a ServerHello carrying `selected_identity`
-  must answer an offer that was made and select identity 0, the only one
-  offered (§4.2.11); the resumed flight then skips Certificate and
-  CertificateVerify, `_on_encrypted_extensions` stepping straight to
-  WAIT_FINISHED (§2.2). Declining works too: `TlsClient` carries a
-  zero-PSK fallback schedule beside the PSK schedule until the
-  ServerHello resolves the offer, since the Early Secret extracts zeros
-  when the server does not resume (§7.1). `_fill_psk_binder` now feeds
-  the transcript in two chunks and MACs the running transcript, so a
-  second ClientHello after a HelloRetryRequest recomputes its binder
-  over message_hash + HRR + truncated hello (§4.1.4, §4.2.11.2), which
-  a test pins byte for byte. Full resumption and decline handshakes now
-  pass in memory end to end.
-
-- Endpoint wiring, staged. `fetch` takes a caller-owned ticket store:
-  it offers the newest entry and appends what the connection receives;
-  `fetch_each` threads one store through its sequence when
-  `ClientOptions.resume` is set (`--resume` on the CLI, requiring
-  `--connection-per-request`). The reference server seals tickets under
-  a per-process key generated in `Server.__init__` when the config
-  carries none, like the Retry token key, so every reference server
-  issues tickets; `Server.connections_resumed` counts PSK handshakes
-  beside `connections_served`. `TlsClient.start` now takes the caller's
-  clock so obfuscated_ticket_age is real (§4.2.11.1), and both TLS
-  machines expose a public `resumed` flag. The shim claims `resumption`
-  and passes `--connection-per-request --resume` for it.
-- Ladder so far: unit (RFC 8448 vectors, selection and accept paths)
-  and loopback (`test_loopback_resumption`: two connections over real
-  UDP, the second resumed, asserted via `connections_resumed`). The
-  server issuing tickets everywhere also puts 1-RTT server-side CRYPTO
-  (NewSessionTicket) on every loopback and interop-harness handshake,
-  a previously idle send path.
-
-**Next**: the Interop Runner's `resumption` case in both directions,
-plus the wire capture check the phase gates require (a decrypted
-capture of the second connection showing pre_shared_key and no
-Certificate).
-
-**Three traps already paid for, worth not repeating.**
-
-- The binder covers the ClientHello *truncated at the binders*, while the
-  header length field still counts them: RFC 8448 prints a 477-octet
-  prefix whose own length field says 512. So the message is encoded with
-  a placeholder binder and patched, never encoded short.
-- `pre_shared_key` must be the last extension, since the binder covers
-  everything before it.
-- `str.replace` in an editing script hits *every* match, and `TlsClient`
-  and `TlsServer` have identical `__init__` prologues. One edit silently
-  gave the server a `session_tickets` list; mypy caught it, ruff did not.
+Still deliberately absent, waiting on the 0-RTT decision (design.md
+§7): the `early_data` extension, ticket age freshness checks, and
+NEW_TOKEN issuance (§8.1.3).
 
 ## Retry (2026-08-06)
 
@@ -393,12 +348,12 @@ server halves in `connection.py` and `endpoints/server.py`,
 ## Next steps
 
 1. **Finish the QUIC protocol work before starting HTTP/3.** Remaining
-   runner cases: `resumption`, `zerortt`, `ecn`, `chacha20`,
-   `connectionmigration`, and `versionnegotiation`, where dsquic sends
-   VN but a client does not react to receiving one by retrying with a
-   supported version. `resumption` is the natural next one: it needs
-   session tickets in `tls.py` and is the prerequisite for `zerortt`,
-   which in turn is what makes NEW_TOKEN (§8.1.3) worth having.
+   runner cases: `zerortt`, `ecn`, `chacha20`, `connectionmigration`,
+   and `versionnegotiation`, where dsquic sends VN but a client does
+   not react to receiving one by retrying with a supported version.
+   With `resumption` done, `zerortt` is the natural next one; it hangs
+   on the 0-RTT scope decision (design.md §7) and is what makes
+   NEW_TOKEN (§8.1.3) worth having.
 2. **HTTP/3 after that** (design.md §6.1). The largest piece and the one
    that unblocks MASQUE, since `h3.py` is a stub and carries the last
    open MASQUE readiness constraint. `h3.py` is written against a

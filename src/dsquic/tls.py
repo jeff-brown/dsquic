@@ -1056,8 +1056,14 @@ class TlsClient(_Handshake):
                 Extension(
                     ExtensionType.QUIC_TRANSPORT_PARAMETERS, self._config.transport_parameters
                 ),
+                # §4.2.9: sent whether or not a ticket is offered, since
+                # it also governs the tickets the server may issue, and
+                # servers issue none to a client advertising no modes.
+                # psk_dhe_ke: resumption keeps an ECDHE exchange, so a
+                # resumed connection has forward secrecy of its own.
+                Extension(ExtensionType.PSK_KEY_EXCHANGE_MODES, _vec(1, bytes([PSK_DHE_KE]))),
                 *(
-                    self._psk_extensions(self._config.session_ticket)
+                    [self._psk_offer(self._config.session_ticket)]
                     if self._config.session_ticket is not None
                     else []
                 ),
@@ -1081,8 +1087,8 @@ class TlsClient(_Handshake):
         self.events.append(SendData(EncryptionLevel.INITIAL, raw))
         self.state = ClientState.WAIT_SERVER_HELLO
 
-    def _psk_extensions(self, ticket: SessionTicket) -> list[Extension]:
-        """§4.2.9 and §4.2.11: offer a ticket, with a placeholder binder.
+    def _psk_offer(self, ticket: SessionTicket) -> Extension:
+        """§4.2.11: offer a ticket, with a placeholder binder.
 
         pre_shared_key is last because the binder covers everything
         before it, so nothing may follow. The binder is written over the
@@ -1090,18 +1096,13 @@ class TlsClient(_Handshake):
         those very bytes.
         """
         age = int((self._now - ticket.received_at) * 1000) + ticket.age_add
-        return [
-            # psk_dhe_ke: resumption still does an ECDHE exchange, so the
-            # new connection has forward secrecy of its own.
-            Extension(ExtensionType.PSK_KEY_EXCHANGE_MODES, _vec(1, bytes([PSK_DHE_KE]))),
-            Extension(
-                ExtensionType.PRE_SHARED_KEY,
-                encode_offered_psks(
-                    [PskIdentity(identity=ticket.identity, obfuscated_ticket_age=age % 2**32)],
-                    [bytes(SHA256_LENGTH)],
-                ),
+        return Extension(
+            ExtensionType.PRE_SHARED_KEY,
+            encode_offered_psks(
+                [PskIdentity(identity=ticket.identity, obfuscated_ticket_age=age % 2**32)],
+                [bytes(SHA256_LENGTH)],
             ),
-        ]
+        )
 
     def _fill_psk_binder(self, raw: bytes) -> bytes:
         """§4.2.11.2: replace the placeholder binder with the real one.
@@ -1322,6 +1323,9 @@ class TlsServer(_Handshake):
         self._client_transport_parameters = b""
         # §2.2: whether this handshake resumed a session via a PSK.
         self.resumed = False
+        # §4.2.9: whether the client advertised psk_dhe_ke, without
+        # which no ticket it could use can be issued.
+        self._client_supports_resumption = False
         self.state = ServerState.START
 
     def _handle(self, level: EncryptionLevel, message: HandshakeMessage, raw: bytes) -> None:
@@ -1449,6 +1453,8 @@ class TlsServer(_Handshake):
 
         selected = self._select_psk(hello, raw)
         self.resumed = selected is not None
+        modes = _find_extension(hello.extensions, ExtensionType.PSK_KEY_EXCHANGE_MODES)
+        self._client_supports_resumption = modes is not None and PSK_DHE_KE in modes[1:]
         if selected is not None:
             # §7.1: resuming extracts the PSK into the Early Secret, so
             # the schedule is rebuilt before it sees this ClientHello.
@@ -1491,24 +1497,7 @@ class TlsServer(_Handshake):
         )
         self.schedule.update_transcript(encrypted_extensions)
         if selected is None:
-            certificate = encode_certificate(
-                Certificate(
-                    request_context=b"",
-                    entries=[
-                        CertificateEntry(data=data, extensions=[])
-                        for data in self._config.certificate_chain
-                    ],
-                )
-            )
-            self.schedule.update_transcript(certificate)
-            algorithm, signature = _sign_certificate_verify(
-                self._config.signing_key, self.schedule.transcript_hash()
-            )
-            certificate_verify = encode_certificate_verify(
-                CertificateVerify(algorithm=algorithm, signature=signature)
-            )
-            self.schedule.update_transcript(certificate_verify)
-            flight = encrypted_extensions + certificate + certificate_verify
+            flight = encrypted_extensions + self._certificate_messages()
         else:
             # §2.2: a PSK authenticates the connection, so Certificate
             # and CertificateVerify are not sent.
@@ -1521,6 +1510,28 @@ class TlsServer(_Handshake):
         self._alpn = alpn
         self._client_transport_parameters = client_transport_parameters
         self.state = ServerState.WAIT_FINISHED
+
+    def _certificate_messages(self) -> bytes:
+        """Certificate and CertificateVerify (§4.4.2, §4.4.3), fed to
+        the transcript in order."""
+        certificate = encode_certificate(
+            Certificate(
+                request_context=b"",
+                entries=[
+                    CertificateEntry(data=data, extensions=[])
+                    for data in self._config.certificate_chain
+                ],
+            )
+        )
+        self.schedule.update_transcript(certificate)
+        algorithm, signature = _sign_certificate_verify(
+            self._config.signing_key, self.schedule.transcript_hash()
+        )
+        certificate_verify = encode_certificate_verify(
+            CertificateVerify(algorithm=algorithm, signature=signature)
+        )
+        self.schedule.update_transcript(certificate_verify)
+        return certificate + certificate_verify
 
     def _on_finished(self, message: Finished, raw: bytes) -> None:
         expected = finished_verify_data(self.client_hs_secret, self.schedule.transcript_hash())
@@ -1537,9 +1548,10 @@ class TlsServer(_Handshake):
         Sent after the client's Finished because the resumption master
         secret is derived over a transcript that ends there. The ticket
         goes out at the application level, which RFC 9001 §4.5 requires
-        of any post-handshake message.
+        of any post-handshake message. A client that advertised no
+        usable psk_key_exchange_mode gets no ticket (§4.2.9).
         """
-        if self._config.ticket_key is None:
+        if self._config.ticket_key is None or not self._client_supports_resumption:
             return
         nonce = os.urandom(TICKET_NONCE_LENGTH)
         psk = resumption_psk(self.schedule.resumption_master_secret(), nonce)

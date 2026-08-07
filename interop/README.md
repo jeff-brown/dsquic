@@ -35,8 +35,9 @@ recorded in `docs/design.md`.
 ## Test cases this image attempts
 
 `handshake`, `transfer`, `multiconnect`, `transferloss`,
-`transfercorruption`, `blackhole`, `longrtt`, and `amplificationlimit`.
-Everything else exits 127.
+`transfercorruption`, `blackhole`, `longrtt`, `amplificationlimit`,
+`ipv6`, `keyupdate`, `retry`, and `resumption`. Everything else exits
+127.
 
 `multiplexing` is not in that list and does not need to be: the runner
 gives both containers the name `transfer` for it, and it is the request
@@ -166,8 +167,10 @@ As **server**, all twelve cases claimed at the time pass against all
 four peers, with no failures. `keyupdate` is verified by the runner
 reading key phase bits out of the pcap, and quiche reports it
 unsupported because its client does not implement key update.
-`resumption` has been claimed since that sweep and has not been run
-through the simulator yet.
+`resumption`, claimed after that sweep, passes on its own in both
+roles against all four peers; the runner verifies it from the pcap as
+exactly two handshakes, a Certificate in the first and none in the
+second.
 
 As **client**, `handshake`, `transfer`, `multiplexing`, `handshakeloss`,
 `handshakecorruption`, `ipv6` and `keyupdate` pass against all four

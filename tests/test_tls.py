@@ -26,6 +26,7 @@ from dsquic.tls import (
     MESSAGE_HASH_TYPE,
     MISSING_EXTENSION,
     NO_APPLICATION_PROTOCOL,
+    PSK_DHE_KE,
     RSA_PSS_RSAE_SHA256,
     TLS_1_3,
     TLS_AES_128_GCM_SHA256,
@@ -795,6 +796,24 @@ def test_no_ticket_without_a_ticket_key(credentials: Credentials) -> None:
     client = make_client(credentials)
     pump(client, make_server(credentials))
     assert client.session_tickets == []
+
+
+def test_a_client_advertises_psk_modes_without_an_offer(credentials: Credentials) -> None:
+    """RFC 8446 §4.2.9: the extension also governs the tickets a server
+    may issue, so it goes out on every hello; spec-following servers
+    issue no NewSessionTicket to a client that advertised no modes."""
+    client = make_client(credentials)
+    client.start(0.0)
+    hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    message, _ = parse_handshake_message(hello)
+    assert isinstance(message, ClientHello)
+    types = [e.type for e in message.extensions]
+    assert ExtensionType.PSK_KEY_EXCHANGE_MODES in types
+    assert ExtensionType.PRE_SHARED_KEY not in types
+    modes = next(
+        e.data for e in message.extensions if e.type == ExtensionType.PSK_KEY_EXCHANGE_MODES
+    )
+    assert modes == bytes([1, PSK_DHE_KE])
 
 
 def test_a_client_offers_a_ticket_with_a_verifiable_binder(credentials: Credentials) -> None:
