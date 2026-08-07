@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  408 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  410 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -295,9 +295,15 @@ connection carrying many early requests.
    confirmation (server, §4.9.3). A resuming client that hits a
    HelloRetryRequest keeps its pre-retry 0-RTT data only via the
    handshake-probe resend path, which is slow but converges.
-5. Server anti-replay: the §8.3 window over the sealed issue time and
-   the offered obfuscated age; outside it, accept the PSK but refuse
-   early data.
+5. Done: the §8.3 freshness window, `TlsServer._ticket_is_fresh`: the
+   claimed age (obfuscated_ticket_age minus the sealed age_add) must
+   sit within 10 seconds of the actual age (now minus the sealed issue
+   time); outside it the PSK still resumes and only the early data is
+   refused. The replay test feeds one ClientHello to two servers, 5
+   and 30 seconds after issue. Consequence callers inherit: ticket age
+   is measured on the client's monotonic clock, so offering a ticket
+   under a clock that runs backwards (or a different process's clock
+   without care) makes the claim stale and 0-RTT quietly downgrade.
 6. NEW_TOKEN (§8.1.3): issued after the handshake, stored with the
    ticket, presented in the resuming Initial; `retry.py` already
    kind-tags tokens so Retry and NEW_TOKEN validation stay distinct.

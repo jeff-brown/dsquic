@@ -934,27 +934,31 @@ class TestZeroRtt:
 
     KEY = bytes(range(32))
 
-    def _ticket(self, credentials: Credentials) -> SessionTicket:
+    def _ticket(self, credentials: Credentials) -> tuple[SessionTicket, float]:
+        """A ticket and the clock it was issued under. The clock keeps
+        running into the resumed connection: ticket age is measured
+        against it (§8.3), and a clock that jumps backwards makes the
+        age claim stale and the early data refused."""
         client, server = make_resumption_pair(credentials, self.KEY)
         client.connect(0.0)
-        pump(client, server)
+        now = pump(client, server)
         assert isinstance(client.tls, TlsClient)
-        return client.tls.session_tickets[0]
+        return client.tls.session_tickets[0], now
 
     def test_data_rides_zero_rtt_before_the_handshake(self, credentials: Credentials) -> None:
         """The first flight carries the request in a 0-RTT packet, and
         the server acts on it before the handshake completes, which is
         the round trip the feature exists to save."""
-        ticket = self._ticket(credentials)
+        ticket, now = self._ticket(credentials)
         keylog: list[str] = []
         client, server = make_resumption_pair(
             credentials, self.KEY, ticket, early_data=True, client_keylog=keylog
         )
-        client.connect(0.0)
+        client.connect(now)
         stream_id = client.open_stream()
         client.send_stream_data(stream_id, b"GET /early\r\n", end_stream=True)
 
-        flight = client.datagrams_to_send(0.0)
+        flight = client.datagrams_to_send(now)
         types = [parse_long_header(datagram.data).packet_type for datagram in flight]
         assert PacketType.ZERO_RTT in types
         # SSLKEYLOGFILE must carry the early secret or captures of
@@ -962,7 +966,7 @@ class TestZeroRtt:
         assert any(line.startswith("CLIENT_EARLY_TRAFFIC_SECRET") for line in keylog)
 
         for datagram in flight:
-            server.datagram_received(datagram.data, 0.0, source="client")
+            server.datagram_received(datagram.data, now, source="client")
         state_during_flight = server.state
         assert state_during_flight is ConnectionState.HANDSHAKING
         received = [e for e in server.take_events() if isinstance(e, StreamDataReceived)]
@@ -970,7 +974,7 @@ class TestZeroRtt:
         assert received[0].data == b"GET /early\r\n"
         assert received[0].end_stream
 
-        pump(client, server)
+        pump(client, server, now=now)
         assert client.state is ConnectionState.CONNECTED
         assert server.state is ConnectionState.CONNECTED
         assert isinstance(client.tls, TlsClient)
@@ -980,14 +984,14 @@ class TestZeroRtt:
         """RFC 9001 §4.6.2: a server that cannot use the ticket ignores
         the 0-RTT packets, and the client sends the same stream data
         again in 1-RTT once the full handshake completes."""
-        ticket = self._ticket(credentials)
+        ticket, now = self._ticket(credentials)
         client, server = make_resumption_pair(
             credentials, bytes(range(32, 64)), ticket, early_data=True
         )
-        client.connect(0.0)
+        client.connect(now)
         stream_id = client.open_stream()
         client.send_stream_data(stream_id, b"GET /early\r\n", end_stream=True)
-        pump(client, server)
+        pump(client, server, now=now)
 
         assert client.state is ConnectionState.CONNECTED
         assert server.state is ConnectionState.CONNECTED

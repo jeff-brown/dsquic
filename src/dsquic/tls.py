@@ -37,9 +37,11 @@ server-side PSK selection (§4.2.9, §4.2.11), which extracts the PSK
 into the Early Secret (§7.1) and omits certificate authentication
 (§2.2); 0-RTT signaling (§4.2.10 as profiled by RFC 9001 §4.6.1):
 tickets permit early data, the client offers it alongside its PSK,
-and the server accepts only when the first identity is selected and
-the ALPN and transport parameters the ticket remembers are unchanged
-(RFC 9001 §7.4.1); and the NSS-format keylog callback. Unknown extensions are
+and the server accepts only when the first identity is selected, the
+ALPN and the limits the ticket remembers are unchanged (RFC 9001
+§7.4.1), and the claimed ticket age is fresh, which is the §8.3
+anti-replay a stateless server can do; and the NSS-format keylog
+callback. Unknown extensions are
 preserved on parse and ignored, never rejected (grease tolerance,
 RFC 8701).
 
@@ -84,6 +86,10 @@ TICKET_KEY_LENGTH = 32  # AES-256-GCM key that seals session tickets (§4.6.1)
 # RFC 9001 §4.6.1: the only max_early_data_size a QUIC ticket may carry,
 # since 0-RTT data is limited by transport flow control, not by TLS.
 MAX_EARLY_DATA_SIZE = 0xFFFFFFFF
+# §8.3 bounds the mismatch between claimed and actual ticket age by a
+# window covering RTT variation and modest clock skew, suggesting "on
+# the order of ten seconds".
+TICKET_AGE_TOLERANCE_MS = 10_000
 PSK_DHE_KE = 1  # §4.2.9: resumption with an ECDHE exchange
 SESSION_TICKET_LIFETIME = 7200  # seconds; §4.6.1 caps this at 7 days
 MESSAGE_HASH_TYPE = 254  # §4.4.1, the HelloRetryRequest transcript stand-in
@@ -1571,6 +1577,10 @@ class TlsServer(_Handshake):
                 decode_transport_parameters(selected[1].transport_parameters),
                 decode_transport_parameters(self._config.transport_parameters),
             )
+            # §8.3: the freshness check, the anti-replay mechanism a
+            # stateless ticket permits. Refusing here downgrades the
+            # replayed data to nothing while the PSK still resumes.
+            and self._ticket_is_fresh(hello, selected)
         )
         if selected is not None:
             self.schedule = KeySchedule(psk=selected[1].psk)
@@ -1579,6 +1589,27 @@ class TlsServer(_Handshake):
             self.early_secret = self.schedule.client_early_traffic_secret()
             self._keylog("CLIENT_EARLY_TRAFFIC_SECRET", self.early_secret)
         return selected
+
+    def _ticket_is_fresh(self, hello: ClientHello, selected: tuple[int, TicketState]) -> bool:
+        """§8.3: bound the gap between claimed and actual ticket age.
+
+        The client claims an age through obfuscated_ticket_age; the
+        sealed ticket carries when it was really issued. An attacker
+        replaying a captured ClientHello cannot recompute the claim for
+        the later arrival time, so a stale claim marks a replay (or a
+        first flight delayed longer than the tolerance) and the early
+        data is refused. This is the only §8 mechanism that keeps the
+        server stateless; what it concedes is replay inside the window,
+        which is why only idempotent data belongs in 0-RTT (RFC 9001
+        §9.2).
+        """
+        offer = _find_extension(hello.extensions, ExtensionType.PRE_SHARED_KEY)
+        assert offer is not None  # selected implies an offer was parsed
+        identities, _ = parse_offered_psks(offer)
+        index, state = selected
+        claimed_ms = (identities[index].obfuscated_ticket_age - state.age_add) % 2**32
+        actual_ms = (self._now - state.issued_at) * 1000
+        return abs(actual_ms - claimed_ms) <= TICKET_AGE_TOLERANCE_MS
 
     def _on_client_hello(self, hello: ClientHello, raw: bytes) -> None:
         if TLS_AES_128_GCM_SHA256 not in hello.cipher_suites:

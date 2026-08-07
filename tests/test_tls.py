@@ -1241,6 +1241,44 @@ def test_early_data_is_refused_when_limits_shrink(credentials: Credentials) -> N
     assert not client.early_data_accepted
 
 
+def test_a_replayed_offer_outside_the_window_is_refused(credentials: Credentials) -> None:
+    """RFC 8446 §8.3: obfuscated_ticket_age claims when the hello was
+    built, and a replay cannot recompute the claim for its later
+    arrival. The same bytes are accepted inside the tolerance and
+    refused outside it, and refusal costs only the early data: the PSK
+    still resumes."""
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    client = make_resuming_client(credentials, ticket, early_data=True)
+    client.start(0.0)
+    hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
+
+    prompt_server = make_server(credentials, ticket_key=key)
+    prompt_server.receive(EncryptionLevel.INITIAL, hello, 5.0)
+    assert prompt_server.resumed
+    assert prompt_server.early_data_accepted
+
+    replay_server = make_server(credentials, ticket_key=key)
+    replay_server.receive(EncryptionLevel.INITIAL, hello, 30.0)
+    assert replay_server.resumed
+    assert not replay_server.early_data_accepted
+
+
+def test_a_stale_age_claim_refuses_early_data(credentials: Credentials) -> None:
+    """§8.3 from the other side: a client whose claim says the ticket
+    is 30 seconds old when it was issued moments ago is refused early
+    data, while the resumption itself still stands."""
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    lying = make_resuming_client(credentials, replace(ticket, received_at=-30.0), early_data=True)
+    server = make_server(credentials, ticket_key=key)
+    pump(lying, server)
+    assert server.resumed
+    assert not server.early_data_accepted
+    assert lying.state is ClientState.CONNECTED
+    assert not lying.early_data_accepted
+
+
 def test_a_ticket_with_any_other_early_data_limit_aborts(credentials: Credentials) -> None:
     """RFC 9001 §4.6.1: 0xffffffff is the only legal value, since flow
     control, not TLS, limits 0-RTT data in QUIC."""
