@@ -789,3 +789,44 @@ def test_no_ticket_without_a_ticket_key(credentials: Credentials) -> None:
     client = make_client(credentials)
     pump(client, make_server(credentials))
     assert client.session_tickets == []
+
+
+def test_a_client_offers_a_ticket_with_a_verifiable_binder(credentials: Credentials) -> None:
+    """RFC 8446 §4.2.11: the offer carries a binder proving the client
+    holds the PSK, computed over the ClientHello up to the binder.
+
+    Checked the way a server checks it: re-derive from the ticket's PSK
+    over the truncated message and compare.
+    """
+    key = bytes(range(32))
+    first = make_client(credentials)
+    pump(first, make_server(credentials, ticket_key=key))
+    ticket = first.session_tickets[0]
+
+    resuming = TlsClient(
+        ClientConfig(
+            server_name="localhost",
+            alpn=["hq-interop"],
+            transport_parameters=b"client-params",
+            ca_certificates=credentials.ca,
+            verification_time=VERIFICATION_TIME,
+            session_ticket=ticket,
+        )
+    )
+    resuming.start()
+    sent = [e for e in resuming.take_events() if isinstance(e, SendData)]
+    hello = sent[0].data
+
+    message, _ = parse_handshake_message(hello)
+    assert isinstance(message, ClientHello)
+    # §4.2.11: pre_shared_key is the last extension, since the binder
+    # covers everything before it.
+    assert message.extensions[-1].type == ExtensionType.PRE_SHARED_KEY
+    identities, binders = parse_offered_psks(message.extensions[-1].data)
+    assert identities[0].identity == ticket.identity
+
+    expected = finished_verify_data(
+        KeySchedule(psk=ticket.psk).binder_key(),
+        hashlib.sha256(binder_transcript(hello)).digest(),
+    )
+    assert binders == [expected]

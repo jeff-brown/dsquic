@@ -71,6 +71,7 @@ ECDSA_SECP256R1_SHA256 = 0x0403
 
 TICKET_NONCE_LENGTH = 12  # AES-GCM nonce for a sealed ticket
 TICKET_KEY_LENGTH = 32
+PSK_DHE_KE = 1  # §4.2.9: resumption with an ECDHE exchange
 SESSION_TICKET_LIFETIME = 7200  # seconds; §4.6.1 caps this at 7 days
 MESSAGE_HASH_TYPE = 254  # §4.4.1, the HelloRetryRequest transcript stand-in
 SUPPORTED_GROUPS = [X25519_GROUP]  # groups this implementation can key with
@@ -713,6 +714,9 @@ class ClientConfig:
     # the ClientHello small, accepting a HelloRetryRequest round trip in
     # exchange; an empty list does that for every group.
     key_share_groups: list[int] | None = None
+    # §4.6.1: a ticket kept from an earlier connection to this server.
+    # None means offer no PSK, which is an ordinary full handshake.
+    session_ticket: "SessionTicket | None" = None
 
     def __post_init__(self) -> None:
         if not self.insecure_skip_verify and not self.ca_certificates:
@@ -988,6 +992,11 @@ class TlsClient(_Handshake):
         # §4.6.1: tickets arrive after the handshake, so a caller reads
         # them once the connection is up and keeps them for next time.
         self.session_tickets: list[SessionTicket] = []
+        if config.session_ticket is not None:
+            # §7.1: resuming extracts the PSK into the Early Secret, and
+            # the binder is derived from it, so the schedule has to carry
+            # the PSK before the ClientHello is built.
+            self.schedule = KeySchedule(psk=config.session_ticket.psk)
         self._random = random if random is not None else os.urandom(32)
         self._client_random = self._random
         share_groups = (
@@ -1035,15 +1044,56 @@ class TlsClient(_Handshake):
                 Extension(
                     ExtensionType.QUIC_TRANSPORT_PARAMETERS, self._config.transport_parameters
                 ),
+                *(
+                    self._psk_extensions(self._config.session_ticket)
+                    if self._config.session_ticket is not None
+                    else []
+                ),
             ],
         )
 
     def start(self) -> None:
         """Send the ClientHello at the Initial level."""
         raw = encode_client_hello(self._build_client_hello())
+        if self._config.session_ticket is not None:
+            raw = self._fill_psk_binder(raw)
         self.schedule.update_transcript(raw)
         self.events.append(SendData(EncryptionLevel.INITIAL, raw))
         self.state = ClientState.WAIT_SERVER_HELLO
+
+    def _psk_extensions(self, ticket: SessionTicket) -> list[Extension]:
+        """§4.2.9 and §4.2.11: offer a ticket, with a placeholder binder.
+
+        pre_shared_key is last because the binder covers everything
+        before it, so nothing may follow. The binder is written over the
+        placeholder once the message is encoded, since it is a MAC of
+        those very bytes.
+        """
+        age = int((self._now - ticket.received_at) * 1000) + ticket.age_add
+        return [
+            # psk_dhe_ke: resumption still does an ECDHE exchange, so the
+            # new connection has forward secrecy of its own.
+            Extension(ExtensionType.PSK_KEY_EXCHANGE_MODES, _vec(1, bytes([PSK_DHE_KE]))),
+            Extension(
+                ExtensionType.PRE_SHARED_KEY,
+                encode_offered_psks(
+                    [PskIdentity(identity=ticket.identity, obfuscated_ticket_age=age % 2**32)],
+                    [bytes(SHA256_LENGTH)],
+                ),
+            ),
+        ]
+
+    def _fill_psk_binder(self, raw: bytes) -> bytes:
+        """§4.2.11.2: replace the placeholder binder with the real one.
+
+        The message is encoded first and patched, rather than encoded
+        short and extended: the length field the binder covers counts
+        the binder, so a shorter encoding would authenticate different
+        bytes than the ones sent.
+        """
+        binder = finished_verify_data(self.schedule.binder_key(), _sha256(binder_transcript(raw)))
+        assert len(binder) == SHA256_LENGTH
+        return raw[: -len(binder)] + binder
 
     def _on_hello_retry_request(self, hello: ServerHello, raw: bytes) -> None:
         """Generate the requested key share and send a second ClientHello.
@@ -1211,9 +1261,6 @@ class TlsServer(_Handshake):
     ) -> None:
         super().__init__(keylog)
         self._config = config
-        # §4.6.1: tickets arrive after the handshake, so a caller reads
-        # them once the connection is up and keeps them for next time.
-        self.session_tickets: list[SessionTicket] = []
         self._random = random if random is not None else os.urandom(32)
         self._key = key if key is not None else X25519PrivateKey.generate()
         self._hello_retry_sent = False

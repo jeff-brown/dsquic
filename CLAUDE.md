@@ -165,7 +165,8 @@ it exists to teach QUIC.
   index of pointers: rationale in `docs/design.md`, current status in
   `STATE.md`, RFC mapping in module docstrings. When working, search for and
   read only the modules and tests relevant to the task; do not load the whole
-  tree. As the project grows, split documentation into focused, descriptively
+  tree. Defects found and the investigations behind them live in
+  `docs/findings.md`, not in `STATE.md`, which carries current state only. As the project grows, split documentation into focused, descriptively
   named files under `docs/` and reference them here so they can be retrieved
   on demand instead of held in context.
 
