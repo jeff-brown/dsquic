@@ -79,6 +79,7 @@ from dsquic.protection import (
 )
 from dsquic.qlog import QlogTrace
 from dsquic.recovery import AckOfUnsentPacket, LossDetection, SentPacket
+from dsquic.retry import RetryContext, is_retry, parse_retry
 from dsquic.streams import (
     FlowControlLimits,
     RangeSet,
@@ -270,6 +271,9 @@ class ConnectionConfig:
     # None never to initiate. Whether to update is protocol; how often
     # is policy, so it is configured rather than decided here.
     key_update_interval: int | None = None
+    # Set by a server that answered this connection's first Initial with
+    # a Retry (§8.1.2); None on every other connection.
+    retry: RetryContext | None = None
     keylog: Callable[[str], None] | None = None
     # Opens a trace, given the group ID, the role, and the reference
     # clock reading. A factory because a server learns the group ID from
@@ -305,6 +309,15 @@ class Connection:
         self._initial_dcid = self.peer_cid  # §7.3: fixes the Initial keys
         self._server_config = server_config
 
+        # §17.2.5: the token a client attaches to later Initials, the
+        # Retry's source CID, and, for a server that sent a Retry, the
+        # original destination CID recovered from the token (§8.1.2).
+        # Set before the parameters are built, which reads them.
+        self._retry_token = b""
+        self._retry_source_cid = self.config.retry.source_cid if self.config.retry else None
+        self._original_dcid = (
+            self.config.retry.original_destination_cid if self.config.retry else None
+        )
         self._local_parameters = self._parameters_for(self._initial_dcid)
         self.peer_parameters: TransportParameters | None = None
 
@@ -330,6 +343,9 @@ class Connection:
         # because a probe must go out at the level whose timer expired.
         self._probes_pending: dict[EncryptionLevel, int] = dict.fromkeys(EncryptionLevel, 0)
         self._handshake_done_pending = False
+        # §17.2.5: a client attaches the Retry's token to every later
+        # Initial and remembers the Retry's source CID, which §7.3 makes
+        # the server echo. Empty until a Retry arrives.
         # Pacer state (§7.7): bytes of credit, when it was last filled,
         # and when it will next hold enough for a datagram.
         self._pacing_credit = 0.0
@@ -557,6 +573,9 @@ class Connection:
             # §17.3: a short header packet runs to the end of the datagram.
             pn_offset = parse_short_header(data, len(self.host_cid)).pn_offset
             return EncryptionLevel.ONE_RTT, pn_offset, data, len(data)
+        if self.is_client and is_retry(data):
+            self._handle_retry(data, now)
+            return None
         long_header = parse_long_header(data)
         level = {
             PacketType.INITIAL: EncryptionLevel.INITIAL,
@@ -574,6 +593,42 @@ class Connection:
             self._peer_cid_confirmed = True
         packet_end = long_header.pn_offset + long_header.length
         return level, long_header.pn_offset, data[:packet_end], packet_end
+
+    def _handle_retry(self, data: bytes, now: float) -> None:
+        """§17.2.5.2: start the handshake again with the server's token.
+
+        At most one Retry is accepted per connection attempt, and none
+        once the server has sent a packet the client could read: both
+        would otherwise let an off-path attacker restart a handshake at
+        will. A Retry whose integrity tag fails is discarded, which is
+        the check that makes the token unforgeable (RFC 9001 §5.8).
+        """
+        if self._retry_token or self._peer_cid_confirmed:
+            self._drop(now, qlog.DROP_UNSUPPORTED, len(data))
+            return
+        try:
+            packet = parse_retry(data, self._initial_dcid)
+        except (HeaderParseError, BufferReadError, UnsupportedVersion):
+            self._drop(now, qlog.DROP_INVALID, len(data))
+            return
+        if not packet.token:
+            self._drop(now, qlog.DROP_INVALID, len(data))  # §17.2.5.2: empty is invalid
+            return
+        self._retry_token = packet.token
+        self._retry_source_cid = packet.source_cid
+        self.peer_cid = packet.source_cid
+        # RFC 9001 §5.2: Initial keys follow the Destination Connection
+        # ID, which the Retry has just changed.
+        self._install_initial_keys(packet.source_cid)
+        # §17.2.5.3: packet numbers do not reset, so the first flight is
+        # resent under new numbers. Its old packets can never be
+        # acknowledged, since the server now holds different Initial keys.
+        space = self._spaces[EncryptionLevel.INITIAL]
+        for sent in self.recovery.restart_space(EncryptionLevel.INITIAL):
+            for frame in sent.frames:
+                if isinstance(frame, Crypto):
+                    space.crypto_retransmit.append(frame)
+        self._log(now, qlog.PACKET_RECEIVED, {"header": {"packet_type": "retry"}})
 
     # --- qlog ------------------------------------------------------------------
 
@@ -683,13 +738,23 @@ class Connection:
 
     def _parameters_for(self, initial_dcid: bytes) -> TransportParameters:
         """Our transport parameters, including the §7.3 connection ID
-        authentication fields."""
+        authentication fields.
+
+        After a Retry the client's Initial names the connection ID the
+        Retry chose, so the original one comes from the token instead;
+        §7.3 has the server echo both.
+        """
         parameters = replace(
             self.config.transport_parameters, initial_source_connection_id=self.host_cid
         )
         if self.is_client:
             return parameters
-        return replace(parameters, original_destination_connection_id=initial_dcid)
+        original = self._original_dcid if self._original_dcid is not None else initial_dcid
+        return replace(
+            parameters,
+            original_destination_connection_id=original,
+            retry_source_connection_id=self._retry_source_cid,
+        )
 
     def _adopt_client_initial(self, dcid: bytes, scid: bytes) -> None:
         """A server learns both connection IDs from the client's first
@@ -1008,6 +1073,16 @@ class Connection:
                     frames.TRANSPORT_PARAMETER_ERROR,
                     "original_destination_connection_id mismatch",
                 )
+            # §7.3: after a Retry the server echoes the connection ID it
+            # chose there, and a client that saw no Retry must see no
+            # such parameter. Without both checks an attacker who can
+            # inject a Retry could steer the client to itself.
+            retry_source = self.peer_parameters.retry_source_connection_id
+            if retry_source != self._retry_source_cid:
+                raise ConnectionError_(
+                    frames.TRANSPORT_PARAMETER_ERROR,
+                    "retry_source_connection_id mismatch",
+                )
 
     def _confirm_handshake(self, now: float) -> None:
         """§4.9.2: confirmation discards Handshake keys and enables the
@@ -1312,6 +1387,7 @@ class Connection:
                 version=QUIC_V1,
                 destination_cid=self.peer_cid,
                 source_cid=self.host_cid,
+                token=self._retry_token if level is EncryptionLevel.INITIAL else b"",
             )
             if pad_datagram_to:
                 # The Length varint is the same width for the padded and
@@ -1426,6 +1502,7 @@ class Connection:
                     LongHeaderTemplate(
                         packet_type=LEVEL_TO_PACKET_TYPE[level],
                         version=QUIC_V1,
+                        token=self._retry_token if level is EncryptionLevel.INITIAL else b"",
                         destination_cid=self.peer_cid,
                         source_cid=self.host_cid,
                     ),

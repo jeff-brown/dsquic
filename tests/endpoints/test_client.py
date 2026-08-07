@@ -19,7 +19,7 @@ from conftest import PemCredentials
 from dsquic import hq
 from dsquic.endpoints import load_pem_certificates
 from dsquic.endpoints.client import ClientOptions, fetch, fetch_each
-from dsquic.endpoints.server import Server, load_credentials
+from dsquic.endpoints.server import Server, ServerOptions, load_credentials
 from dsquic.tls import ServerConfig
 
 INDEX_BODY = b"<html>hello from dsquic over real UDP</html>"
@@ -41,6 +41,7 @@ def running_server(
     document_root: Path,
     connection_limit: int,
     family: socket.AddressFamily = socket.AF_INET,
+    retry: bool = False,
 ) -> Generator[tuple[int, Server], None, None]:
     """A dsquic server on a loopback port, serving a fixed number of
     connections and then exiting. Yields the port and the server, whose
@@ -56,7 +57,12 @@ def running_server(
     port = sock.getsockname()[1]
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
-    running = Server(sock, selector, server_config, document_root, idle_timeout=5.0)
+    running = Server(
+        sock,
+        selector,
+        server_config,
+        ServerOptions(document_root=document_root, idle_timeout=5.0, retry=retry),
+    )
 
     thread = threading.Thread(
         target=lambda: running.serve(connection_limit=connection_limit), daemon=True
@@ -101,6 +107,28 @@ def test_loopback_transfer(credentials: PemCredentials, server: int) -> None:
     bodies = fetch(
         host="127.0.0.1",
         port=server,
+        paths=["/index.html"],
+        options=ClientOptions(
+            ca_certificates=load_pem_certificates(credentials.ca_pem),
+            server_name="localhost",
+        ),
+    )
+    assert bodies == {"/index.html": INDEX_BODY}
+
+
+@pytest.fixture
+def retry_server(credentials: PemCredentials, document_root: Path) -> Iterator[int]:
+    """A server that validates addresses with a Retry (§8.1.2)."""
+    with running_server(credentials, document_root, connection_limit=1, retry=True) as (port, _):
+        yield port
+
+
+def test_loopback_transfer_through_a_retry(credentials: PemCredentials, retry_server: int) -> None:
+    """RFC 9000 §8.1.2 end to end: the server answers the first Initial
+    with a Retry, and the client repeats its handshake with the token."""
+    bodies = fetch(
+        host="127.0.0.1",
+        port=retry_server,
         paths=["/index.html"],
         options=ClientOptions(
             ca_certificates=load_pem_certificates(credentials.ca_pem),

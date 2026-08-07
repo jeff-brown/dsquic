@@ -347,6 +347,23 @@ class LossDetection:
         )
         return TimeoutOutcome(lost=[], probe_level=level)
 
+    def restart_space(self, level: EncryptionLevel) -> list[SentPacket]:
+        """RFC 9000 §17.2.5.3: a Retry changes the Initial keys, so what
+        was already sent can never be acknowledged.
+
+        The packets leave the space with no congestion signal, as in
+        §6.4, but the space stays usable: the client sends its first
+        flight again, under packet numbers that continue rather than
+        reset. Returns what was dropped so the caller can resend it.
+        """
+        space = self._spaces[level]
+        sent = list(space.sent.values())
+        self.controller.on_packets_discarded([packet for packet in sent if packet.in_flight])
+        space.sent.clear()
+        space.loss_time = None
+        self._pto_count = 0
+        return sent
+
     def discard_space(self, level: EncryptionLevel) -> None:
         """Keys were discarded (§6.4): forget the space's packets with no
         congestion signal, and reset the PTO backoff (A.11)."""

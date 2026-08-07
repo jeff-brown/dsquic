@@ -24,7 +24,7 @@ set -e
 # and handshakecorruption cases: one connection per file rather than one
 # connection carrying every request.
 #
-SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate"
+SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate retry"
 
 case " $SUPPORTED " in
     *" $TESTCASE "*) ;;
@@ -95,7 +95,16 @@ if [ "$ROLE" == "client" ]; then
         $MODE
 else
     echo "dsquic server: $TESTCASE, serving /www on port 443" >&2
+    if [ "$TESTCASE" == "retry" ]; then
+        # §8.1.2: the case requires the server to validate the client
+        # address with a Retry before committing state.
+        SERVER_MODE="--retry"
+    else
+        SERVER_MODE=""
+    fi
+    # shellcheck disable=SC2086
     exec python -m dsquic.endpoints.server \
+        $SERVER_MODE \
         --host :: \
         --port 443 \
         --certificate /certs/cert.pem \

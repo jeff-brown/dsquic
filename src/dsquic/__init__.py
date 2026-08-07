@@ -14,6 +14,8 @@ Module map (each module docstring cites the RFC sections it implements):
     connection  - connection state machine (RFC 9000 §5, §7, §10)
     tls         - TLS 1.3 handshake, scoped to QUIC (RFC 8446)
     protection  - packet protection: keys, AEAD, header protection (RFC 9001)
+    retry       - Retry packets and address validation tokens
+                  (RFC 9000 §8.1, §17.2.5)
     recovery    - loss detection, RTT, PTO (RFC 9002 §5-§6)
     congestion  - congestion controller interface (RFC 9002 §7)
     new_reno    - NewReno congestion controller (RFC 9002 §7, Appendix B)

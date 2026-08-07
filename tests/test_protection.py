@@ -3,8 +3,6 @@
 import pytest
 from cryptography.exceptions import InvalidTag
 
-from dsquic import protection
-from dsquic.packet import HeaderParseError
 from dsquic.protection import (
     KEY_PHASE_BIT,
     PacketKeys,
@@ -210,55 +208,3 @@ def test_key_phase_bit_survives_header_protection(key_phase: bool) -> None:
     assert unprotected.key_phase is key_phase
     assert unprotected.packet_number == 1
     assert decrypt_payload(SERVER_KEYS, unprotected) == b"\x01" * 32
-
-
-class TestRetry:
-    """RFC 9001 §5.8 and RFC 9000 §17.2.5."""
-
-    # RFC 9001 A.4: a Retry answering the Initial of A.2. The original
-    # destination connection ID is covered by the tag and absent from
-    # the wire.
-    PACKET = bytes.fromhex(
-        "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba"
-    )
-    ORIGINAL_DESTINATION_CID = bytes.fromhex("8394c8f03e515708")
-
-    def test_integrity_tag_matches_the_spec_vector(self) -> None:
-        tag = protection.retry_integrity_tag(
-            self.ORIGINAL_DESTINATION_CID, self.PACKET[: -protection.AEAD_TAG_LENGTH]
-        )
-        assert tag == self.PACKET[-protection.AEAD_TAG_LENGTH :]
-
-    def test_parses_the_spec_vector(self) -> None:
-        retry = protection.parse_retry(self.PACKET, self.ORIGINAL_DESTINATION_CID)
-        assert retry.destination_cid == b""
-        assert retry.source_cid == bytes.fromhex("f067a5502a4262b5")
-        assert retry.token == b"token"
-
-    def test_builds_the_spec_vector(self) -> None:
-        """Byte for byte apart from the first, whose low four bits are
-        the Unused field of §17.2.5: the server sets them to an arbitrary
-        value and a client ignores them. The vector has them set; this
-        implementation leaves them clear, so the tag differs too, since
-        the first byte is covered by it."""
-        built = protection.build_retry(
-            destination_cid=b"",
-            source_cid=bytes.fromhex("f067a5502a4262b5"),
-            token=b"token",
-            original_destination_cid=self.ORIGINAL_DESTINATION_CID,
-        )
-        assert built[0] & 0xF0 == self.PACKET[0] & 0xF0
-        assert built[1:-16] == self.PACKET[1:-16]
-        assert protection.parse_retry(built, self.ORIGINAL_DESTINATION_CID).token == b"token"
-
-    def test_a_wrong_original_cid_fails_the_tag(self) -> None:
-        """§17.2.5.2: a client MUST discard a Retry whose tag does not
-        verify, which is what an off-path injection looks like."""
-        with pytest.raises(HeaderParseError, match="integrity tag"):
-            protection.parse_retry(self.PACKET, b"\x00" * 8)
-
-    def test_a_corrupted_token_fails_the_tag(self) -> None:
-        corrupted = bytearray(self.PACKET)
-        corrupted[16] ^= 0x01
-        with pytest.raises(HeaderParseError, match="integrity tag"):
-            protection.parse_retry(bytes(corrupted), self.ORIGINAL_DESTINATION_CID)

@@ -18,24 +18,12 @@ MVP cipher: AES-128-GCM with SHA-256 (TLS_AES_128_GCM_SHA256), which is
 also what Initial packets always use (§5.2).
 """
 
-import hmac
 from dataclasses import dataclass, replace
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from dsquic.buffer import Buffer
-from dsquic.packet import (
-    FIXED_BIT,
-    HEADER_FORM_LONG,
-    MAX_CID_LENGTH,
-    QUIC_V1,
-    HeaderParseError,
-    PacketType,
-    Retry,
-    UnsupportedVersion,
-    decode_packet_number,
-)
+from dsquic.packet import HEADER_FORM_LONG, decode_packet_number
 from dsquic.tls import SHA256_LENGTH, hkdf_expand_label, hkdf_extract
 
 INITIAL_SALT_V1 = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")  # §5.2
@@ -216,53 +204,3 @@ def retry_integrity_tag(original_destination_cid: bytes, retry_without_tag: byte
     """
     pseudo = bytes([len(original_destination_cid)]) + original_destination_cid + retry_without_tag
     return AESGCM(RETRY_INTEGRITY_KEY).encrypt(RETRY_INTEGRITY_NONCE, b"", pseudo)
-
-
-def parse_retry(data: bytes, original_destination_cid: bytes) -> Retry:
-    """Parse and authenticate a Retry packet (RFC 9000 §17.2.5).
-
-    §17.2.5.2: a client MUST discard a Retry whose Retry Integrity Tag
-    does not verify. That is what stops an off-path attacker injecting
-    one: only an endpoint that saw the Initial knows the original
-    destination connection ID the tag covers.
-    """
-    if len(data) < AEAD_TAG_LENGTH:
-        raise HeaderParseError("Retry packet shorter than its integrity tag")
-    buf = Buffer(data)
-    first = buf.pull_uint8()
-    if not first & HEADER_FORM_LONG:
-        raise HeaderParseError("Retry packet without a long header")
-    version = buf.pull_uint32()
-    if version != QUIC_V1:
-        raise UnsupportedVersion(version)
-    if PacketType((first & 0x30) >> 4) is not PacketType.RETRY:
-        raise HeaderParseError("not a Retry packet")
-    destination_cid = buf.pull_bytes(buf.pull_uint8())
-    source_cid = buf.pull_bytes(buf.pull_uint8())
-    if len(destination_cid) > MAX_CID_LENGTH or len(source_cid) > MAX_CID_LENGTH:
-        raise HeaderParseError("connection ID longer than 20 bytes")
-    expected = retry_integrity_tag(original_destination_cid, data[:-AEAD_TAG_LENGTH])
-    if not hmac.compare_digest(data[-AEAD_TAG_LENGTH:], expected):
-        raise HeaderParseError("Retry integrity tag does not verify")
-    return Retry(
-        version=version,
-        destination_cid=destination_cid,
-        source_cid=source_cid,
-        token=data[buf.position : -AEAD_TAG_LENGTH],
-    )
-
-
-def build_retry(
-    *,
-    destination_cid: bytes,
-    source_cid: bytes,
-    token: bytes,
-    original_destination_cid: bytes,
-) -> bytes:
-    """Build a Retry packet with its integrity tag (RFC 9000 §17.2.5)."""
-    header = bytearray([HEADER_FORM_LONG | FIXED_BIT | (PacketType.RETRY.value << 4)])
-    header += QUIC_V1.to_bytes(4, "big")
-    header += bytes([len(destination_cid)]) + destination_cid
-    header += bytes([len(source_cid)]) + source_cid
-    header += token
-    return bytes(header) + retry_integrity_tag(original_destination_cid, bytes(header))

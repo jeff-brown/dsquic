@@ -21,12 +21,12 @@ the open item recorded below.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  341 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  364 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
-  congestion, new_reno, hq, qlog, and the `endpoints/` subpackage (the
-  only I/O). Still docstring stubs: h3, qpack, masque.
+  congestion, new_reno, retry, hq, qlog, and the `endpoints/` subpackage
+  (the only I/O). Still docstring stubs: h3, qpack, masque.
 - `endpoints.server.Server` serves many connections over one socket,
   routing by Destination Connection ID via
   `packet.destination_connection_id` (RFC 8999 §5.1, version
@@ -196,6 +196,57 @@ Two cautions about reading any of this:
   that lose *handshake* packets. `endpoints.client.fetch_each` provides
   that, bounding the whole run rather than each connection so one slow
   handshake cannot spend a budget the remaining files still need.
+
+## Retry (2026-08-06)
+
+`retry` passes in both roles against quic-go, aioquic, picoquic and
+quiche, `✓(S)` in every column. `retry.py` carries the Retry packet
+(§17.2.5) and the address validation tokens (§8.1.2-§8.1.4); the Retry
+Integrity Tag is RFC 9001 §5.8 and stays in `protection.py`. The design
+rationale, including why the core never sees an address, is in the
+design.md appendix.
+
+The client accepts at most one Retry per attempt and none once the
+server has sent a readable packet (§17.2.5.2), re-derives its Initial
+keys from the Retry's source connection ID (RFC 9001 §5.2), keeps its
+packet numbers running (§17.2.5.3), and checks
+`retry_source_connection_id` against the Retry it saw, or against its
+absence when it saw none (§7.3). The server mints a token binding the
+client address and the original destination connection ID, keeps no
+state, and recovers both from the token when the retried Initial
+arrives. `endpoints.server.ServerOptions.retry` turns it on;
+`--retry` on the reference server, and the shim passes it for this case.
+
+Only Retry tokens exist. NEW_TOKEN (§8.1.3) is parsed and ignored: the
+token format carries a kind byte so the two can be told apart, which
+§8.1.4 requires because Retry tokens are validated more strictly, but
+nothing issues or stores one yet. It belongs with resumption and 0-RTT,
+which is what §8.1.3 exists to serve.
+
+Three things this cost, all worth recording.
+
+The RFC 9001 A.4 vector is reproduced exactly apart from the first byte's
+low four bits, which §17.2.5 defines as Unused and a client ignores;
+matching the vector there would mean copying a value the spec says
+carries no meaning.
+
+The first interop run failed as server against all four peers because
+address validation ran *before* Version Negotiation, so the simulator's
+readiness probe, which offers an unknown version precisely to elicit a VN
+packet, was read as a v1 Initial and dropped. VN comes first, ahead of
+everything, for the second time in this project's history.
+
+A token that does not validate now draws a Retry rather than a dropped
+packet, per §8.1.3: "the server SHOULD proceed as if the client did not
+have a validated address, including potentially sending a Retry packet",
+whose note gives the reason as a client holding a NEW_TOKEN token. It is
+reachable without NEW_TOKEN existing at all, because the key that
+authenticates these tokens is generated per process: a client that
+reconnects across a server restart presents one this server cannot check,
+and discarding it left that client hanging until its idle timer. The test
+covering it runs the same crafted Initial against a server with address
+validation on and off, so what it pins is the policy rather than some
+unconditional reply.
 
 ## Connection stalls under handshake loss (2026-08-06)
 
@@ -383,10 +434,11 @@ case, the same figure quic-go's interop client uses.
 
 ## In-flight work
 
-`origin/main` is at 9e90e1f, "Pace sending per RFC 9002 §7.7; exempt
-ACK-only packets from the window". Staged and awaiting commit: the three
-client-side handshake-loss defects, `acked_ranges` in the qlog, IPv6 in
-both endpoints, and the client-side key update policy.
+`origin/main` is at d01af35, "Add Retry packet parsing and integrity tag
+(RFC 9001 §5.8)". Staged and awaiting commit: Retry itself, both roles,
+including the address validation tokens in `retry.py`, the client and
+server halves in `connection.py` and `endpoints/server.py`,
+`retry_source_connection_id`, and `ServerOptions`.
 
 ## What interop and the wire found that self-testing did not
 
@@ -531,17 +583,18 @@ And the one that mattered most, also found this way:
 
 ## Next steps
 
-1. **The roadmap past the MVP** (design.md §6.1), in order: retry,
-   resumption, http3, ecn, zerortt. Each climbs all three
-   rungs of the ladder (design.md §6.2). `http3` is the largest and the
-   one that unblocks MASQUE, since `h3.py` is still a stub and carries
-   the last open MASQUE readiness constraint.
-2. **Re-run the full case list.** Pacing changed the send path for every
-   case and only a subset has been re-run since; the loss cases, the
-   server role, and `blackhole`, `longrtt` and `amplificationlimit` are
-   unverified against the current build.
-3. **Broaden the runner matrix.** Three implementations are exercised
-   locally out of the 17 registered; each additional one is a `docker
+1. **Finish the QUIC protocol work before starting HTTP/3.** Remaining
+   runner cases: `resumption`, `zerortt`, `ecn`, `chacha20`,
+   `connectionmigration`, and `versionnegotiation`, where dsquic sends
+   VN but a client does not react to receiving one by retrying with a
+   supported version. `resumption` is the natural next one: it needs
+   session tickets in `tls.py` and is the prerequisite for `zerortt`,
+   which in turn is what makes NEW_TOKEN (§8.1.3) worth having.
+2. **HTTP/3 after that** (design.md §6.1). The largest piece and the one
+   that unblocks MASQUE, since `h3.py` is a stub and carries the last
+   open MASQUE readiness constraint.
+3. **Broaden the runner matrix.** Four implementations are exercised
+   locally out of the 18 registered; each additional one is a `docker
    pull` and a row in the run. Submitting dsquic upstream additionally
    needs a linux/amd64 image, since the hosted runner builds for that
    architecture.

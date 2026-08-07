@@ -13,8 +13,15 @@ from conftest import INDEX_BODY, LARGE_BODY, PemCredentials
 from dsquic import hq
 from dsquic.endpoints import load_pem_certificates
 from dsquic.endpoints.client import ClientOptions, fetch
-from dsquic.endpoints.server import Server, load_credentials, resolve
-from dsquic.packet import destination_connection_id
+from dsquic.endpoints.server import Server, ServerOptions, load_credentials, resolve
+from dsquic.packet import (
+    QUIC_V1,
+    LongHeaderTemplate,
+    PacketType,
+    build_long_header,
+    destination_connection_id,
+)
+from dsquic.retry import is_retry
 from dsquic.tls import ServerConfig
 
 
@@ -97,7 +104,9 @@ def running_server(
     port = sock.getsockname()[1]
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
-    server = Server(sock, selector, config, document_root, idle_timeout=10.0)
+    server = Server(
+        sock, selector, config, ServerOptions(document_root=document_root, idle_timeout=10.0)
+    )
 
     stop = threading.Event()
 
@@ -112,6 +121,87 @@ def running_server(
     finally:
         stop.set()
         thread.join(timeout=10)
+        selector.close()
+        sock.close()
+
+
+@pytest.mark.parametrize("retry", [True, False])
+def test_an_unusable_token_gets_a_retry_not_silence(
+    credentials: PemCredentials, tmp_path: Path, retry: bool
+) -> None:
+    """RFC 9000 §8.1.3: an Initial whose token does not validate leaves
+    the client unvalidated rather than unheard, "including potentially
+    sending a Retry packet".
+
+    Reachable without NEW_TOKEN ever being implemented: the key that
+    authenticates Retry tokens is generated per process, so a client that
+    reconnects with a token issued before a restart presents one this
+    server cannot check. Discarding it would hang that client until its
+    idle timer.
+    """
+    chain, key = load_credentials(credentials.certificate_pem, credentials.private_key_pem)
+    config = ServerConfig(
+        certificate_chain=chain, signing_key=key, alpn=[hq.ALPN], transport_parameters=b""
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.setblocking(False)
+    port = sock.getsockname()[1]
+    selector = selectors.DefaultSelector()
+    selector.register(sock, selectors.EVENT_READ)
+    server = Server(
+        sock,
+        selector,
+        config,
+        # Short, because poll() blocks until its next deadline: with a
+        # long one, a server that correctly stays silent would hang this
+        # test rather than fail it.
+        ServerOptions(document_root=tmp_path, idle_timeout=0.05, retry=retry),
+    )
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Short, because the failure this guards against is silence:
+    # a long timeout would make a broken server hang the suite
+    # rather than fail it.
+    client.settimeout(0.05)
+    destination_cid = bytes(range(8))
+    template = LongHeaderTemplate(
+        packet_type=PacketType.INITIAL,
+        version=QUIC_V1,
+        destination_cid=destination_cid,
+        source_cid=b"\x09" * 8,
+        token=b"a token from some earlier connection",
+    )
+    # §14.1: a client Initial datagram is at least 1200 bytes. The
+    # payload is never decrypted here: address validation reads only the
+    # header, and answers before any key is involved.
+    payload = b"\x00" * 1100
+    initial = (
+        build_long_header(
+            template, payload_length=len(payload), packet_number=0, packet_number_length=1
+        )
+        + payload
+    )
+    try:
+        client.sendto(initial, ("127.0.0.1", port))
+        answer = None
+        for _ in range(20):
+            server.poll()
+            try:
+                answer, _ = client.recvfrom(2048)
+            except TimeoutError:
+                continue
+            break
+        if retry:
+            assert answer is not None, "the server never answered"
+            assert is_retry(answer)
+        else:
+            # The same datagram, with address validation off, draws no
+            # Retry: what the assertion above tests is the policy, not
+            # some unconditional reply.
+            assert answer is None
+    finally:
+        client.close()
         selector.close()
         sock.close()
 

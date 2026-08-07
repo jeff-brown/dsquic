@@ -18,9 +18,11 @@ Run with: python -m dsquic.endpoints.server
 """
 
 import argparse
+import os
 import selectors
 import socket
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -44,10 +46,34 @@ from dsquic.endpoints import (
 )
 from dsquic.packet import (
     HEADER_FORM_LONG,
+    HeaderParseError,
+    LongHeader,
+    PacketType,
+    UnsupportedVersion,
     destination_connection_id,
+    parse_long_header,
     version_negotiation_response,
 )
+from dsquic.retry import (
+    TOKEN_KEY_LENGTH,
+    RetryContext,
+    TokenError,
+    build_retry,
+    mint_token,
+    validate_token,
+)
 from dsquic.tls import ServerConfig, SigningKey
+
+TOKEN_LIFETIME = 60.0  # §8.1.4: how long a Retry token proves an address
+
+
+def _address_bytes(source: Address) -> bytes:
+    """A socket address as the bytes a token binds itself to.
+
+    The core never interprets an address, so choosing this encoding is
+    the endpoint's job (design.md §4.6).
+    """
+    return repr(source).encode()
 
 
 def load_credentials(certificate: Path, private_key: Path) -> tuple[list[bytes], SigningKey]:
@@ -81,6 +107,17 @@ class _Session:
         self.deadline = time.monotonic() + idle_timeout
 
 
+@dataclass(frozen=True)
+class ServerOptions:
+    """What the reference server serves, and how it treats new clients."""
+
+    document_root: Path
+    idle_timeout: float = 30.0
+    # §8.1.2: answer a new client's first Initial with a Retry, which
+    # validates its address before the server commits any state.
+    retry: bool = False
+
+
 class Server:
     """A dsquic server over one socket, serving many connections.
 
@@ -100,15 +137,18 @@ class Server:
         sock: socket.socket,
         selector: selectors.BaseSelector,
         server_config: ServerConfig,
-        document_root: Path,
-        idle_timeout: float = 30.0,
+        options: ServerOptions,
     ) -> None:
         self._sock = sock
         self._selector = selector
         self._server_config = server_config
-        self._document_root = document_root
-        self._idle_timeout = idle_timeout
+        self._document_root = options.document_root
+        self._idle_timeout = options.idle_timeout
         self._sessions: dict[bytes, _Session] = {}
+        # §8.1.2: the key that authenticates our own Retry tokens. It is
+        # ours alone and never leaves the process, so it is generated
+        # rather than configured. None means addresses are not validated.
+        self._retry_key = os.urandom(TOKEN_KEY_LENGTH) if options.retry else None
         self.connections_served = 0
 
     def serve(self, connection_limit: int | None = None) -> None:
@@ -147,8 +187,10 @@ class Server:
         session = self._sessions.get(cid)
         if session is None:
             # §6.1: a packet naming a version we do not speak is answered
-            # statelessly, before any connection exists. The simulator's
-            # readiness probe relies on this.
+            # statelessly, before any connection exists, and before any
+            # address validation: the simulator's readiness probe offers
+            # an unknown version precisely to elicit this, and reading it
+            # as a v1 Initial would drop it instead.
             negotiation = version_negotiation_response(data)
             if negotiation is not None:
                 if isinstance(source, tuple):
@@ -156,17 +198,80 @@ class Server:
                 return
             if not data[0] & HEADER_FORM_LONG:
                 return  # no state for this CID, and nothing to build it from
-            session = self._accept(cid)
+            accepted = None
+            if self._retry_key is not None:
+                accepted = self._validate_address(data, cid, source)
+                if accepted is None:
+                    return  # a Retry went out, or the token was no good
+            session = self._accept(cid, accepted)
         session.connection.datagram_received(data, time.monotonic(), source=source)
         session.deadline = time.monotonic() + self._idle_timeout
         # §7.2: the client will switch to the CID we chose, so index both.
         self._sessions.setdefault(session.connection.host_cid, session)
 
-    def _accept(self, cid: bytes) -> _Session:
+    def _validate_address(self, data: bytes, cid: bytes, source: Address) -> RetryContext | None:
+        """§8.1.2: answer an untokened Initial with a Retry, or check the
+        token on one that carries it.
+
+        Returns the context for a validated client, or None when the
+        datagram produced a Retry instead of a connection.
+        """
+        assert self._retry_key is not None
+        if not data or not data[0] & HEADER_FORM_LONG:
+            return None
+        try:
+            header = parse_long_header(data)
+        except (HeaderParseError, UnsupportedVersion):
+            return None
+        if header.packet_type is not PacketType.INITIAL:
+            return None
+        if not header.token:
+            self._send_retry(header, source)
+            return None
+        try:
+            original = validate_token(
+                self._retry_key,
+                header.token,
+                client_address=_address_bytes(source),
+                now=time.time(),
+                lifetime=TOKEN_LIFETIME,
+            )
+        except TokenError:
+            # §8.1.3: a token that does not validate leaves the client
+            # unvalidated rather than unheard, "including potentially
+            # sending a Retry packet". Discarding instead would strand a
+            # client holding a token this server cannot check: one from a
+            # NEW_TOKEN frame, or one issued before a restart, since the
+            # key that authenticates them lives only in this process.
+            self._send_retry(header, source)
+            return None
+        return RetryContext(original_destination_cid=original, source_cid=cid)
+
+    def _send_retry(self, header: LongHeader, source: Address) -> None:
+        """§8.1.2: send a Retry naming a fresh connection ID, and keep no
+        state; the token carries what the retried Initial will need."""
+        assert self._retry_key is not None
+        retry_cid = os.urandom(CONNECTION_ID_LENGTH)
+        token = mint_token(
+            self._retry_key,
+            original_destination_cid=header.destination_cid,
+            client_address=_address_bytes(source),
+            now=time.time(),
+        )
+        packet = build_retry(
+            destination_cid=header.source_cid,
+            source_cid=retry_cid,
+            token=token,
+            original_destination_cid=header.destination_cid,
+        )
+        if isinstance(source, tuple):
+            self._sock.sendto(packet, source)
+
+    def _accept(self, cid: bytes, retry: RetryContext | None = None) -> _Session:
         connection = Connection(
             is_client=False,
             server_config=self._server_config,
-            config=ConnectionConfig(keylog=keylog_writer(), qlog=qlog_trace),
+            config=ConnectionConfig(keylog=keylog_writer(), qlog=qlog_trace, retry=retry),
         )
         session = _Session(connection, self._idle_timeout)
         self._sessions[cid] = session
@@ -214,7 +319,8 @@ def serve_one(
     idle_timeout: float,
 ) -> None:
     """Accept and serve a single connection to completion."""
-    Server(sock, selector, server_config, document_root, idle_timeout).serve(connection_limit=1)
+    options = ServerOptions(document_root=document_root, idle_timeout=idle_timeout)
+    Server(sock, selector, server_config, options).serve(connection_limit=1)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -225,6 +331,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--private-key", type=Path, required=True)
     parser.add_argument("--www", type=Path, default=Path("www"), help="document root")
     parser.add_argument("--idle-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--retry",
+        action="store_true",
+        help="validate client addresses with a Retry packet (RFC 9000 §8.1.2)",
+    )
     parser.add_argument("--once", action="store_true", help="serve one connection and exit")
     args = parser.parse_args(argv)
 
@@ -248,7 +359,10 @@ def main(argv: list[str] | None = None) -> int:
     selector.register(sock, selectors.EVENT_READ)
     print(f"dsquic serving {args.www} on {args.host}:{args.port}", flush=True)
 
-    server = Server(sock, selector, server_config, args.www, args.idle_timeout)
+    options = ServerOptions(
+        document_root=args.www, idle_timeout=args.idle_timeout, retry=args.retry
+    )
+    server = Server(sock, selector, server_config, options)
     try:
         server.serve(connection_limit=1 if args.once else None)
     except KeyboardInterrupt:

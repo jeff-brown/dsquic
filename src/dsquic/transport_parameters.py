@@ -40,6 +40,7 @@ class TransportParameters:
     """The parameters this implementation reads or writes (§18.2)."""
 
     original_destination_connection_id: bytes | None = None
+    retry_source_connection_id: bytes | None = None
     initial_source_connection_id: bytes | None = None
     max_idle_timeout_ms: int = 0
     max_udp_payload_size: int = 65527
@@ -65,6 +66,8 @@ class TransportParameters:
 
         if self.original_destination_connection_id is not None:
             put(ORIGINAL_DESTINATION_CONNECTION_ID, self.original_destination_connection_id)
+        if self.retry_source_connection_id is not None:
+            put(RETRY_SOURCE_CONNECTION_ID, self.retry_source_connection_id)
         if self.initial_source_connection_id is not None:
             put(INITIAL_SOURCE_CONNECTION_ID, self.initial_source_connection_id)
         put_int(MAX_IDLE_TIMEOUT, self.max_idle_timeout_ms)
@@ -98,6 +101,7 @@ def decode_transport_parameters(data: bytes) -> TransportParameters:
     datagram_size = values.get(MAX_DATAGRAM_FRAME_SIZE)
     return TransportParameters(
         original_destination_connection_id=values.get(ORIGINAL_DESTINATION_CONNECTION_ID),
+        retry_source_connection_id=values.get(RETRY_SOURCE_CONNECTION_ID),
         initial_source_connection_id=values.get(INITIAL_SOURCE_CONNECTION_ID),
         max_idle_timeout_ms=as_int(MAX_IDLE_TIMEOUT, 0),
         max_udp_payload_size=as_int(MAX_UDP_PAYLOAD_SIZE, 65527),

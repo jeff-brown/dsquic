@@ -184,7 +184,7 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 
 | Case | Reason |
 |---|---|
-| `retry`, `v2` | Retry packets are not generated or parsed, and only QUIC v1 is offered |
+| `v2` | Only QUIC v1 is offered |
 | `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
 | `resumption`, `zerortt` | No session tickets, no 0-RTT |
 | `chacha20` | AES-128-GCM only |

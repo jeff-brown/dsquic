@@ -316,6 +316,27 @@ Recorded here so the open questions above stay honest:
   sets no ceiling of its own. picoquic instead bounds the number of
   retransmissions rather than the interval; that needs more state and
   has no QUIC-spec citation, so it was not taken.
+- **Retry lives in its own module, and the address never reaches the
+  core (2026-08-06)**: `retry.py` holds the Retry packet (RFC 9000
+  §17.2.5) and the address validation tokens (§8.1.2-§8.1.4); the Retry
+  Integrity Tag stays in `protection.py`, since it is RFC 9001 §5.8 and
+  AEAD is that module's concern. `packet.py` keeps the Retry dataclass
+  but cannot read or write one: doing so needs the tag, and
+  `protection.py` already imports `packet.py`, so the dependency runs one
+  way only.
+  A token binds the client's address, but the core never learns what an
+  address is: `mint_token` and `validate_token` take opaque bytes and the
+  endpoint decides how a socket address becomes them, which keeps §4.6's
+  sans-IO line intact and leaves a MASQUE-tunnelled connection free to
+  use something that is not an IP address at all. The token also carries
+  the original destination connection ID, because a server that answers
+  with a Retry keeps no state and §7.3 still requires it to echo that ID
+  as a transport parameter; `ConnectionConfig.retry` is how the endpoint
+  hands both back when the retried Initial arrives.
+  Deciding to validate an address is policy and lives in the endpoint
+  (`ServerOptions.retry`), because only the endpoint knows addresses;
+  minting, checking, and the §7.3 comparison are protocol and live in the
+  core.
 - **Completion and confirmation are separate events (2026-08-06)**:
   RFC 9001 §4.1.1 makes 1-RTT data sendable once the TLS handshake is
   complete, while §4.1.2 confirmation is a later event that governs
