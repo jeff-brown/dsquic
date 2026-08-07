@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  410 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  416 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -304,9 +304,18 @@ connection carrying many early requests.
    is measured on the client's monotonic clock, so offering a ticket
    under a clock that runs backwards (or a different process's clock
    without care) makes the claim stale and 0-RTT quietly downgrade.
-6. NEW_TOKEN (§8.1.3): issued after the handshake, stored with the
-   ticket, presented in the resuming Initial; `retry.py` already
-   kind-tags tokens so Retry and NEW_TOKEN validation stay distinct.
+6. Done, core half: `retry.py` mints and validates NEW_TOKEN-kind
+   tokens (address plus age, no connection ID, kind b"\x02"; each
+   validator refuses the other kind, §8.1.4); the core carries them:
+   `Connection.send_new_token` queues the frame (the endpoint mints,
+   since the core never sees an address), a client keeps arrivals in
+   `Connection.new_tokens`, and `ConnectionConfig.token` rides the
+   next connection's Initials, with a Retry's token taking precedence
+   (§17.2.5.3). A server receiving NEW_TOKEN errors (§19.7); lost
+   frames are resent verbatim (§13.3). Endpoint minting on
+   HandshakeCompleted, validation in `Server._validate_address`
+   (accept either kind as validating; per-process token key decoupled
+   from `--retry`), and the client-side store belong to step 7.
 7. Endpoints and shim: an early-data mode on `fetch`, and the zerortt
    split (first URL full, rest resumed) in `run_endpoint.sh`.
 8. Ladder: RFC 8448 vectors, an aioquic 0-RTT interop test in

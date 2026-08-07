@@ -44,6 +44,7 @@ VERSION_END = 5  # first byte plus the 32-bit version (§17.2)
 # sent in NEW_TOKEN, because only the first proves the address of *this*
 # connection attempt. The kind is authenticated, not merely prefixed.
 RETRY_TOKEN = b"\x01"
+NEW_TOKEN = b"\x02"
 
 
 @dataclass(frozen=True)
@@ -183,3 +184,46 @@ def validate_token(
     if now - issued > lifetime:
         raise TokenError("token has expired")
     return original_destination_cid
+
+
+def mint_new_token(key: bytes, *, client_address: bytes, now: float) -> bytes:
+    """A token for a NEW_TOKEN frame, binding only the client address.
+
+    §8.1.3: it will be presented on a connection the server has not
+    seen yet, so unlike a Retry token it carries no connection ID and
+    is validated against nothing but the address and its age.
+    """
+    nonce = os.urandom(NONCE_LENGTH)
+    payload = encode_varint(len(client_address)) + client_address + int(now).to_bytes(8, "big")
+    return NEW_TOKEN + nonce + AESGCM(key).encrypt(nonce, payload, NEW_TOKEN)
+
+
+def validate_new_token(
+    key: bytes,
+    token: bytes,
+    *,
+    client_address: bytes,
+    now: float,
+    lifetime: float,
+) -> None:
+    """Check a NEW_TOKEN token, or raise TokenError (§8.1.3).
+
+    Success means the address in front of us held this address when the
+    token was minted, which lifts the §8.1 amplification limit without
+    a Retry round trip.
+    """
+    if not token.startswith(NEW_TOKEN):
+        raise TokenError("not a NEW_TOKEN token")
+    nonce = token[len(NEW_TOKEN) : len(NEW_TOKEN) + NONCE_LENGTH]
+    sealed = token[len(NEW_TOKEN) + NONCE_LENGTH :]
+    try:
+        payload = AESGCM(key).decrypt(nonce, sealed, NEW_TOKEN)
+    except InvalidTag as exc:
+        raise TokenError("token does not authenticate") from exc
+    buf = Buffer(payload)
+    address = buf.pull_bytes(buf.pull_varint())
+    issued = int.from_bytes(buf.pull_bytes(8), "big")
+    if not hmac.compare_digest(address, client_address):
+        raise TokenError("token was issued to another address")
+    if now - issued > lifetime:
+        raise TokenError("token has expired")

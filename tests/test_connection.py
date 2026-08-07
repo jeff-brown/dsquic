@@ -1000,3 +1000,36 @@ class TestZeroRtt:
         received = [e for e in server.take_events() if isinstance(e, StreamDataReceived)]
         assert received
         assert received[0].data == b"GET /early\r\n"
+
+
+class TestNewToken:
+    """RFC 9000 §8.1.3: address validation tokens for later connections."""
+
+    def test_a_token_travels_to_the_client(self, credentials: Credentials) -> None:
+        """The endpoint mints the token, since the core never sees an
+        address; the core delivers it and the client keeps it."""
+        client, server, now = handshake(credentials)
+        server.send_new_token(b"\x02minted-elsewhere")
+        for datagram in server.datagrams_to_send(now):
+            client.datagram_received(datagram.data, now, source="server")
+        assert client.new_tokens == [b"\x02minted-elsewhere"]
+
+    def test_a_stored_token_rides_the_initial(self, credentials: Credentials) -> None:
+        """The next connection presents the stored token in its Initial
+        packets, where the server can validate the address without a
+        Retry round trip."""
+        client = Connection(
+            is_client=True,
+            client_config=ClientConfig(
+                server_name="localhost",
+                alpn=[hq.ALPN],
+                transport_parameters=b"",
+                ca_certificates=credentials.ca,
+                verification_time=VERIFICATION_TIME,
+            ),
+            config=ConnectionConfig(token=b"\x02stored-token"),
+            destination="server",
+        )
+        client.connect(0.0)
+        header = parse_long_header(client.datagrams_to_send(0.0)[0].data)
+        assert header.token == b"\x02stored-token"

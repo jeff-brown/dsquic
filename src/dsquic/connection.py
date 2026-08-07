@@ -304,6 +304,11 @@ class ConnectionConfig:
     # Set by a server that answered this connection's first Initial with
     # a Retry (§8.1.2); None on every other connection.
     retry: RetryContext | None = None
+    # §8.1.3: a token a NEW_TOKEN frame delivered on an earlier
+    # connection to this server; the client carries it in its Initial
+    # packets so the server can skip address validation. A Retry's
+    # token replaces it for the rest of the attempt (§17.2.5.3).
+    token: bytes = b""
     keylog: Callable[[str], None] | None = None
     # Opens a trace, given the group ID, the role, and the reference
     # clock reading. A factory because a server learns the group ID from
@@ -344,6 +349,9 @@ class Connection:
         # original destination CID recovered from the token (§8.1.2).
         # Set before the parameters are built, which reads them.
         self._retry_token = b""
+        # §8.1.3: tokens the peer sent in NEW_TOKEN frames, for the
+        # caller to keep for later connections, like session tickets.
+        self.new_tokens: list[bytes] = []
         self._retry_source_cid = self.config.retry.source_cid if self.config.retry else None
         self._original_dcid = (
             self.config.retry.original_destination_cid if self.config.retry else None
@@ -888,10 +896,17 @@ class Connection:
             if not self.is_client:
                 raise ConnectionError_(frames.PROTOCOL_VIOLATION, "client sent HANDSHAKE_DONE")
             self._confirm_handshake(now)
+        elif isinstance(frame, NewToken):
+            # §19.7: servers issue tokens, so a server receiving one is
+            # a protocol violation; a client keeps it for a later
+            # connection (§8.1.3).
+            if not self.is_client:
+                raise ConnectionError_(frames.PROTOCOL_VIOLATION, "client sent NEW_TOKEN")
+            self.new_tokens.append(frame.token)
         elif isinstance(frame, ConnectionClose):
             self._on_connection_close(frame, now)
         # Frames for deferred features (NEW_CONNECTION_ID, PATH_CHALLENGE,
-        # NEW_TOKEN, DATAGRAM, blocked frames) are accepted and ignored.
+        # DATAGRAM, blocked frames) are accepted and ignored.
 
     def _handle_limit(self, frame: MaxData | MaxStreamData | MaxStreams) -> None:
         """A peer raising one of our sending allowances (§4.1, §4.6)."""
@@ -953,6 +968,9 @@ class Connection:
                 # §13.3: retransmitted until acknowledged. The client
                 # confirms the handshake on this frame alone (§4.1.2).
                 self._handshake_done_pending = True
+            elif isinstance(frame, NewToken):
+                # §13.3: resent verbatim until acknowledged.
+                self._queue_control(frame)
             elif isinstance(frame, MaxData) and self.streams is not None:
                 # §13.3: the current limit is sent, not the lost one.
                 self._queue_control(MaxData(maximum=self.streams.local_max_data))
@@ -1527,7 +1545,9 @@ class Connection:
                 version=QUIC_V1,
                 destination_cid=self.peer_cid,
                 source_cid=self.host_cid,
-                token=self._retry_token if level is EncryptionLevel.INITIAL else b"",
+                token=(self._retry_token or self.config.token)
+                if level is EncryptionLevel.INITIAL
+                else b"",
             )
             if pad_datagram_to:
                 # The Length varint is the same width for the padded and
@@ -1645,7 +1665,9 @@ class Connection:
                     LongHeaderTemplate(
                         packet_type=LEVEL_TO_PACKET_TYPE[level],
                         version=QUIC_V1,
-                        token=self._retry_token if level is EncryptionLevel.INITIAL else b"",
+                        token=(self._retry_token or self.config.token)
+                        if level is EncryptionLevel.INITIAL
+                        else b"",
                         destination_cid=self.peer_cid,
                         source_cid=self.host_cid,
                     ),
@@ -1749,6 +1771,15 @@ class Connection:
                 peer=_flow_limits(self._remembered_parameters),
             )
         self._arm_idle_timer(now)
+
+    def send_new_token(self, token: bytes) -> None:
+        """Server: queue a NEW_TOKEN frame (§8.1.3).
+
+        The token binds the client's address, which the core never
+        sees, so the endpoint mints it (retry.py) and hands it in.
+        """
+        assert not self.is_client
+        self._queue_control(NewToken(token=token))
 
     def open_stream(self) -> int:
         """Open the next bidirectional stream, or raise if the peer's

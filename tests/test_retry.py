@@ -110,3 +110,39 @@ class TestTokens:
             retry.validate_token(
                 KEY, b"\x02rubbish", client_address=ADDRESS, now=100.0, lifetime=60.0
             )
+
+
+class TestNewTokenTokens:
+    """RFC 9000 §8.1.3: tokens minted into NEW_TOKEN frames."""
+
+    def test_round_trip(self) -> None:
+        token = retry.mint_new_token(KEY, client_address=ADDRESS, now=100.0)
+        retry.validate_new_token(KEY, token, client_address=ADDRESS, now=1000.0, lifetime=3600.0)
+
+    def test_another_address_is_rejected(self) -> None:
+        token = retry.mint_new_token(KEY, client_address=ADDRESS, now=100.0)
+        with pytest.raises(TokenError, match="another address"):
+            retry.validate_new_token(
+                KEY, token, client_address=b"198.51.100.9:443", now=100.0, lifetime=3600.0
+            )
+
+    def test_an_expired_token_is_rejected(self) -> None:
+        token = retry.mint_new_token(KEY, client_address=ADDRESS, now=100.0)
+        with pytest.raises(TokenError, match="expired"):
+            retry.validate_new_token(
+                KEY, token, client_address=ADDRESS, now=4000.0, lifetime=3600.0
+            )
+
+    def test_the_kinds_do_not_cross(self) -> None:
+        """§8.1.4: each validator refuses the other's kind, because
+        only a Retry token proves the address of this very attempt."""
+        retry_token = retry.mint_token(
+            KEY, original_destination_cid=b"\x01", client_address=ADDRESS, now=100.0
+        )
+        with pytest.raises(TokenError, match="not a NEW_TOKEN token"):
+            retry.validate_new_token(
+                KEY, retry_token, client_address=ADDRESS, now=100.0, lifetime=3600.0
+            )
+        new_token = retry.mint_new_token(KEY, client_address=ADDRESS, now=100.0)
+        with pytest.raises(TokenError, match="not a Retry token"):
+            retry.validate_token(KEY, new_token, client_address=ADDRESS, now=100.0, lifetime=60.0)
