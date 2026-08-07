@@ -997,11 +997,17 @@ class TlsClient(_Handshake):
         # §4.6.1: tickets arrive after the handshake, so a caller reads
         # them once the connection is up and keeps them for next time.
         self.session_tickets: list[SessionTicket] = []
+        self._fallback_schedule: KeySchedule | None = None
+        self._resumed = False
         if config.session_ticket is not None:
             # §7.1: resuming extracts the PSK into the Early Secret, and
             # the binder is derived from it, so the schedule has to carry
-            # the PSK before the ClientHello is built.
+            # the PSK before the ClientHello is built. Whether the server
+            # takes the offer is unknown until its ServerHello, so a
+            # zero-PSK schedule rides along for the decline path
+            # (§4.2.11).
             self.schedule = KeySchedule(psk=config.session_ticket.psk)
+            self._fallback_schedule = KeySchedule()
         self._random = random if random is not None else os.urandom(32)
         self._client_random = self._random
         share_groups = (
@@ -1062,7 +1068,10 @@ class TlsClient(_Handshake):
         raw = encode_client_hello(self._build_client_hello())
         if self._config.session_ticket is not None:
             raw = self._fill_psk_binder(raw)
-        self.schedule.update_transcript(raw)
+        else:
+            self.schedule.update_transcript(raw)
+        if self._fallback_schedule is not None:
+            self._fallback_schedule.update_transcript(raw)
         self.events.append(SendData(EncryptionLevel.INITIAL, raw))
         self.state = ClientState.WAIT_SERVER_HELLO
 
@@ -1091,14 +1100,21 @@ class TlsClient(_Handshake):
     def _fill_psk_binder(self, raw: bytes) -> bytes:
         """§4.2.11.2: replace the placeholder binder with the real one.
 
-        The message is encoded first and patched, rather than encoded
-        short and extended: the length field the binder covers counts
-        the binder, so a shorter encoding would authenticate different
-        bytes than the ones sent.
+        The binder is a Finished over the running transcript plus this
+        hello truncated at its binders; after a HelloRetryRequest that
+        transcript already holds the first hello and the retry. The
+        schedule is fed in two chunks so the binder can be read off
+        between them. The message is patched rather than re-encoded
+        short: the length field the binder covers counts the binder, so
+        a shorter encoding would authenticate different bytes than the
+        ones sent.
         """
-        binder = finished_verify_data(self.schedule.binder_key(), _sha256(binder_transcript(raw)))
-        assert len(binder) == SHA256_LENGTH
-        return raw[: -len(binder)] + binder
+        truncated = binder_transcript(raw)
+        self.schedule.update_transcript(truncated)
+        binder = finished_verify_data(self.schedule.binder_key(), self.schedule.transcript_hash())
+        patched = raw[: -len(binder)] + binder
+        self.schedule.update_transcript(patched[len(truncated) :])
+        return patched
 
     def _on_hello_retry_request(self, hello: ServerHello, raw: bytes) -> None:
         """Generate the requested key share and send a second ClientHello.
@@ -1123,9 +1139,19 @@ class TlsClient(_Handshake):
         # §4.4.1: ClientHello1 becomes a message_hash before the retry.
         self.schedule.replace_transcript_with_message_hash()
         self.schedule.update_transcript(raw)
+        if self._fallback_schedule is not None:
+            self._fallback_schedule.replace_transcript_with_message_hash()
+            self._fallback_schedule.update_transcript(raw)
         self._keys = {group: X25519PrivateKey.generate()}
         retry = encode_client_hello(self._build_client_hello())
-        self.schedule.update_transcript(retry)
+        if self._config.session_ticket is not None:
+            # §4.1.4: the second hello recomputes its binder, which now
+            # covers the first hello and the retry (§4.2.11.2).
+            retry = self._fill_psk_binder(retry)
+        else:
+            self.schedule.update_transcript(retry)
+        if self._fallback_schedule is not None:
+            self._fallback_schedule.update_transcript(retry)
         self.events.append(SendData(EncryptionLevel.INITIAL, retry))
         self.state = ClientState.WAIT_SERVER_HELLO
 
@@ -1165,6 +1191,21 @@ class TlsClient(_Handshake):
         our_key = self._keys.get(group)
         if our_key is None:
             raise TlsAlert(ILLEGAL_PARAMETER, f"server chose group {group:#06x} with no share")
+        selected = _find_extension(hello.extensions, ExtensionType.PRE_SHARED_KEY)
+        if selected is not None:
+            if self._config.session_ticket is None:
+                raise TlsAlert(ILLEGAL_PARAMETER, "pre_shared_key answers an offer never made")
+            if int.from_bytes(selected, "big") != 0:
+                # §4.2.11: selected_identity indexes the offered list,
+                # which held exactly one identity.
+                raise TlsAlert(ILLEGAL_PARAMETER, "selected_identity is out of range")
+            self._resumed = True
+        elif self._fallback_schedule is not None:
+            # §4.2.11: the offer was declined, so this is a full
+            # handshake and the Early Secret extracts zeros rather than
+            # the ticket's PSK (§7.1).
+            self.schedule = self._fallback_schedule
+        self._fallback_schedule = None
         self.schedule.update_transcript(raw)
         shared = our_key.exchange(X25519PublicKey.from_public_bytes(peer_public))
         self._emit_handshake_secrets(shared)
@@ -1185,7 +1226,9 @@ class TlsClient(_Handshake):
         self._alpn = selected[0]
         self._peer_transport_parameters = transport_parameters
         self.schedule.update_transcript(raw)
-        self.state = ClientState.WAIT_CERTIFICATE
+        # §2.2: a PSK authenticates the connection, so a resumed
+        # handshake carries no Certificate or CertificateVerify.
+        self.state = ClientState.WAIT_FINISHED if self._resumed else ClientState.WAIT_CERTIFICATE
 
     def _on_certificate(self, message: Certificate, raw: bytes) -> None:
         if not message.entries:

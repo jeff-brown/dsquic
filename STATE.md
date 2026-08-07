@@ -21,7 +21,7 @@ the open item recorded below.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  389 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  394 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -242,27 +242,27 @@ not against our own output, in `tests/rfc8448_vectors.py`:
   CertificateVerify (§2.2), which is what the runner inspects.
   `TestServerPskSelection` in tests/test_tls.py covers all of it.
 
-**Next, client-side accept plus wiring**, in order:
+- Client-side accept, staged: a ServerHello carrying `selected_identity`
+  must answer an offer that was made and select identity 0, the only one
+  offered (§4.2.11); the resumed flight then skips Certificate and
+  CertificateVerify, `_on_encrypted_extensions` stepping straight to
+  WAIT_FINISHED (§2.2). Declining works too: `TlsClient` carries a
+  zero-PSK fallback schedule beside the PSK schedule until the
+  ServerHello resolves the offer, since the Early Secret extracts zeros
+  when the server does not resume (§7.1). `_fill_psk_binder` now feeds
+  the transcript in two chunks and MACs the running transcript, so a
+  second ClientHello after a HelloRetryRequest recomputes its binder
+  over message_hash + HRR + truncated hello (§4.1.4, §4.2.11.2), which
+  a test pins byte for byte. Full resumption and decline handshakes now
+  pass in memory end to end.
 
-1. Client: accept a Certificate-free flight when the ServerHello carries
-   `selected_identity` (verify it is in the offered range, §4.2.11).
-   `CLIENT_EXPECTS` currently requires Certificate after
-   EncryptedExtensions. Two more client gaps found while writing the
-   server side, both needed for interop where the peer may decline or
-   retry: (a) on a ServerHello *without* `selected_identity` the client
-   must fall back to a zero-PSK schedule; today `TlsClient.__init__`
-   bakes the PSK into the Early Secret unconditionally, so a declining
-   server breaks the handshake at Finished. (b) `_on_hello_retry_request`
-   re-encodes the hello without re-running `_fill_psk_binder`, so a
-   resuming client that hits HRR sends the placeholder binder (and the
-   CH2 binder must cover CH1 and the HRR per §4.2.11.2). Our server
-   declines PSKs after its own HRR for the matching reason: it keeps no
-   message bytes to rebuild that transcript.
-2. Endpoints: tickets surviving between connections in
+**Next, endpoint wiring plus the ladder**, in order:
+
+1. Endpoints: tickets surviving between connections in
    `endpoints.client.fetch_each`; `--connection-per-request` for this
    case; add `resumption` to `SUPPORTED` in `interop/run_endpoint.sh`.
-3. Ladder: unit, loopback through the reference endpoints, then the
-   runner in both directions.
+2. Ladder: loopback through the reference endpoints over real UDP, then
+   the runner in both directions (unit rung is done).
 
 **Three traps already paid for, worth not repeating.**
 

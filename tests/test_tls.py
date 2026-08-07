@@ -23,6 +23,7 @@ from dsquic.tls import (
     HANDSHAKE_FAILURE,
     HELLO_RETRY_REQUEST_RANDOM,
     ILLEGAL_PARAMETER,
+    MESSAGE_HASH_TYPE,
     MISSING_EXTENSION,
     NO_APPLICATION_PROTOCOL,
     RSA_PSS_RSAE_SHA256,
@@ -339,7 +340,8 @@ def pump(client: TlsClient, server: TlsServer) -> tuple[list[TlsEvent], list[Tls
     """Shuttle SendData between the machines until both go quiet."""
     client_events: list[TlsEvent] = []
     server_events: list[TlsEvent] = []
-    client.start()
+    if client.state is ClientState.START:
+        client.start()
     for _ in range(10):
         moved = False
         for event in client.take_events():
@@ -979,3 +981,132 @@ class TestServerPskSelection:
         with pytest.raises(TlsAlert, match="last") as excinfo:
             server.receive(EncryptionLevel.INITIAL, encode_client_hello(reordered), 0.0)
         assert excinfo.value.alert == ILLEGAL_PARAMETER
+
+
+# --- RFC 8446 §4.2.11: the client side of a resumption offer ------------------
+
+
+def test_resumption_completes_without_a_certificate(credentials: Credentials) -> None:
+    """The resumed handshake end to end: both sides reach CONNECTED on
+    the same secrets, no Certificate crosses the wire (§2.2), and the
+    resumed connection is itself issued a ticket (§4.6.1)."""
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    client = make_resuming_client(credentials, ticket)
+    server = make_server(credentials, ticket_key=key)
+    client_events, server_events = pump(client, server)
+    assert client.state is ClientState.CONNECTED
+    assert server.state is ServerState.CONNECTED
+    assert secrets_of(client_events) == secrets_of(server_events)
+    sent = [type(m) for e in server_events if isinstance(e, SendData) for m in parse_flight(e.data)]
+    assert Certificate not in sent
+    assert NewSessionTicket in sent
+    chained = client.session_tickets[0]
+    assert open_ticket(key, chained.identity, now=0.0, lifetime=7200.0) == chained.psk
+    done = next(e for e in client_events if isinstance(e, HandshakeComplete))
+    assert done.alpn == "hq-interop"
+    assert done.peer_transport_parameters == b"server-params"
+
+
+def test_a_declined_offer_falls_back_to_a_full_handshake(credentials: Credentials) -> None:
+    """§4.2.11: a server that cannot use the ticket answers without
+    selected_identity, and the client reverts to the zero-PSK Early
+    Secret (§7.1) and the certificate path."""
+    ticket = obtain_ticket(credentials, bytes(range(32)))
+    server = make_server(credentials)  # no ticket key, so every offer is declined
+    client = make_resuming_client(credentials, ticket)
+    client_events, server_events = pump(client, server)
+    assert client.state is ClientState.CONNECTED
+    assert server.state is ServerState.CONNECTED
+    assert secrets_of(client_events) == secrets_of(server_events)
+    sent = [type(m) for e in server_events if isinstance(e, SendData) for m in parse_flight(e.data)]
+    assert Certificate in sent
+
+
+def test_a_retried_hello_recomputes_its_binder(credentials: Credentials) -> None:
+    """§4.1.4 and §4.2.11.2: the second ClientHello's binder covers the
+    first hello's message_hash, the HelloRetryRequest, and the second
+    hello truncated at its binders. The server declines a PSK offered
+    after its own retry, so the handshake completes with a certificate.
+    """
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    client = TlsClient(
+        ClientConfig(
+            server_name="localhost",
+            alpn=["hq-interop"],
+            transport_parameters=b"client-params",
+            ca_certificates=credentials.ca,
+            verification_time=VERIFICATION_TIME,
+            session_ticket=ticket,
+            key_share_groups=[],
+        )
+    )
+    server = make_server(credentials, ticket_key=key)
+    client.start()
+    hello1 = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    server.receive(EncryptionLevel.INITIAL, hello1, 0.0)
+    retry = next(e for e in server.take_events() if isinstance(e, SendData)).data
+    client.receive(EncryptionLevel.INITIAL, retry, 0.0)
+    hello2 = next(e for e in client.take_events() if isinstance(e, SendData)).data
+
+    message, _ = parse_handshake_message(hello2)
+    assert isinstance(message, ClientHello)
+    _, binders = parse_offered_psks(message.extensions[-1].data)
+    message_hash = (
+        bytes([MESSAGE_HASH_TYPE]) + (32).to_bytes(3, "big") + hashlib.sha256(hello1).digest()
+    )
+    transcript = hashlib.sha256(message_hash + retry + binder_transcript(hello2)).digest()
+    expected = finished_verify_data(KeySchedule(psk=ticket.psk).binder_key(), transcript)
+    assert binders == [expected]
+
+    server.receive(EncryptionLevel.INITIAL, hello2, 0.0)
+    pump(client, server)
+    assert client.state is ClientState.CONNECTED
+    assert server.state is ServerState.CONNECTED
+
+
+def test_an_unsolicited_selected_identity_aborts(credentials: Credentials) -> None:
+    """§4.2.11: a server may only answer an offer that was made."""
+    client = make_client(credentials)
+    server = make_server(credentials)
+    client.start()
+    hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    server.receive(EncryptionLevel.INITIAL, hello, 0.0)
+    server_hello = next(e for e in server.take_events() if isinstance(e, SendData)).data
+    message, _ = parse_handshake_message(server_hello)
+    assert isinstance(message, ServerHello)
+    forged = replace(
+        message,
+        extensions=[*message.extensions, Extension(ExtensionType.PRE_SHARED_KEY, b"\x00\x00")],
+    )
+    with pytest.raises(TlsAlert, match="never made") as excinfo:
+        client.receive(EncryptionLevel.INITIAL, encode_server_hello(forged), 0.0)
+    assert excinfo.value.alert == ILLEGAL_PARAMETER
+
+
+def test_a_selected_identity_out_of_range_aborts(credentials: Credentials) -> None:
+    """§4.2.11: selected_identity indexes the offered list, which held
+    exactly one identity."""
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    client = make_resuming_client(credentials, ticket)
+    server = make_server(credentials, ticket_key=key)
+    client.start()
+    hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    server.receive(EncryptionLevel.INITIAL, hello, 0.0)
+    server_hello = next(e for e in server.take_events() if isinstance(e, SendData)).data
+    message, _ = parse_handshake_message(server_hello)
+    assert isinstance(message, ServerHello)
+    forged = replace(
+        message,
+        extensions=[
+            e
+            if e.type != ExtensionType.PRE_SHARED_KEY
+            else Extension(ExtensionType.PRE_SHARED_KEY, (1).to_bytes(2, "big"))
+            for e in message.extensions
+        ],
+    )
+    with pytest.raises(TlsAlert, match="out of range") as excinfo:
+        client.receive(EncryptionLevel.INITIAL, encode_server_hello(forged), 0.0)
+    assert excinfo.value.alert == ILLEGAL_PARAMETER
