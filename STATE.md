@@ -262,7 +262,7 @@ connection carrying many early requests.
 
 **Order of work, each step gated on the one before:**
 
-1. `KeySchedule`: `client_early_traffic_secret`, pinned to the RFC
+1. Done: `KeySchedule.client_early_traffic_secret`, pinned to the RFC
    8448 §4 resumed 0-RTT trace in `tests/rfc8448_vectors.py`.
 2. `tls.py`: `early_data` in NewSessionTicket carrying the mandatory
    0xffffffff (RFC 9001 §4.6.1), in the ClientHello when offering, and

@@ -211,6 +211,16 @@ class KeySchedule:
         """
         return hkdf_expand_label(self._secret, b"res binder", EMPTY_TRANSCRIPT_HASH, SHA256_LENGTH)
 
+    def client_early_traffic_secret(self) -> bytes:
+        """§7.1: the secret 0-RTT packets are protected with (RFC 9001
+        §5.1).
+
+        Derived at the Early Secret over the ClientHello alone, binders
+        included, so it must be read before add_ecdhe() and before the
+        transcript sees the ServerHello.
+        """
+        return self._derive(b"c e traffic")
+
     def resumption_master_secret(self) -> bytes:
         """§7.1: derived at the Master Secret over the transcript through
         the client's Finished, which is the last message it covers."""

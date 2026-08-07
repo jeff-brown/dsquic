@@ -690,6 +690,16 @@ class TestResumptionKeySchedule:
         assert first == rfc8448.RESUMPTION_PSK
         assert second != first
 
+    def test_client_early_traffic_secret_matches_the_zero_rtt_trace(self) -> None:
+        """§7.1: derived at the Early Secret over the complete
+        ClientHello, binders included, unlike the binder itself, which
+        stops where the binders start. RFC 9001 §5.1 protects 0-RTT
+        packets with this secret."""
+        hello = rfc8448.CLIENT_HELLO_BINDER_PREFIX + b"\x00\x21" + b"\x20" + rfc8448.BINDER
+        schedule = KeySchedule(psk=rfc8448.RESUMPTION_PSK)
+        schedule.update_transcript(hello)
+        assert schedule.client_early_traffic_secret() == rfc8448.CLIENT_EARLY_TRAFFIC_SECRET
+
 
 def test_new_session_ticket_round_trips_the_spec_vector() -> None:
     """RFC 8446 §4.6.1, against the 205-octet ticket of RFC 8448 §3.

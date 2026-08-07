@@ -117,6 +117,12 @@ BINDER_TRANSCRIPT_HASH = bytes.fromhex(  # 32 octets
 BINDER = bytes.fromhex(  # 32 octets
     "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"
 )
+# §4 "derive secret tls13 c e traffic": the 0-RTT traffic secret,
+# derived at the Early Secret over the complete ClientHello, binders
+# included (its transcript hash is the "hash" input printed there).
+CLIENT_EARLY_TRAFFIC_SECRET = bytes.fromhex(  # 32 octets
+    "3fbbe6a60deb66c30a32795aba0eff7eaa10105586e7be5c09678d63b6caab62"
+)
 
 NEW_SESSION_TICKET = bytes.fromhex(  # 205 octets, RFC 8448 §3
     "040000c90000001efad6aac502000000b22c035d829359ee5ff7af4ec9000000"
