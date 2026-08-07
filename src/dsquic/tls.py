@@ -46,13 +46,14 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.x509 import DNSName, load_der_x509_certificate
 from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
@@ -68,6 +69,8 @@ SHA256_LENGTH = 32
 RSA_PSS_RSAE_SHA256 = 0x0804
 ECDSA_SECP256R1_SHA256 = 0x0403
 
+TICKET_NONCE_LENGTH = 12  # AES-GCM nonce for a sealed ticket
+TICKET_KEY_LENGTH = 32
 MESSAGE_HASH_TYPE = 254  # §4.4.1, the HelloRetryRequest transcript stand-in
 SUPPORTED_GROUPS = [X25519_GROUP]  # groups this implementation can key with
 
@@ -217,6 +220,50 @@ class KeySchedule:
 
     def server_application_traffic_secret(self) -> bytes:
         return self._derive(b"s ap traffic")
+
+
+@dataclass(frozen=True)
+class SessionTicket:
+    """A ticket a client holds for resumption (RFC 8446 §4.6.1).
+
+    ``identity`` is the opaque ticket the server issued, ``psk`` the
+    secret it stands for, and ``age_add`` the value added to its age
+    when offering it so observers cannot correlate offers.
+    """
+
+    identity: bytes
+    psk: bytes
+    age_add: int
+    lifetime: int
+    received_at: float
+
+
+def seal_ticket(key: bytes, psk: bytes, now: float) -> bytes:
+    """§4.6.1: a ticket only its issuer can read.
+
+    The PSK travels inside, so the server needs no per-ticket state; the
+    issue time travels with it so expiry can be checked on return.
+    """
+    nonce = os.urandom(TICKET_NONCE_LENGTH)
+    plaintext = int(now).to_bytes(8, "big") + psk
+    return nonce + AESGCM(key).encrypt(nonce, plaintext, None)
+
+
+def open_ticket(key: bytes, ticket: bytes, now: float, lifetime: float) -> bytes:
+    """Recover the PSK a ticket stands for, or raise (§4.6.1)."""
+    nonce, sealed = ticket[:TICKET_NONCE_LENGTH], ticket[TICKET_NONCE_LENGTH:]
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, sealed, None)
+    except InvalidTag as exc:
+        raise TicketError("ticket does not authenticate") from exc
+    issued = int.from_bytes(plaintext[:8], "big")
+    if now - issued > lifetime:
+        raise TicketError("ticket has expired")
+    return plaintext[8:]
+
+
+class TicketError(Exception):
+    """A ticket that cannot be used (§4.6.1)."""
 
 
 @dataclass(frozen=True)
@@ -679,6 +726,10 @@ class ServerConfig:
     signing_key: SigningKey
     alpn: list[str]
     transport_parameters: bytes
+    # §4.6.1: the key that seals session tickets. A server keeps no state
+    # for a ticket it issued, so everything needed to resume travels
+    # inside it, sealed. None means tickets are not issued.
+    ticket_key: bytes | None = None
 
 
 class ClientState(enum.Enum):

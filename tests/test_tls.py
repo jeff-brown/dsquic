@@ -50,6 +50,7 @@ from dsquic.tls import (
     ServerConfig,
     ServerHello,
     ServerState,
+    TicketError,
     TlsAlert,
     TlsClient,
     TlsEvent,
@@ -66,9 +67,11 @@ from dsquic.tls import (
     finished_verify_data,
     hkdf_expand_label,
     hkdf_label,
+    open_ticket,
     parse_handshake_message,
     parse_offered_psks,
     resumption_psk,
+    seal_ticket,
 )
 
 # --- RFC 8448 §3 vectors ------------------------------------------------------
@@ -727,3 +730,38 @@ class TestPskBinder:
         ]
         with pytest.raises(TlsAlert):
             parse_offered_psks(encode_offered_psks(identities, [rfc8448.BINDER]))
+
+
+class TestSessionTickets:
+    """RFC 8446 §4.6.1: a server keeps no state for a ticket it issues."""
+
+    KEY = bytes(range(32))
+    PSK = bytes(range(32, 64))
+
+    def test_a_ticket_returns_the_psk_it_sealed(self) -> None:
+        ticket = seal_ticket(self.KEY, self.PSK, now=1000.0)
+        assert open_ticket(self.KEY, ticket, now=1100.0, lifetime=3600.0) == self.PSK
+
+    def test_an_expired_ticket_is_refused(self) -> None:
+        ticket = seal_ticket(self.KEY, self.PSK, now=1000.0)
+        with pytest.raises(TicketError, match="expired"):
+            open_ticket(self.KEY, ticket, now=9000.0, lifetime=3600.0)
+
+    def test_another_server_cannot_read_it(self) -> None:
+        """Only the issuer holds the key, which is what lets the ticket
+        carry the PSK instead of an index into server state."""
+        ticket = seal_ticket(self.KEY, self.PSK, now=1000.0)
+        with pytest.raises(TicketError, match="authenticate"):
+            open_ticket(bytes(32), ticket, now=1000.0, lifetime=3600.0)
+
+    def test_a_tampered_ticket_is_refused(self) -> None:
+        ticket = bytearray(seal_ticket(self.KEY, self.PSK, now=1000.0))
+        ticket[-1] ^= 0x01
+        with pytest.raises(TicketError, match="authenticate"):
+            open_ticket(self.KEY, bytes(ticket), now=1000.0, lifetime=3600.0)
+
+    def test_two_tickets_for_one_psk_differ(self) -> None:
+        """A fresh nonce per ticket, so two offers cannot be linked."""
+        first = seal_ticket(self.KEY, self.PSK, now=1000.0)
+        second = seal_ticket(self.KEY, self.PSK, now=1000.0)
+        assert first != second
