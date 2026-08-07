@@ -243,9 +243,56 @@ aioquic interop harness now wires a session-ticket store, so
 `test_resumption` in tests/interop/test_aioquic.py reproduces in 0.4
 seconds what took a runner cycle to see.
 
-Still deliberately absent, waiting on the 0-RTT decision (design.md
-§7): the `early_data` extension, ticket age freshness checks, and
-NEW_TOKEN issuance (§8.1.3).
+The pieces resumption deliberately left out, `early_data`, ticket age
+freshness, and NEW_TOKEN issuance, are now the 0-RTT plan below.
+
+## 0-RTT, next (2026-08-07)
+
+Decided in scope with freshness-based anti-replay; rationale and the
+sub-decisions are in the design.md appendix.
+
+**Acceptance criterion**, read from the runner's `TestCaseZeroRTT`:
+40 files of 32 bytes with 250-octet names, exactly 2 handshakes, some
+0-RTT payload from the client, and at most half the total request
+bytes (0.5 x 250 x 40 = 5000) in client 1-RTT packets. So the client
+fetches one file on a full connection, then the remaining 39 on one
+resumed connection with every request sent as early data. That is a
+new client mode, not `--connection-per-request`: one resumed
+connection carrying many early requests.
+
+**Order of work, each step gated on the one before:**
+
+1. `KeySchedule`: `client_early_traffic_secret`, pinned to the RFC
+   8448 §4 resumed 0-RTT trace in `tests/rfc8448_vectors.py`.
+2. `tls.py`: `early_data` in NewSessionTicket carrying the mandatory
+   0xffffffff (RFC 9001 §4.6.1), in the ClientHello when offering, and
+   in EncryptedExtensions when accepting. QUIC uses no EndOfEarlyData
+   (RFC 9001 §8.3). The client emits the early secret at start; the
+   server derives it only on accept. The sealed ticket grows the
+   fields acceptance needs: `age_add` for the §8.3 freshness check,
+   plus the ALPN and transport parameters the original connection
+   used, since 0-RTT MUST be refused if either would change
+   (RFC 9001 §7.4.1, RFC 8446 §4.2.10).
+3. `SessionTicket` on the client grows `max_early_data_size`, the
+   ALPN, and the server's remembered transport parameters, which
+   govern what the client may send before fresh ones arrive.
+4. `connection.py`: the 0-RTT packet type (long header 0x1), sharing
+   the application-data packet number space and flow control with
+   1-RTT (RFC 9000 §12.3); client sends stream data under remembered
+   limits before the handshake completes, and on reject retransmits
+   the same stream data in 1-RTT; the server installs early receive
+   keys after the ClientHello it accepts.
+5. Server anti-replay: the §8.3 window over the sealed issue time and
+   the offered obfuscated age; outside it, accept the PSK but refuse
+   early data.
+6. NEW_TOKEN (§8.1.3): issued after the handshake, stored with the
+   ticket, presented in the resuming Initial; `retry.py` already
+   kind-tags tokens so Retry and NEW_TOKEN validation stay distinct.
+7. Endpoints and shim: an early-data mode on `fetch`, and the zerortt
+   split (first URL full, rest resumed) in `run_endpoint.sh`.
+8. Ladder: RFC 8448 vectors, an aioquic 0-RTT interop test in
+   `tests/interop/` (the harness's ticket store already enables it),
+   loopback, then the runner in both roles.
 
 ## Retry (2026-08-06)
 
@@ -351,9 +398,8 @@ server halves in `connection.py` and `endpoints/server.py`,
    runner cases: `zerortt`, `ecn`, `chacha20`, `connectionmigration`,
    and `versionnegotiation`, where dsquic sends VN but a client does
    not react to receiving one by retrying with a supported version.
-   With `resumption` done, `zerortt` is the natural next one; it hangs
-   on the 0-RTT scope decision (design.md §7) and is what makes
-   NEW_TOKEN (§8.1.3) worth having.
+   `zerortt` is underway: the decision is settled (design.md appendix)
+   and the plan is the "0-RTT, next" section above.
 2. **HTTP/3 after that** (design.md §6.1). The largest piece and the one
    that unblocks MASQUE, since `h3.py` is a stub and carries the last
    open MASQUE readiness constraint. `h3.py` is written against a
@@ -400,7 +446,8 @@ Observed divergences worth keeping:
 
 ## Open decisions
 
-See design.md §7. Still open: 0-RTT scope, whether to add an asyncio
-transport over the sans-IO core, PyPI publication, and the v1 MASQUE
-surface (CONNECT-UDP only vs. CONNECT-IP alongside). Everything settled
-so far is recorded in the design.md appendix.
+See design.md §7. Still open: whether to add an asyncio transport over
+the sans-IO core, PyPI publication, and the v1 MASQUE surface
+(CONNECT-UDP only vs. CONNECT-IP alongside). 0-RTT was settled in scope
+on 2026-08-07 with freshness-based anti-replay; everything settled so
+far is recorded in the design.md appendix.

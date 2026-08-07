@@ -202,7 +202,8 @@ Each step is a gate: the next phase starts only after the previous phase passes 
 
 - [x] Edge-case convention: decided, state inline / validation quarantined (§4.8)
 - [x] Module layout: decided, flat modules; the TLS-shim/packet-protection line is drawn as `tls.py` / `protection.py` (see appendix)
-- [ ] 0-RTT: in the MVP scope, or deferred?
+- [x] 0-RTT: decided 2026-08-07, in scope; freshness-based anti-replay
+      (see appendix)
 - [ ] When (and whether) to add an asyncio transport layer over the sans-IO core
 - [ ] PyPI distribution name: publish as `dsquic`, or stay git-install only for the academic phase?
 - [ ] Whether `h3.py` and `qpack.py` ever ship as separate artifacts usable with other QUIC implementations. Only the packaging is open: the dependency discipline that keeps it possible is settled and enforced (see appendix).
@@ -490,3 +491,26 @@ Recorded here so the open questions above stay honest:
   meaningful epoch, so without an anchor a reader cannot place the
   trace on a real timeline or lay a client trace over a server one.
   Supplying it is I/O, so it comes from `endpoints/`.
+
+- **0-RTT is in scope, with freshness-based anti-replay (2026-08-07).**
+  Settled when resumption passed the Interop Runner in both roles.
+  Scope: early application data on resumption (RFC 9001 §4.6): the
+  ticket announces `early_data` with the mandatory 0xffffffff (§4.6.1),
+  the client remembers the server's transport parameters alongside the
+  ticket and observes the remembered limits until the handshake
+  delivers fresh ones (RFC 9001 §7.4.1), 0-RTT packets are protected
+  with `client_early_traffic_secret`, and the server accepts or rejects
+  with the client falling back to resending the same data in 1-RTT.
+  NEW_TOKEN (RFC 9000 §8.1.3) rides along, so a resuming client also
+  presents an address validation token. Anti-replay is the freshness
+  check of RFC 8446 §8.3, the only mechanism of §8 compatible with the
+  stateless sealed-ticket design: the sealed ticket carries its issue
+  time and `age_add`, the server compares the client's claimed ticket
+  age against the actual age, and a claim outside the window downgrades
+  0-RTT to 1-RTT rather than aborting. Single-use tickets (§8.1) and
+  ClientHello recording (§8.2) are deliberately not used because both
+  reintroduce the per-ticket server state the sealed-ticket decision
+  removed. The teaching note, which belongs in module docstrings where
+  it applies: stateless 0-RTT accepts bounded replay, which is why only
+  idempotent application data (hq GETs) is ever sent early, and why
+  RFC 9001 §9.2 forbids carrying anything replay-sensitive in it.
