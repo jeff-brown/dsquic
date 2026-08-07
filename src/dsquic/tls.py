@@ -91,6 +91,8 @@ class ExtensionType(enum.IntEnum):
     SUPPORTED_GROUPS = 10
     SIGNATURE_ALGORITHMS = 13
     ALPN = 16
+    PRE_SHARED_KEY = 41
+    EARLY_DATA = 42
     SUPPORTED_VERSIONS = 43
     PSK_KEY_EXCHANGE_MODES = 45
     KEY_SHARE = 51
@@ -148,9 +150,12 @@ class KeySchedule:
     each handshake message in wire order before deriving.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, psk: bytes | None = None) -> None:
+        """§7.1: the Early Secret extracts a PSK when resuming, and all
+        zeros when not."""
         self._transcript = hashes.Hash(hashes.SHA256())
-        self._secret = hkdf_extract(bytes(SHA256_LENGTH), bytes(SHA256_LENGTH))
+        ikm = psk if psk is not None else bytes(SHA256_LENGTH)
+        self._secret = hkdf_extract(bytes(SHA256_LENGTH), ikm)
 
     def update_transcript(self, handshake_message: bytes) -> None:
         self._transcript.update(handshake_message)
@@ -186,6 +191,21 @@ class KeySchedule:
         derived = hkdf_expand_label(self._secret, b"derived", EMPTY_TRANSCRIPT_HASH, SHA256_LENGTH)
         self._secret = hkdf_extract(derived, bytes(SHA256_LENGTH))
 
+    def binder_key(self) -> bytes:
+        """§7.1: the base secret a PSK binder is computed from.
+
+        Derived at the Early Secret, before any ECDHE, because the binder
+        covers a ClientHello that has not been answered yet. The binder
+        itself is finished_verify_data over it, since §4.2.11.2 gives the
+        binder the same construction as a Finished message.
+        """
+        return hkdf_expand_label(self._secret, b"res binder", EMPTY_TRANSCRIPT_HASH, SHA256_LENGTH)
+
+    def resumption_master_secret(self) -> bytes:
+        """§7.1: derived at the Master Secret over the transcript through
+        the client's Finished, which is the last message it covers."""
+        return self._derive(b"res master")
+
     def client_handshake_traffic_secret(self) -> bytes:
         return self._derive(b"c hs traffic")
 
@@ -197,6 +217,16 @@ class KeySchedule:
 
     def server_application_traffic_secret(self) -> bytes:
         return self._derive(b"s ap traffic")
+
+
+def resumption_psk(resumption_master_secret: bytes, ticket_nonce: bytes) -> bytes:
+    """§4.6.1: the PSK a ticket stands for.
+
+    The nonce makes every ticket issued on one connection derive a
+    different PSK, so tickets cannot be correlated by the value they
+    carry.
+    """
+    return hkdf_expand_label(resumption_master_secret, b"resumption", ticket_nonce, SHA256_LENGTH)
 
 
 def finished_verify_data(base_secret: bytes, transcript_hash: bytes) -> bytes:
@@ -278,9 +308,18 @@ class Finished:
 
 @dataclass(frozen=True)
 class NewSessionTicket:
-    """RFC 8446 §4.6.1; carried opaquely and ignored (no resumption yet)."""
+    """RFC 8446 §4.6.1.
 
-    body: bytes
+    ``nonce`` is what makes each ticket stand for a different PSK, and
+    ``ticket`` is opaque to the client: only the server that issued it
+    can read it back.
+    """
+
+    lifetime: int
+    age_add: int
+    nonce: bytes
+    ticket: bytes
+    extensions: list[Extension]
 
 
 HandshakeMessage = (
@@ -339,6 +378,17 @@ def encode_server_hello(hello: ServerHello) -> bytes:
         + _encode_extensions(hello.extensions)
     )
     return _handshake_message(HandshakeType.SERVER_HELLO, body)
+
+
+def encode_new_session_ticket(message: NewSessionTicket) -> bytes:
+    body = (
+        message.lifetime.to_bytes(4, "big")
+        + message.age_add.to_bytes(4, "big")
+        + _vec(1, message.nonce)
+        + _vec(2, message.ticket)
+        + _encode_extensions(message.extensions)
+    )
+    return _handshake_message(HandshakeType.NEW_SESSION_TICKET, body)
 
 
 def encode_encrypted_extensions(message: EncryptedExtensions) -> bytes:
@@ -408,6 +458,16 @@ def _parse_certificate(buf: Buffer) -> Certificate:
     return Certificate(request_context=request_context, entries=entries)
 
 
+def _parse_new_session_ticket(buf: Buffer) -> NewSessionTicket:
+    return NewSessionTicket(
+        lifetime=buf.pull_uint32(),
+        age_add=buf.pull_uint32(),
+        nonce=buf.pull_bytes(buf.pull_uint8()),
+        ticket=buf.pull_bytes(buf.pull_uint16()),
+        extensions=_parse_extensions(buf),
+    )
+
+
 def _parse_certificate_verify(buf: Buffer) -> CertificateVerify:
     algorithm = buf.pull_uint16()
     return CertificateVerify(algorithm=algorithm, signature=buf.pull_bytes(buf.pull_uint16()))
@@ -440,7 +500,7 @@ def parse_handshake_message(data: bytes) -> tuple[HandshakeMessage, int]:
     elif message_type is HandshakeType.FINISHED:
         message = Finished(verify_data=body.pull_bytes(body.remaining))
     else:
-        message = NewSessionTicket(body=body.pull_bytes(body.remaining))
+        message = _parse_new_session_ticket(body)
     if not body.is_empty:
         raise HandshakeParseError(f"trailing bytes in {message_type.name}")
     return message, buf.position

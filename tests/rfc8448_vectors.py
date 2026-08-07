@@ -1,4 +1,4 @@
-"""RFC 8448 §3 (simple 1-RTT handshake) test vectors.
+"""RFC 8448 §3 (simple 1-RTT handshake) and §4 (resumption) test vectors.
 
 Extracted verbatim from rfc8448.txt; the octet counts printed in the
 RFC were verified against each value during extraction."""
@@ -90,4 +90,40 @@ SERVER_FINISHED_VERIFY = bytes.fromhex(  # 32 octets
 )
 CLIENT_FINISHED_VERIFY = bytes.fromhex(  # 32 octets
     "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"
+)
+
+
+# RFC 8448 §3, the ticket the server issues at the end of the handshake,
+# and §4, the resumption that follows from it.
+RESUMPTION_MASTER_SECRET = bytes.fromhex(  # 32 octets
+    "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"
+)
+TICKET_NONCE = bytes.fromhex("0000")  # 2 octets
+RESUMPTION_PSK = bytes.fromhex(  # 32 octets
+    "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3"
+)
+# The Early Secret of the resumed handshake, extracted from that PSK.
+EARLY_SECRET_FROM_PSK = bytes.fromhex(  # 32 octets
+    "9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c"
+)
+# §4 labels this "finished" because a binder is a Finished message over
+# the truncated ClientHello.
+BINDER_FINISHED_KEY = bytes.fromhex(  # 32 octets
+    "5588673e72cb59c87d220caffe94f2dea9a3b1609f7d50e90a48227db9ed7eaa"
+)
+BINDER_TRANSCRIPT_HASH = bytes.fromhex(  # 32 octets
+    "63224b2e4573f2d3454ca84b9d009a04f6be9e05711a8396473aefa01e924a14"
+)
+BINDER = bytes.fromhex(  # 32 octets
+    "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"
+)
+
+NEW_SESSION_TICKET = bytes.fromhex(  # 205 octets, RFC 8448 §3
+    "040000c90000001efad6aac502000000b22c035d829359ee5ff7af4ec9000000"
+    "00262a6494dc486d2c8a34cb33fa90bf1b0070ad3c498883c9367c09a2be785a"
+    "bc55cd226097a3a982117283f82a03a143efd3ff5dd36d64e861be7fd61d2827"
+    "db279cce145077d454a3664d4e6da4d29ee03725a6a4dafcd0fc67d2aea70529"
+    "513e3da2677fa5906c5b3f7d8f92f228bda40dda721470f9fbf297b5aea61764"
+    "6fac5c03272e970727c621a79141ef5f7de6505e5bfbc388e93343694093934a"
+    "e4d3570008002a000400000400"
 )

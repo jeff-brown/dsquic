@@ -42,6 +42,7 @@ from dsquic.tls import (
     HandshakeComplete,
     HandshakeParseError,
     KeySchedule,
+    NewSessionTicket,
     SecretAvailable,
     SendData,
     ServerConfig,
@@ -56,10 +57,13 @@ from dsquic.tls import (
     encode_client_hello,
     encode_encrypted_extensions,
     encode_finished,
+    encode_new_session_ticket,
     encode_server_hello,
     finished_verify_data,
+    hkdf_expand_label,
     hkdf_label,
     parse_handshake_message,
+    resumption_psk,
 )
 
 # --- RFC 8448 §3 vectors ------------------------------------------------------
@@ -634,3 +638,53 @@ def test_unexpected_message_order_raises(credentials: Credentials) -> None:
     with pytest.raises(TlsAlert) as excinfo:
         client.receive(EncryptionLevel.INITIAL, finished)
     assert excinfo.value.alert == UNEXPECTED_MESSAGE
+
+
+class TestResumptionKeySchedule:
+    """RFC 8448 §4 against the RFC 8446 §7.1 key schedule."""
+
+    def test_psk_comes_from_the_resumption_secret_and_nonce(self) -> None:
+        """§4.6.1: one PSK per ticket, keyed by the ticket's nonce."""
+        assert (
+            resumption_psk(rfc8448.RESUMPTION_MASTER_SECRET, rfc8448.TICKET_NONCE)
+            == rfc8448.RESUMPTION_PSK
+        )
+
+    def test_early_secret_extracts_the_psk(self) -> None:
+        """The binder key hangs off the Early Secret, so this pins the
+        extract step as well as the derivation."""
+        schedule = KeySchedule(psk=rfc8448.RESUMPTION_PSK)
+        finished_key = hkdf_expand_label(schedule.binder_key(), b"finished", b"", 32)
+        assert finished_key == rfc8448.BINDER_FINISHED_KEY
+
+    def test_binder_is_a_finished_over_the_truncated_client_hello(self) -> None:
+        """§4.2.11.2: the binder proves the client holds the PSK, and
+        covers the ClientHello up to the identities, since the binder
+        cannot cover itself."""
+        schedule = KeySchedule(psk=rfc8448.RESUMPTION_PSK)
+        binder = finished_verify_data(schedule.binder_key(), rfc8448.BINDER_TRANSCRIPT_HASH)
+        assert binder == rfc8448.BINDER
+
+    def test_each_ticket_nonce_gives_a_different_psk(self) -> None:
+        """§4.6.1: the nonce is why several tickets issued on one
+        connection cannot be correlated by the PSK they stand for."""
+        first = resumption_psk(rfc8448.RESUMPTION_MASTER_SECRET, b"\x00\x00")
+        second = resumption_psk(rfc8448.RESUMPTION_MASTER_SECRET, b"\x00\x01")
+        assert first == rfc8448.RESUMPTION_PSK
+        assert second != first
+
+
+def test_new_session_ticket_round_trips_the_spec_vector() -> None:
+    """RFC 8446 §4.6.1, against the 205-octet ticket of RFC 8448 §3.
+
+    The nonce is what the resumption PSK is derived from, so parsing it
+    correctly is what makes the ticket usable at all.
+    """
+    message, consumed = parse_handshake_message(rfc8448.NEW_SESSION_TICKET)
+    assert consumed == len(rfc8448.NEW_SESSION_TICKET)
+    assert isinstance(message, NewSessionTicket)
+    assert message.nonce == rfc8448.TICKET_NONCE
+    assert message.lifetime == 0x1E
+    assert encode_new_session_ticket(message) == rfc8448.NEW_SESSION_TICKET
+    # §4.2.10: the ticket says how much early data it permits.
+    assert [ext.type for ext in message.extensions] == [ExtensionType.EARLY_DATA]
