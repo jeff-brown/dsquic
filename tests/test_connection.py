@@ -20,10 +20,16 @@ from dsquic.connection import (
     HandshakeConfirmed,
     StreamDataReceived,
 )
-from dsquic.packet import parse_long_header
+from dsquic.packet import PacketType, parse_long_header
 from dsquic.qlog import QlogTrace
 from dsquic.recovery import MAX_PTO
-from dsquic.tls import ClientConfig, EncryptionLevel, ServerConfig
+from dsquic.tls import (
+    ClientConfig,
+    EncryptionLevel,
+    ServerConfig,
+    SessionTicket,
+    TlsClient,
+)
 from test_tls import Credentials, issue_leaf, make_ca
 
 VERIFICATION_TIME = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
@@ -90,6 +96,45 @@ def make_pair(
         config=ConnectionConfig(
             qlog=trace_into(server_qlog) if server_qlog is not None else None,
         ),
+        destination="client",
+    )
+    return client, server
+
+
+def make_resumption_pair(
+    credentials: Credentials,
+    ticket_key: bytes,
+    ticket: SessionTicket | None = None,
+    early_data: bool = False,
+    client_keylog: list[str] | None = None,
+) -> tuple[Connection, Connection]:
+    """A pair whose server can issue and accept session tickets."""
+    client = Connection(
+        is_client=True,
+        client_config=ClientConfig(
+            server_name="localhost",
+            alpn=[hq.ALPN],
+            transport_parameters=b"",
+            ca_certificates=credentials.ca,
+            verification_time=VERIFICATION_TIME,
+            session_ticket=ticket,
+            early_data=early_data,
+        ),
+        config=ConnectionConfig(
+            keylog=client_keylog.append if client_keylog is not None else None,
+        ),
+        destination="server",
+    )
+    server = Connection(
+        is_client=False,
+        server_config=ServerConfig(
+            certificate_chain=credentials.chain,
+            signing_key=credentials.key,
+            alpn=[hq.ALPN],
+            transport_parameters=b"",
+            ticket_key=ticket_key,
+        ),
+        config=ConnectionConfig(),
         destination="client",
     )
     return client, server
@@ -882,3 +927,72 @@ class TestClientKeyUpdate:
         phase = client.key_phase()
         self.transfer(client, server, now)
         assert client.key_phase() is phase
+
+
+class TestZeroRtt:
+    """RFC 9001 §4.6: early application data on a resumed connection."""
+
+    KEY = bytes(range(32))
+
+    def _ticket(self, credentials: Credentials) -> SessionTicket:
+        client, server = make_resumption_pair(credentials, self.KEY)
+        client.connect(0.0)
+        pump(client, server)
+        assert isinstance(client.tls, TlsClient)
+        return client.tls.session_tickets[0]
+
+    def test_data_rides_zero_rtt_before_the_handshake(self, credentials: Credentials) -> None:
+        """The first flight carries the request in a 0-RTT packet, and
+        the server acts on it before the handshake completes, which is
+        the round trip the feature exists to save."""
+        ticket = self._ticket(credentials)
+        keylog: list[str] = []
+        client, server = make_resumption_pair(
+            credentials, self.KEY, ticket, early_data=True, client_keylog=keylog
+        )
+        client.connect(0.0)
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, b"GET /early\r\n", end_stream=True)
+
+        flight = client.datagrams_to_send(0.0)
+        types = [parse_long_header(datagram.data).packet_type for datagram in flight]
+        assert PacketType.ZERO_RTT in types
+        # SSLKEYLOGFILE must carry the early secret or captures of
+        # these packets cannot be decrypted.
+        assert any(line.startswith("CLIENT_EARLY_TRAFFIC_SECRET") for line in keylog)
+
+        for datagram in flight:
+            server.datagram_received(datagram.data, 0.0, source="client")
+        state_during_flight = server.state
+        assert state_during_flight is ConnectionState.HANDSHAKING
+        received = [e for e in server.take_events() if isinstance(e, StreamDataReceived)]
+        assert received
+        assert received[0].data == b"GET /early\r\n"
+        assert received[0].end_stream
+
+        pump(client, server)
+        assert client.state is ConnectionState.CONNECTED
+        assert server.state is ConnectionState.CONNECTED
+        assert isinstance(client.tls, TlsClient)
+        assert client.tls.early_data_accepted
+
+    def test_rejected_zero_rtt_is_resent_in_one_rtt(self, credentials: Credentials) -> None:
+        """RFC 9001 §4.6.2: a server that cannot use the ticket ignores
+        the 0-RTT packets, and the client sends the same stream data
+        again in 1-RTT once the full handshake completes."""
+        ticket = self._ticket(credentials)
+        client, server = make_resumption_pair(
+            credentials, bytes(range(32, 64)), ticket, early_data=True
+        )
+        client.connect(0.0)
+        stream_id = client.open_stream()
+        client.send_stream_data(stream_id, b"GET /early\r\n", end_stream=True)
+        pump(client, server)
+
+        assert client.state is ConnectionState.CONNECTED
+        assert server.state is ConnectionState.CONNECTED
+        assert isinstance(client.tls, TlsClient)
+        assert not client.tls.early_data_accepted
+        received = [e for e in server.take_events() if isinstance(e, StreamDataReceived)]
+        assert received
+        assert received[0].data == b"GET /early\r\n"

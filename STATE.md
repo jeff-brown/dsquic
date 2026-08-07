@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  406 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  408 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -277,12 +277,24 @@ connection carrying many early requests.
 3. Done with step 2: `SessionTicket` on the client grew
    `max_early_data_size`, the ALPN, and the server's remembered
    transport parameters.
-4. `connection.py`: the 0-RTT packet type (long header 0x1), sharing
-   the application-data packet number space and flow control with
-   1-RTT (RFC 9000 §12.3); client sends stream data under remembered
-   limits before the handshake completes, and on reject retransmits
-   the same stream data in 1-RTT; the server installs early receive
-   keys after the ClientHello it accepts.
+4. Done: 0-RTT in `connection.py`, deliberately not a fourth `_Space`:
+   it shares the application space's packet numbers, recovery, and
+   flow control (§12.3), holding early send/recv keys beside the 1-RTT
+   ones. The client builds long-header 0x1 packets until 1-RTT send
+   keys exist, under stream state created at `connect()` from the
+   ticket's remembered parameters; the server installs early receive
+   keys and its stream state the moment TLS accepts, so 0-RTT stream
+   frames are served before its handshake completes. Reject requeues
+   everything 0-RTT carried into 1-RTT (RFC 9001 §4.6.2); acceptance
+   with reduced limits aborts (§7.4.1, `reduces_zero_rtt_limits` in
+   transport_parameters.py, also the server's acceptance test, since
+   the CID-authentication fields differ per connection and byte
+   equality of encoded parameters never holds). Frames §12.4 bars from
+   0-RTT are rejected; both sides keylog CLIENT_EARLY_TRAFFIC_SECRET;
+   qlog says "0RTT". Early keys drop at completion (client) and
+   confirmation (server, §4.9.3). A resuming client that hits a
+   HelloRetryRequest keeps its pre-retry 0-RTT data only via the
+   handshake-probe resend path, which is slow but converges.
 5. Server anti-replay: the §8.3 window over the sealed issue time and
    the offered obfuscated age; outside it, accept the PSK but refuse
    early data.

@@ -68,6 +68,7 @@ from cryptography.x509 import DNSName, load_der_x509_certificate
 from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
 
 from dsquic.buffer import Buffer
+from dsquic.transport_parameters import decode_transport_parameters, reduces_zero_rtt_limits
 
 TLS_AES_128_GCM_SHA256 = 0x1301
 TLS_LEGACY_VERSION = 0x0303  # frozen at "TLS 1.2" (RFC 8446 §4.1.2)
@@ -1066,6 +1067,9 @@ class TlsClient(_Handshake):
         # server's EncryptedExtensions accepted it.
         self._early_data_offered = False
         self.early_data_accepted = False
+        # RFC 9001 §5.1: the secret 0-RTT packets are protected with,
+        # set when the offer goes out and cleared by a retry (§4.1.4).
+        self.early_secret: bytes | None = None
         if config.session_ticket is not None:
             # §7.1: resuming extracts the PSK into the Early Secret, and
             # the binder is derived from it, so the schedule has to carry
@@ -1163,6 +1167,11 @@ class TlsClient(_Handshake):
             self.schedule.update_transcript(raw)
         if self._fallback_schedule is not None:
             self._fallback_schedule.update_transcript(raw)
+        if self._early_data_offered:
+            # §7.1: derived over the ClientHello alone, so it exists
+            # before the server answers, which is the point of 0-RTT.
+            self.early_secret = self.schedule.client_early_traffic_secret()
+            self._keylog("CLIENT_EARLY_TRAFFIC_SECRET", self.early_secret)
         self.events.append(SendData(EncryptionLevel.INITIAL, raw))
         self.state = ClientState.WAIT_SERVER_HELLO
 
@@ -1222,6 +1231,9 @@ class TlsClient(_Handshake):
         if group in self._keys:
             raise TlsAlert(ILLEGAL_PARAMETER, "HelloRetryRequest asks for a group already shared")
         self._hello_retried = True
+        # §4.1.4: no early data after a retry; the keys derived from
+        # this secret must not protect anything further.
+        self.early_secret = None
         # §4.4.1: ClientHello1 becomes a message_hash before the retry.
         self.schedule.replace_transcript_with_message_hash()
         self.schedule.update_transcript(raw)
@@ -1422,11 +1434,14 @@ class TlsServer(_Handshake):
         self._key = key if key is not None else X25519PrivateKey.generate()
         self._hello_retry_sent = False
         self._alpn = ""
-        self._client_transport_parameters = b""
+        self.client_transport_parameters = b""
         # §2.2: whether this handshake resumed a session via a PSK.
         self.resumed = False
         # §4.2.10: whether this handshake accepted the client's 0-RTT.
         self.early_data_accepted = False
+        # RFC 9001 §5.1: the secret the accepted 0-RTT packets are
+        # protected with; None while nothing is accepted.
+        self.early_secret: bytes | None = None
         # §4.2.9: whether the client advertised psk_dhe_ke, without
         # which no ticket it could use can be issued.
         self._client_supports_resumption = False
@@ -1526,6 +1541,45 @@ class TlsServer(_Handshake):
             return index, state
         return None
 
+    def _resolve_psk_offer(
+        self, hello: ClientHello, raw: bytes, alpn: str
+    ) -> tuple[int, TicketState] | None:
+        """Settle resumption and early data, and feed the transcript.
+
+        Selects a PSK (or None), records what the hello advertised,
+        decides 0-RTT, rebuilds the schedule around the PSK before it
+        sees this ClientHello (§7.1), and derives the early traffic
+        secret while the transcript still ends at the hello.
+        """
+        selected = self._select_psk(hello, raw)
+        self.resumed = selected is not None
+        modes = _find_extension(hello.extensions, ExtensionType.PSK_KEY_EXCHANGE_MODES)
+        self._client_supports_resumption = modes is not None and PSK_DHE_KE in modes[1:]
+        early_data = _find_extension(hello.extensions, ExtensionType.EARLY_DATA)
+        self.early_data_accepted = (
+            early_data is not None
+            and selected is not None
+            # §4.2.10: early data rides only on the first offered
+            # identity, and only if nothing the client may remember has
+            # changed: the same ALPN, and no limit among the transport
+            # parameters it is allowed to act on reduced (RFC 9001
+            # §7.4.1). The CID authentication fields differ on every
+            # connection, which is why this is not byte equality.
+            and selected[0] == 0
+            and selected[1].alpn == alpn
+            and not reduces_zero_rtt_limits(
+                decode_transport_parameters(selected[1].transport_parameters),
+                decode_transport_parameters(self._config.transport_parameters),
+            )
+        )
+        if selected is not None:
+            self.schedule = KeySchedule(psk=selected[1].psk)
+        self.schedule.update_transcript(raw)
+        if self.early_data_accepted:
+            self.early_secret = self.schedule.client_early_traffic_secret()
+            self._keylog("CLIENT_EARLY_TRAFFIC_SECRET", self.early_secret)
+        return selected
+
     def _on_client_hello(self, hello: ClientHello, raw: bytes) -> None:
         if TLS_AES_128_GCM_SHA256 not in hello.cipher_suites:
             raise TlsAlert(HANDSHAKE_FAILURE, "client did not offer TLS_AES_128_GCM_SHA256")
@@ -1555,27 +1609,7 @@ class TlsServer(_Handshake):
         alpn = self._negotiate_alpn(hello)
         self._client_random = hello.random
 
-        selected = self._select_psk(hello, raw)
-        self.resumed = selected is not None
-        modes = _find_extension(hello.extensions, ExtensionType.PSK_KEY_EXCHANGE_MODES)
-        self._client_supports_resumption = modes is not None and PSK_DHE_KE in modes[1:]
-        early_data = _find_extension(hello.extensions, ExtensionType.EARLY_DATA)
-        self.early_data_accepted = (
-            early_data is not None
-            and selected is not None
-            # §4.2.10: early data rides only on the first offered
-            # identity, and only if nothing the ticket remembers would
-            # change: same ALPN, and transport parameters this server
-            # still sends verbatim (RFC 9001 §7.4.1).
-            and selected[0] == 0
-            and selected[1].alpn == alpn
-            and selected[1].transport_parameters == self._config.transport_parameters
-        )
-        if selected is not None:
-            # §7.1: resuming extracts the PSK into the Early Secret, so
-            # the schedule is rebuilt before it sees this ClientHello.
-            self.schedule = KeySchedule(psk=selected[1].psk)
-        self.schedule.update_transcript(raw)
+        selected = self._resolve_psk_offer(hello, raw, alpn)
         server_hello = ServerHello(
             random=self._random,
             legacy_session_id_echo=hello.legacy_session_id,
@@ -1630,7 +1664,7 @@ class TlsServer(_Handshake):
         self.events.append(SendData(EncryptionLevel.HANDSHAKE, flight + finished))
         self._emit_application_secrets()
         self._alpn = alpn
-        self._client_transport_parameters = client_transport_parameters
+        self.client_transport_parameters = client_transport_parameters
         self.state = ServerState.WAIT_FINISHED
 
     def _certificate_messages(self) -> bytes:
@@ -1660,7 +1694,7 @@ class TlsServer(_Handshake):
         if message.verify_data != expected:
             raise TlsAlert(DECRYPT_ERROR, "client Finished verify_data mismatch")
         self.schedule.update_transcript(raw)
-        self.events.append(HandshakeComplete(self._alpn, self._client_transport_parameters))
+        self.events.append(HandshakeComplete(self._alpn, self.client_transport_parameters))
         self.state = ServerState.CONNECTED
         self._issue_session_ticket()
 

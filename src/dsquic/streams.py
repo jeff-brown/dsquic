@@ -338,6 +338,24 @@ class StreamManager:
         )
         return stream_id
 
+    def update_peer_limits(self, peer: FlowControlLimits) -> None:
+        """Adopt the limits the handshake delivered, after 0-RTT ran
+        under remembered ones (RFC 9001 §7.4.1).
+
+        The caller aborts if a server that accepted 0-RTT reduced a
+        limit; after a rejection the fresh values simply replace the
+        remembered ones. Every stream that can exist here is
+        locally-initiated and bidirectional, since nothing
+        peer-initiated is processed before the handshake completes.
+        """
+        self._peer = peer
+        self.max_data = peer.max_data
+        self.max_streams_bidi = peer.max_streams_bidi
+        self.max_streams_uni = peer.max_streams_uni
+        for half in self._streams.values():
+            if half.send is not None:
+                half.send.on_max_stream_data(peer.max_stream_data_bidi_remote)
+
     def send_stream(self, stream_id: int) -> SendStream:
         half = self._streams[stream_id]
         if half.send is None:

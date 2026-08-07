@@ -116,3 +116,28 @@ def decode_transport_parameters(data: bytes) -> TransportParameters:
         active_connection_id_limit=as_int(ACTIVE_CONNECTION_ID_LIMIT, 2),
         max_datagram_frame_size=Buffer(datagram_size).pull_varint() if datagram_size else None,
     )
+
+
+def reduces_zero_rtt_limits(remembered: TransportParameters, current: TransportParameters) -> bool:
+    """RFC 9001 §7.4.1: whether ``current`` reduces a limit 0-RTT data
+    may have been sent under.
+
+    These are the parameters a client is permitted to remember from an
+    earlier connection. A server refuses 0-RTT rather than reduce one;
+    a client aborts if a server that accepted 0-RTT reduced one anyway.
+    """
+    return (
+        current.initial_max_data < remembered.initial_max_data
+        or (
+            current.initial_max_stream_data_bidi_local
+            < remembered.initial_max_stream_data_bidi_local
+        )
+        or (
+            current.initial_max_stream_data_bidi_remote
+            < remembered.initial_max_stream_data_bidi_remote
+        )
+        or current.initial_max_stream_data_uni < remembered.initial_max_stream_data_uni
+        or current.initial_max_streams_bidi < remembered.initial_max_streams_bidi
+        or current.initial_max_streams_uni < remembered.initial_max_streams_uni
+        or current.active_connection_id_limit < remembered.active_connection_id_limit
+    )

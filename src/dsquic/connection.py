@@ -14,13 +14,18 @@ tunnelled through an outer one.
 
 Packet numbers, ACK state, and CRYPTO reassembly exist once per packet
 number space (Initial, Handshake, Application), keyed by
-tls.EncryptionLevel.
+tls.EncryptionLevel. 0-RTT is not a fourth space: it shares the
+application space's packet numbers and flow control (§12.3), carrying
+early stream data under its own keys (RFC 9001 §5.1) within the limits
+remembered from the ticket's connection (RFC 9001 §7.4.1), with
+rejected data resent in 1-RTT (RFC 9001 §4.6.2).
 
-Key update is implemented (RFC 9001 §6); Version Negotiation is answered
-statelessly in packet.py, before any connection exists. Not in this MVP:
-Retry, migration, stateless reset, NEW_CONNECTION_ID issuance, and
-0-RTT. Received frames for those features are parsed and ignored where
-the spec permits.
+Key update is implemented (RFC 9001 §6); Retry and the address
+validation tokens live in retry.py; Version Negotiation is answered
+statelessly in packet.py, before any connection exists. Not in this
+MVP: migration, stateless reset, and NEW_CONNECTION_ID issuance.
+Received frames for those features are parsed and ignored where the
+spec permits.
 """
 
 import enum
@@ -44,6 +49,8 @@ from dsquic.frames import (
     MaxData,
     MaxStreamData,
     MaxStreams,
+    NewToken,
+    PathResponse,
     Ping,
     Stream,
     StreamsBlocked,
@@ -100,7 +107,11 @@ from dsquic.tls import (
     TlsClient,
     TlsServer,
 )
-from dsquic.transport_parameters import TransportParameters, decode_transport_parameters
+from dsquic.transport_parameters import (
+    TransportParameters,
+    decode_transport_parameters,
+    reduces_zero_rtt_limits,
+)
 
 MIN_INITIAL_DATAGRAM = 1200  # §14.1: a client Initial datagram floor
 DEFAULT_MAX_DATAGRAM_SIZE = 1200  # conservative default; per-connection config
@@ -125,6 +136,18 @@ _QLOG_PACKET_TYPE = {
     EncryptionLevel.HANDSHAKE: "handshake",
     EncryptionLevel.ONE_RTT: "1RTT",
 }
+
+
+def _flow_limits(parameters: TransportParameters) -> FlowControlLimits:
+    """One side's initial limits, read off its transport parameters (§18.2)."""
+    return FlowControlLimits(
+        max_data=parameters.initial_max_data,
+        max_stream_data_bidi_local=parameters.initial_max_stream_data_bidi_local,
+        max_stream_data_bidi_remote=parameters.initial_max_stream_data_bidi_remote,
+        max_stream_data_uni=parameters.initial_max_stream_data_uni,
+        max_streams_bidi=parameters.initial_max_streams_bidi,
+        max_streams_uni=parameters.initial_max_streams_uni,
+    )
 
 
 class ConnectionError_(Exception):
@@ -206,6 +229,13 @@ class _Space:
 
     keys_send: PacketKeys | None = None
     keys_recv: PacketKeys | None = None
+    # 0-RTT keys (RFC 9001 §5.1). Not a fourth space: 0-RTT shares the
+    # application space's packet numbers and flow control (§12.3); only
+    # the keys and the long header differ. The client holds send keys,
+    # the server receive keys, and each side drops them when the
+    # handshake settles what 0-RTT anticipated.
+    keys_send_early: PacketKeys | None = None
+    keys_recv_early: PacketKeys | None = None
     next_packet_number: int = 0
     largest_received: int = -1
     received: RangeSet = field(default_factory=RangeSet)
@@ -322,6 +352,9 @@ class Connection:
         self.peer_parameters: TransportParameters | None = None
 
         self.tls: TlsClient | TlsServer | None = None
+        # RFC 9001 §7.4.1: the transport parameters 0-RTT is sent
+        # under, remembered from the connection that issued the ticket.
+        self._remembered_parameters: TransportParameters | None = None
         if is_client:
             if client_config is None:
                 raise ValueError("client_config is required for a client connection")
@@ -329,6 +362,10 @@ class Connection:
                 replace(client_config, transport_parameters=self._local_parameters.encode()),
                 keylog=self.config.keylog,
             )
+            if client_config.early_data and client_config.session_ticket is not None:
+                self._remembered_parameters = decode_transport_parameters(
+                    client_config.session_ticket.transport_parameters
+                )
         elif server_config is None:
             raise ValueError("server_config is required for a server connection")
 
@@ -388,7 +425,12 @@ class Connection:
                 space.secret_recv_next, space.keys_recv_next = next_generation(event.secret, keys)
 
     def _decrypt(
-        self, space: _Space, level: EncryptionLevel, packet: bytes, pn_offset: int, now: float
+        self,
+        level: EncryptionLevel,
+        packet: bytes,
+        pn_offset: int,
+        now: float,
+        zero_rtt: bool = False,
     ) -> tuple[int, bytes] | None:
         """Unprotect one packet, or None if it does not authenticate.
 
@@ -396,6 +438,19 @@ class Connection:
         every key generation (§6); the key phase and packet number it
         recovers are what select the packet protection keys.
         """
+        space = self._spaces[level]
+        if zero_rtt:
+            # RFC 9001 §5.1: 0-RTT has its own keys and no key phase;
+            # the §6 rotation below concerns only 1-RTT generations.
+            assert space.keys_recv_early is not None
+            try:
+                unprotected = remove_header_protection(
+                    space.keys_recv_early.hp, packet, pn_offset, space.largest_received
+                )
+                payload = decrypt_payload(space.keys_recv_early, unprotected)
+            except (InvalidTag, ValueError):
+                return None
+            return unprotected.packet_number, payload
         assert space.keys_recv is not None
         try:
             unprotected = remove_header_protection(
@@ -580,9 +635,14 @@ class Connection:
         level = {
             PacketType.INITIAL: EncryptionLevel.INITIAL,
             PacketType.HANDSHAKE: EncryptionLevel.HANDSHAKE,
+            # §12.3: 0-RTT shares the application data packet number
+            # space; only its keys and header differ from 1-RTT.
+            PacketType.ZERO_RTT: EncryptionLevel.ONE_RTT,
         }.get(long_header.packet_type)
         if level is None:
-            return None  # 0-RTT: not supported, stop parsing this datagram
+            return None  # unsupported type: stop parsing this datagram
+        if self.is_client and long_header.packet_type is PacketType.ZERO_RTT:
+            return None  # §17.2.3: only clients send 0-RTT
         if not self.is_client and level is EncryptionLevel.INITIAL:
             self._open_qlog(long_header.destination_cid, now)
             self._adopt_client_initial(long_header.destination_cid, long_header.source_cid)
@@ -694,21 +754,30 @@ class Connection:
             self._drop(now, qlog.DROP_INVALID, len(data))
             return 0
         level, pn_offset, packet, packet_end = located
+        # §17.2.3: a long header at the application level is 0-RTT.
+        zero_rtt = level is EncryptionLevel.ONE_RTT and bool(packet[0] & 0x80)
 
         space = self._spaces[level]
-        if space.keys_recv is None or space.discarded:
+        keys_recv = space.keys_recv_early if zero_rtt else space.keys_recv
+        if keys_recv is None or space.discarded:
             # No keys yet, or the space is retired: drop this packet and
-            # keep parsing the datagram.
+            # keep parsing the datagram. Unaccepted 0-RTT lands here,
+            # since its keys are only installed on acceptance.
             self._drop(now, qlog.DROP_KEY_UNAVAILABLE, packet_end, level)
             return packet_end
-        if level is EncryptionLevel.ONE_RTT and self.state is ConnectionState.HANDSHAKING:
+        if (
+            level is EncryptionLevel.ONE_RTT
+            and not zero_rtt
+            and self.state is ConnectionState.HANDSHAKING
+        ):
             # RFC 9001 §5.7: 1-RTT packets are neither decrypted nor
             # processed before the handshake completes, and are not
             # acknowledged, since an acknowledgement asserts the frames
-            # were handled. The peer retransmits.
+            # were handled. The peer retransmits. 0-RTT is exempt:
+            # arriving before the handshake completes is its purpose.
             self._drop(now, qlog.DROP_GENERAL, packet_end, level)
             return packet_end
-        decrypted = self._decrypt(space, level, packet, pn_offset, now)
+        decrypted = self._decrypt(level, packet, pn_offset, now, zero_rtt)
         if decrypted is None:
             # §12.2: failed decryption is not fatal.
             self._drop(now, qlog.DROP_DECRYPTION_FAILURE, packet_end, level)
@@ -719,7 +788,10 @@ class Connection:
             return packet_end
         # Logged in _handle_payload, once the frames it carries are parsed.
         received: dict[str, object] = {
-            "header": {"packet_type": _QLOG_PACKET_TYPE[level], "packet_number": packet_number},
+            "header": {
+                "packet_type": "0RTT" if zero_rtt else _QLOG_PACKET_TYPE[level],
+                "packet_number": packet_number,
+            },
             "raw": {"length": packet_end},
         }
         space.received.add(packet_number, packet_number + 1)
@@ -733,7 +805,7 @@ class Connection:
             # keys prove the client processed the server's Initial.
             self._discard_space(EncryptionLevel.INITIAL, now)
             self._address_validated = True
-        self._handle_payload(level, payload, now, received)
+        self._handle_payload(level, payload, now, received, zero_rtt)
         return packet_end
 
     def _parameters_for(self, initial_dcid: bytes) -> TransportParameters:
@@ -776,7 +848,12 @@ class Connection:
             self.peer_cid = scid
 
     def _handle_payload(
-        self, level: EncryptionLevel, payload: bytes, now: float, received: dict[str, object]
+        self,
+        level: EncryptionLevel,
+        payload: bytes,
+        now: float,
+        received: dict[str, object],
+        zero_rtt: bool = False,
     ) -> None:
         try:
             parsed = parse_frames(payload)
@@ -786,6 +863,13 @@ class Connection:
         self._log(now, qlog.PACKET_RECEIVED, received)
         space = self._spaces[level]
         for frame in parsed:
+            if zero_rtt and isinstance(frame, Ack | Crypto | NewToken | PathResponse):
+                # §12.4 Table 3: these frames may not appear in 0-RTT
+                # packets. HANDSHAKE_DONE is also barred, but a client
+                # sending it is already an error at any level.
+                raise ConnectionError_(
+                    frames.PROTOCOL_VIOLATION, "frame not permitted in a 0-RTT packet"
+                )
             if is_ack_eliciting(frame):
                 space.ack_eliciting_pending = True
             self._handle_frame(level, frame, now)
@@ -1012,6 +1096,38 @@ class Connection:
                 self._on_secret(event)
             else:
                 self._on_handshake_complete(event, now)
+        self._sync_early_keys()
+
+    def _sync_early_keys(self) -> None:
+        """Install or drop 0-RTT keys as TLS settles them (RFC 9001 §5.1).
+
+        The client's early secret exists once its hello is built and
+        vanishes on a HelloRetryRequest (§4.1.4); the server's appears
+        when it accepts the offer, and 0-RTT stream frames follow
+        immediately, so the server's stream state must exist by then,
+        built from the transport parameters the same hello carried.
+        """
+        assert self.tls is not None
+        space = self._spaces[EncryptionLevel.ONE_RTT]
+        secret = self.tls.early_secret
+        if secret is None:
+            space.keys_send_early = None
+            return
+        if self.is_client:
+            if space.keys_send_early is None:
+                space.keys_send_early = derive_packet_keys(secret)
+        elif space.keys_recv_early is None:
+            space.keys_recv_early = derive_packet_keys(secret)
+            assert isinstance(self.tls, TlsServer)
+            if self.streams is None:
+                self.peer_parameters = decode_transport_parameters(
+                    self.tls.client_transport_parameters
+                )
+                self.streams = StreamManager(
+                    is_client=False,
+                    local=_flow_limits(self._local_parameters),
+                    peer=_flow_limits(self.peer_parameters),
+                )
 
     def _on_handshake_complete(self, event: HandshakeComplete, now: float) -> None:
         self.alpn = event.alpn
@@ -1028,27 +1144,41 @@ class Connection:
             },
         )
         self._validate_peer_parameters()
-        local = self._local_parameters
         peer = self.peer_parameters
-        self.streams = StreamManager(
-            is_client=self.is_client,
-            local=FlowControlLimits(
-                max_data=local.initial_max_data,
-                max_stream_data_bidi_local=local.initial_max_stream_data_bidi_local,
-                max_stream_data_bidi_remote=local.initial_max_stream_data_bidi_remote,
-                max_stream_data_uni=local.initial_max_stream_data_uni,
-                max_streams_bidi=local.initial_max_streams_bidi,
-                max_streams_uni=local.initial_max_streams_uni,
-            ),
-            peer=FlowControlLimits(
-                max_data=peer.initial_max_data,
-                max_stream_data_bidi_local=peer.initial_max_stream_data_bidi_local,
-                max_stream_data_bidi_remote=peer.initial_max_stream_data_bidi_remote,
-                max_stream_data_uni=peer.initial_max_stream_data_uni,
-                max_streams_bidi=peer.initial_max_streams_bidi,
-                max_streams_uni=peer.initial_max_streams_uni,
-            ),
-        )
+        if self.streams is None:
+            self.streams = StreamManager(
+                is_client=self.is_client,
+                local=_flow_limits(self._local_parameters),
+                peer=_flow_limits(peer),
+            )
+        elif self.is_client:
+            # The streams already exist because 0-RTT ran under
+            # remembered parameters. A server that accepted 0-RTT may
+            # not reduce the limits it accepted under (RFC 9001
+            # §7.4.1); after a rejection the fresh values simply take
+            # over.
+            assert isinstance(self.tls, TlsClient)
+            assert self._remembered_parameters is not None
+            if self.tls.early_data_accepted and reduces_zero_rtt_limits(
+                self._remembered_parameters, peer
+            ):
+                raise ConnectionError_(
+                    frames.PROTOCOL_VIOLATION,
+                    "limits reduced under accepted 0-RTT (RFC 9001 §7.4.1)",
+                )
+            self.streams.update_peer_limits(_flow_limits(peer))
+        space = self._spaces[EncryptionLevel.ONE_RTT]
+        space.keys_send_early = None
+        if (
+            self.is_client
+            and isinstance(self.tls, TlsClient)
+            and self.tls.early_secret is not None
+            and not self.tls.early_data_accepted
+        ):
+            # RFC 9001 §4.6.2: rejected 0-RTT is never acknowledged;
+            # everything it carried is sent again in 1-RTT packets.
+            for sent in self.recovery.restart_space(EncryptionLevel.ONE_RTT):
+                self._requeue_lost(sent)
         self.state = ConnectionState.CONNECTED
         self._events.append(HandshakeCompleted(alpn=self.alpn))
         if not self.is_client:
@@ -1087,6 +1217,9 @@ class Connection:
     def _confirm_handshake(self, now: float) -> None:
         """§4.9.2: confirmation discards Handshake keys and enables the
         application-space PTO."""
+        # §4.9.3: 0-RTT receive keys go with it; reordered 0-RTT can no
+        # longer arrive once the client has confirmed.
+        self._spaces[EncryptionLevel.ONE_RTT].keys_recv_early = None
         self.recovery.handshake_confirmed = True
         self._discard_space(EncryptionLevel.HANDSHAKE, now)
         if self.is_client:
@@ -1206,7 +1339,10 @@ class Connection:
         payload = bytearray()
         for level in (EncryptionLevel.INITIAL, EncryptionLevel.HANDSHAKE, EncryptionLevel.ONE_RTT):
             space = self._spaces[level]
-            if space.keys_send is None or space.discarded:
+            has_send_keys = space.keys_send is not None or (
+                level is EncryptionLevel.ONE_RTT and space.keys_send_early is not None
+            )
+            if not has_send_keys or space.discarded:
                 continue
             room = size_limit - len(payload)
             # An Initial fills its datagram to the floor, so nothing is
@@ -1357,7 +1493,11 @@ class Connection:
         reaches that size, which is how §14.1 expansion is done.
         """
         space = self._spaces[level]
-        assert space.keys_send is not None
+        # RFC 9001 §5.6: 0-RTT protection lasts only until 1-RTT send
+        # keys exist; after that the application space uses them.
+        zero_rtt = level is EncryptionLevel.ONE_RTT and space.keys_send is None
+        keys_send = space.keys_send_early if zero_rtt else space.keys_send
+        assert keys_send is not None
         header_overhead = 64  # bounded: long header, CIDs, length, PN
         if room <= header_overhead + AEAD_TAG_LENGTH:
             return None
@@ -1379,11 +1519,11 @@ class Connection:
         pn_bytes = encode_packet_number(packet_number, None)
         pn_length = len(pn_bytes)
 
-        if level is EncryptionLevel.ONE_RTT:
+        if level is EncryptionLevel.ONE_RTT and not zero_rtt:
             header = bytes([_short_header_first_byte(space, pn_length)]) + self.peer_cid + pn_bytes
         else:
             template = LongHeaderTemplate(
-                packet_type=LEVEL_TO_PACKET_TYPE[level],
+                packet_type=PacketType.ZERO_RTT if zero_rtt else LEVEL_TO_PACKET_TYPE[level],
                 version=QUIC_V1,
                 destination_cid=self.peer_cid,
                 source_cid=self.host_cid,
@@ -1408,14 +1548,17 @@ class Connection:
                 packet_number=packet_number,
                 packet_number_length=pn_length,
             )
-        packet = protect(space.keys_send, header, payload, packet_number)
+        packet = protect(keys_send, header, payload, packet_number)
 
         ack_eliciting = any(is_ack_eliciting(frame) for frame in chosen)
         self._log(
             now,
             qlog.PACKET_SENT,
             {
-                "header": {"packet_type": _QLOG_PACKET_TYPE[level], "packet_number": packet_number},
+                "header": {
+                    "packet_type": "0RTT" if zero_rtt else _QLOG_PACKET_TYPE[level],
+                    "packet_number": packet_number,
+                },
                 "raw": {"length": len(packet)},
                 "frames": [qlog.frame_detail(frame) for frame in chosen],
             },
@@ -1596,6 +1739,15 @@ class Connection:
         self._open_qlog(self._initial_dcid, now)
         self.tls.start(now)
         self._drain_tls_events(now)
+        if self.tls.early_secret is not None and self._remembered_parameters is not None:
+            # RFC 9001 §7.4.1: 0-RTT streams run under the limits
+            # remembered with the ticket until the handshake delivers
+            # fresh ones.
+            self.streams = StreamManager(
+                is_client=True,
+                local=_flow_limits(self._local_parameters),
+                peer=_flow_limits(self._remembered_parameters),
+            )
         self._arm_idle_timer(now)
 
     def open_stream(self) -> int:

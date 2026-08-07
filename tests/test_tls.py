@@ -81,6 +81,17 @@ from dsquic.tls import (
     resumption_psk,
     seal_ticket,
 )
+from dsquic.transport_parameters import TransportParameters
+
+# Real encodings rather than opaque blobs: 0-RTT acceptance decodes the
+# transport parameters a ticket sealed (RFC 9001 §7.4.1).
+CLIENT_PARAMETERS = TransportParameters(initial_max_data=1 << 16).encode()
+SERVER_PARAMETERS = TransportParameters(
+    initial_max_data=1 << 16,
+    initial_max_stream_data_bidi_remote=1 << 15,
+    initial_max_streams_bidi=8,
+).encode()
+REDUCED_PARAMETERS = TransportParameters(initial_max_data=1 << 10).encode()
 
 # --- RFC 8448 §3 vectors ------------------------------------------------------
 
@@ -315,7 +326,7 @@ def make_client(
     config = ClientConfig(
         server_name=server_name,
         alpn=alpn if alpn is not None else ["hq-interop"],
-        transport_parameters=b"client-params",
+        transport_parameters=CLIENT_PARAMETERS,
         ca_certificates=[] if insecure_skip_verify else credentials.ca,
         insecure_skip_verify=insecure_skip_verify,
         verification_time=VERIFICATION_TIME,
@@ -334,7 +345,7 @@ def make_server(
         certificate_chain=credentials.chain,
         signing_key=credentials.key,
         alpn=alpn if alpn is not None else ["hq-interop"],
-        transport_parameters=b"server-params",
+        transport_parameters=SERVER_PARAMETERS,
         ticket_key=ticket_key,
     )
     return TlsServer(config, key=key, keylog=keylog.append if keylog is not None else None)
@@ -389,8 +400,8 @@ def test_in_memory_handshake_completes(credentials: Credentials) -> None:
     server_done = next(e for e in server_events if isinstance(e, HandshakeComplete))
     assert client_done.alpn == "hq-interop"
     assert server_done.alpn == "hq-interop"
-    assert client_done.peer_transport_parameters == b"server-params"
-    assert server_done.peer_transport_parameters == b"client-params"
+    assert client_done.peer_transport_parameters == SERVER_PARAMETERS
+    assert server_done.peer_transport_parameters == CLIENT_PARAMETERS
 
 
 def test_handshake_secrets_feed_packet_protection(credentials: Credentials) -> None:
@@ -463,7 +474,7 @@ def test_expired_certificate_rejected(credentials: Credentials) -> None:
     config = ClientConfig(
         server_name="localhost",
         alpn=["hq-interop"],
-        transport_parameters=b"client-params",
+        transport_parameters=CLIENT_PARAMETERS,
         ca_certificates=credentials.ca,
         verification_time=datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC),
     )
@@ -537,7 +548,7 @@ class TestHelloRetryRequest:
         config = ClientConfig(
             server_name="localhost",
             alpn=["hq-interop"],
-            transport_parameters=b"client-params",
+            transport_parameters=CLIENT_PARAMETERS,
             ca_certificates=credentials.ca,
             verification_time=VERIFICATION_TIME,
             key_share_groups=[],  # offer groups, send no shares
@@ -762,7 +773,7 @@ class TestSessionTickets:
         psk=bytes(range(32, 64)),
         age_add=0x01020304,
         alpn="hq-interop",
-        transport_parameters=b"server-params",
+        transport_parameters=SERVER_PARAMETERS,
         issued_at=1000,
     )
 
@@ -849,7 +860,7 @@ def test_a_client_offers_a_ticket_with_a_verifiable_binder(credentials: Credenti
         ClientConfig(
             server_name="localhost",
             alpn=["hq-interop"],
-            transport_parameters=b"client-params",
+            transport_parameters=CLIENT_PARAMETERS,
             ca_certificates=credentials.ca,
             verification_time=VERIFICATION_TIME,
             session_ticket=ticket,
@@ -887,7 +898,7 @@ def make_resuming_client(
     config = ClientConfig(
         server_name="localhost",
         alpn=alpn if alpn is not None else ["hq-interop"],
-        transport_parameters=b"client-params",
+        transport_parameters=CLIENT_PARAMETERS,
         ca_certificates=credentials.ca,
         verification_time=VERIFICATION_TIME,
         session_ticket=ticket,
@@ -1044,7 +1055,7 @@ def test_resumption_completes_without_a_certificate(credentials: Credentials) ->
     assert open_ticket(key, chained.identity, now=0.0, lifetime=7200.0).psk == chained.psk
     done = next(e for e in client_events if isinstance(e, HandshakeComplete))
     assert done.alpn == "hq-interop"
-    assert done.peer_transport_parameters == b"server-params"
+    assert done.peer_transport_parameters == SERVER_PARAMETERS
 
 
 def test_a_declined_offer_falls_back_to_a_full_handshake(credentials: Credentials) -> None:
@@ -1074,7 +1085,7 @@ def test_a_retried_hello_recomputes_its_binder(credentials: Credentials) -> None
         ClientConfig(
             server_name="localhost",
             alpn=["hq-interop"],
-            transport_parameters=b"client-params",
+            transport_parameters=CLIENT_PARAMETERS,
             ca_certificates=credentials.ca,
             verification_time=VERIFICATION_TIME,
             session_ticket=ticket,
@@ -1161,7 +1172,7 @@ def test_a_ticket_permits_early_data(credentials: Credentials) -> None:
     ticket = obtain_ticket(credentials, bytes(range(32)))
     assert ticket.max_early_data_size == MAX_EARLY_DATA_SIZE
     assert ticket.alpn == "hq-interop"
-    assert ticket.transport_parameters == b"server-params"
+    assert ticket.transport_parameters == SERVER_PARAMETERS
 
 
 def test_early_data_is_accepted_end_to_end(credentials: Credentials) -> None:
@@ -1208,12 +1219,10 @@ def test_early_data_is_refused_across_an_alpn_change(credentials: Credentials) -
     assert not client.early_data_accepted
 
 
-def test_early_data_is_refused_when_transport_parameters_change(
-    credentials: Credentials,
-) -> None:
+def test_early_data_is_refused_when_limits_shrink(credentials: Credentials) -> None:
     """RFC 9001 §7.4.1: 0-RTT is sent under remembered transport
-    parameters, so a server that would now send different ones refuses
-    it rather than let the client exceed limits it no longer offers."""
+    parameters, so a server that would now reduce a limit refuses it
+    rather than let the client exceed what it no longer offers."""
     key = bytes(range(32))
     ticket = obtain_ticket(credentials, key)
     client = make_resuming_client(credentials, ticket, early_data=True)
@@ -1222,7 +1231,7 @@ def test_early_data_is_refused_when_transport_parameters_change(
             certificate_chain=credentials.chain,
             signing_key=credentials.key,
             alpn=["hq-interop"],
-            transport_parameters=b"raised-limits",
+            transport_parameters=REDUCED_PARAMETERS,
             ticket_key=key,
         )
     )
@@ -1258,7 +1267,7 @@ def test_a_second_hello_drops_the_early_data_offer(credentials: Credentials) -> 
         ClientConfig(
             server_name="localhost",
             alpn=["hq-interop"],
-            transport_parameters=b"client-params",
+            transport_parameters=CLIENT_PARAMETERS,
             ca_certificates=credentials.ca,
             verification_time=VERIFICATION_TIME,
             session_ticket=ticket,
