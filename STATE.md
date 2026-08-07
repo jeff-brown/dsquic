@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  397 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  406 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -264,18 +264,19 @@ connection carrying many early requests.
 
 1. Done: `KeySchedule.client_early_traffic_secret`, pinned to the RFC
    8448 §4 resumed 0-RTT trace in `tests/rfc8448_vectors.py`.
-2. `tls.py`: `early_data` in NewSessionTicket carrying the mandatory
-   0xffffffff (RFC 9001 §4.6.1), in the ClientHello when offering, and
-   in EncryptedExtensions when accepting. QUIC uses no EndOfEarlyData
-   (RFC 9001 §8.3). The client emits the early secret at start; the
-   server derives it only on accept. The sealed ticket grows the
-   fields acceptance needs: `age_add` for the §8.3 freshness check,
-   plus the ALPN and transport parameters the original connection
-   used, since 0-RTT MUST be refused if either would change
-   (RFC 9001 §7.4.1, RFC 8446 §4.2.10).
-3. `SessionTicket` on the client grows `max_early_data_size`, the
-   ALPN, and the server's remembered transport parameters, which
-   govern what the client may send before fresh ones arrive.
+2. Done: `early_data` in NewSessionTicket (the mandatory 0xffffffff,
+   RFC 9001 §4.6.1, any other value aborts), offered in the
+   ClientHello under `ClientConfig.early_data` (dropped on a second
+   hello, §4.1.4), echoed in EncryptedExtensions on acceptance. The
+   sealed ticket became `TicketState`: psk, `age_add` (for the §8.3
+   freshness check, still todo), ALPN and transport parameters, and
+   the server accepts only when the first identity was selected and
+   neither remembered value would change (§4.2.10, RFC 9001 §7.4.1).
+   Both machines expose `early_data_accepted`. Secrets and events are
+   step 4, where the packet space lands.
+3. Done with step 2: `SessionTicket` on the client grew
+   `max_early_data_size`, the ALPN, and the server's remembered
+   transport parameters.
 4. `connection.py`: the 0-RTT packet type (long header 0x1), sharing
    the application-data packet number space and flow control with
    1-RTT (RFC 9000 §12.3); client sends stream data under remembered

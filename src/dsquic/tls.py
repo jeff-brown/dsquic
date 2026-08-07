@@ -35,7 +35,11 @@ verifier, with an explicit insecure flag); session-ticket resumption
 the client's pre_shared_key offer with its binder (§4.2.11), and
 server-side PSK selection (§4.2.9, §4.2.11), which extracts the PSK
 into the Early Secret (§7.1) and omits certificate authentication
-(§2.2); and the NSS-format keylog callback. Unknown extensions are
+(§2.2); 0-RTT signaling (§4.2.10 as profiled by RFC 9001 §4.6.1):
+tickets permit early data, the client offers it alongside its PSK,
+and the server accepts only when the first identity is selected and
+the ALPN and transport parameters the ticket remembers are unchanged
+(RFC 9001 §7.4.1); and the NSS-format keylog callback. Unknown extensions are
 preserved on parse and ignored, never rejected (grease tolerance,
 RFC 8701).
 
@@ -76,6 +80,9 @@ ECDSA_SECP256R1_SHA256 = 0x0403
 
 TICKET_NONCE_LENGTH = 12  # AES-GCM nonce for a sealed ticket
 TICKET_KEY_LENGTH = 32  # AES-256-GCM key that seals session tickets (§4.6.1)
+# RFC 9001 §4.6.1: the only max_early_data_size a QUIC ticket may carry,
+# since 0-RTT data is limited by transport flow control, not by TLS.
+MAX_EARLY_DATA_SIZE = 0xFFFFFFFF
 PSK_DHE_KE = 1  # §4.2.9: resumption with an ECDHE exchange
 SESSION_TICKET_LIFETIME = 7200  # seconds; §4.6.1 caps this at 7 days
 MESSAGE_HASH_TYPE = 254  # §4.4.1, the HelloRetryRequest transcript stand-in
@@ -245,7 +252,12 @@ class SessionTicket:
 
     ``identity`` is the opaque ticket the server issued, ``psk`` the
     secret it stands for, and ``age_add`` the value added to its age
-    when offering it so observers cannot correlate offers.
+    when offering it so observers cannot correlate offers. The last
+    three fields are what 0-RTT remembers from the original connection:
+    how much early data the ticket permits (for QUIC either 0 or
+    2^32-1, RFC 9001 §4.6.1), the ALPN protocol, and the server's
+    transport parameters, which govern what a client may send before
+    the new handshake delivers fresh ones (RFC 9001 §7.4.1).
     """
 
     identity: bytes
@@ -253,30 +265,65 @@ class SessionTicket:
     age_add: int
     lifetime: int
     received_at: float
+    max_early_data_size: int
+    alpn: str
+    transport_parameters: bytes
 
 
-def seal_ticket(key: bytes, psk: bytes, now: float) -> bytes:
-    """§4.6.1: a ticket only its issuer can read.
+@dataclass(frozen=True)
+class TicketState:
+    """What a sealed ticket carries for the server that issued it
+    (§4.6.1).
 
-    The PSK travels inside, so the server needs no per-ticket state; the
-    issue time travels with it so expiry can be checked on return.
+    Sealed into the ticket rather than stored, so the server keeps no
+    per-ticket state. ``alpn`` and ``transport_parameters`` are what
+    the issuing connection used: 0-RTT must be refused if either would
+    change (§4.2.10, RFC 9001 §7.4.1). ``age_add`` and ``issued_at``
+    are what the RFC 8446 §8.3 freshness check compares the client's
+    claimed ticket age against.
     """
+
+    psk: bytes
+    age_add: int
+    alpn: str
+    transport_parameters: bytes
+    issued_at: int
+
+
+def seal_ticket(key: bytes, state: TicketState) -> bytes:
+    """§4.6.1: a ticket only its issuer can read."""
+    plaintext = (
+        state.issued_at.to_bytes(8, "big")
+        + state.age_add.to_bytes(4, "big")
+        + _vec(1, state.alpn.encode("ascii"))
+        + _vec(2, state.transport_parameters)
+        + state.psk
+    )
     nonce = os.urandom(TICKET_NONCE_LENGTH)
-    plaintext = int(now).to_bytes(8, "big") + psk
     return nonce + AESGCM(key).encrypt(nonce, plaintext, None)
 
 
-def open_ticket(key: bytes, ticket: bytes, now: float, lifetime: float) -> bytes:
-    """Recover the PSK a ticket stands for, or raise (§4.6.1)."""
+def open_ticket(key: bytes, ticket: bytes, now: float, lifetime: float) -> TicketState:
+    """Recover the state a ticket stands for, or raise (§4.6.1)."""
     nonce, sealed = ticket[:TICKET_NONCE_LENGTH], ticket[TICKET_NONCE_LENGTH:]
     try:
         plaintext = AESGCM(key).decrypt(nonce, sealed, None)
     except InvalidTag as exc:
         raise TicketError("ticket does not authenticate") from exc
-    issued = int.from_bytes(plaintext[:8], "big")
+    buf = Buffer(plaintext)
+    issued = int.from_bytes(buf.pull_bytes(8), "big")
     if now - issued > lifetime:
         raise TicketError("ticket has expired")
-    return plaintext[8:]
+    age_add = buf.pull_uint32()
+    alpn = buf.pull_bytes(buf.pull_uint8()).decode("ascii")
+    transport_parameters = buf.pull_bytes(buf.pull_uint16())
+    return TicketState(
+        psk=buf.pull_bytes(SHA256_LENGTH),
+        age_add=age_add,
+        alpn=alpn,
+        transport_parameters=transport_parameters,
+        issued_at=issued,
+    )
 
 
 class TicketError(Exception):
@@ -684,6 +731,7 @@ DECODE_ERROR = 50
 DECRYPT_ERROR = 51
 PROTOCOL_VERSION = 70
 MISSING_EXTENSION = 109
+UNSUPPORTED_EXTENSION = 110
 NO_APPLICATION_PROTOCOL = 120
 
 
@@ -732,6 +780,10 @@ class ClientConfig:
     # §4.6.1: a ticket kept from an earlier connection to this server.
     # None means offer no PSK, which is an ordinary full handshake.
     session_ticket: "SessionTicket | None" = None
+    # §4.2.10: offer 0-RTT alongside the ticket. The caller is
+    # responsible for sending the early data itself; QUIC signals its
+    # end without EndOfEarlyData (RFC 9001 §8.3).
+    early_data: bool = False
 
     def __post_init__(self) -> None:
         if not self.insecure_skip_verify and not self.ca_certificates:
@@ -1010,6 +1062,10 @@ class TlsClient(_Handshake):
         self._fallback_schedule: KeySchedule | None = None
         # §2.2: whether the server took the PSK offer; its ServerHello decides.
         self.resumed = False
+        # §4.2.10: whether early data was offered, and whether the
+        # server's EncryptedExtensions accepted it.
+        self._early_data_offered = False
+        self.early_data_accepted = False
         if config.session_ticket is not None:
             # §7.1: resuming extracts the PSK into the Early Secret, and
             # the binder is derived from it, so the schedule has to carry
@@ -1037,6 +1093,16 @@ class TlsClient(_Handshake):
     def _build_client_hello(self) -> ClientHello:
         """RFC 8446 §4.1.2. Sent again unchanged except for key_share if
         the server answers with a HelloRetryRequest (§4.1.4)."""
+        # §4.2.10: early data needs a ticket that permits it, and a
+        # second hello after a HelloRetryRequest must not offer it
+        # (§4.1.4), since the retry already cost the round trip 0-RTT
+        # exists to save.
+        self._early_data_offered = (
+            self._config.early_data
+            and self._config.session_ticket is not None
+            and self._config.session_ticket.max_early_data_size == MAX_EARLY_DATA_SIZE
+            and not self._hello_retried
+        )
         shares = b"".join(
             _key_share_entry(group, key.public_key().public_bytes_raw())
             for group, key in self._keys.items()
@@ -1072,6 +1138,9 @@ class TlsClient(_Handshake):
                 # psk_dhe_ke: resumption keeps an ECDHE exchange, so a
                 # resumed connection has forward secrecy of its own.
                 Extension(ExtensionType.PSK_KEY_EXCHANGE_MODES, _vec(1, bytes([PSK_DHE_KE]))),
+                # §4.2.10: empty in a ClientHello; the server's
+                # EncryptedExtensions echoes it on acceptance.
+                *([Extension(ExtensionType.EARLY_DATA, b"")] if self._early_data_offered else []),
                 *(
                     [self._psk_offer(self._config.session_ticket)]
                     if self._config.session_ticket is not None
@@ -1240,6 +1309,19 @@ class TlsClient(_Handshake):
         )
         if transport_parameters is None:
             raise TlsAlert(MISSING_EXTENSION, "no quic_transport_parameters (RFC 9001 §8.2)")
+        early_data = _find_extension(message.extensions, ExtensionType.EARLY_DATA)
+        if early_data is not None:
+            # §4.2.10: acceptance is only valid for an offer the server
+            # took whole: same PSK (so same cipher suite) and same ALPN
+            # as the connection the ticket came from.
+            if not self._early_data_offered:
+                raise TlsAlert(UNSUPPORTED_EXTENSION, "early_data accepted but never offered")
+            if not self.resumed:
+                raise TlsAlert(ILLEGAL_PARAMETER, "early_data accepted without the PSK (§4.2.10)")
+            ticket = self._config.session_ticket
+            if ticket is not None and selected[0] != ticket.alpn:
+                raise TlsAlert(ILLEGAL_PARAMETER, "early_data accepted across an ALPN change")
+            self.early_data_accepted = True
         self._alpn = selected[0]
         self._peer_transport_parameters = transport_parameters
         self.schedule.update_transcript(raw)
@@ -1288,6 +1370,13 @@ class TlsClient(_Handshake):
         ticket the client keeps is a secret in its own right and is held
         for exactly as long as the server said it is good for.
         """
+        early_data = _find_extension(message.extensions, ExtensionType.EARLY_DATA)
+        max_early_data_size = int.from_bytes(early_data, "big") if early_data is not None else 0
+        if early_data is not None and max_early_data_size != MAX_EARLY_DATA_SIZE:
+            # RFC 9001 §4.6.1: any other value is a connection error.
+            raise TlsAlert(
+                ILLEGAL_PARAMETER, "max_early_data_size must be 2^32-1 (RFC 9001 §4.6.1)"
+            )
         self.session_tickets.append(
             SessionTicket(
                 identity=message.ticket,
@@ -1295,6 +1384,9 @@ class TlsClient(_Handshake):
                 age_add=message.age_add,
                 lifetime=message.lifetime,
                 received_at=self._now,
+                max_early_data_size=max_early_data_size,
+                alpn=self._alpn,
+                transport_parameters=self._peer_transport_parameters,
             )
         )
 
@@ -1333,6 +1425,8 @@ class TlsServer(_Handshake):
         self._client_transport_parameters = b""
         # §2.2: whether this handshake resumed a session via a PSK.
         self.resumed = False
+        # §4.2.10: whether this handshake accepted the client's 0-RTT.
+        self.early_data_accepted = False
         # §4.2.9: whether the client advertised psk_dhe_ke, without
         # which no ticket it could use can be issued.
         self._client_supports_resumption = False
@@ -1383,14 +1477,14 @@ class TlsServer(_Handshake):
         self.events.append(SendData(EncryptionLevel.INITIAL, retry))
         self.state = ServerState.WAIT_SECOND_CLIENT_HELLO
 
-    def _select_psk(self, hello: ClientHello, raw: bytes) -> tuple[int, bytes] | None:
+    def _select_psk(self, hello: ClientHello, raw: bytes) -> tuple[int, TicketState] | None:
         """Pick an offered PSK this server can honour (§4.2.11).
 
-        Returns the selected identity's index and the PSK it stands for,
-        or None to proceed with a full handshake, which §4.2.11 always
-        permits. A selected identity's binder must verify or the
-        handshake aborts (§4.2.11.2); ticket ages are not checked, since
-        §4.2.11 reserves them for 0-RTT freshness.
+        Returns the selected identity's index and the state its ticket
+        sealed, or None to proceed with a full handshake, which §4.2.11
+        always permits. A selected identity's binder must verify or the
+        handshake aborts (§4.2.11.2); ticket ages are not checked here,
+        since §4.2.11 reserves them for 0-RTT freshness.
         """
         offer = _find_extension(hello.extensions, ExtensionType.PRE_SHARED_KEY)
         if offer is None:
@@ -1415,7 +1509,7 @@ class TlsServer(_Handshake):
         identities, binders = parse_offered_psks(offer)
         for index, psk_identity in enumerate(identities):
             try:
-                psk = open_ticket(
+                state = open_ticket(
                     self._config.ticket_key,
                     psk_identity.identity,
                     self._now,
@@ -1424,12 +1518,12 @@ class TlsServer(_Handshake):
             except TicketError:
                 continue
             expected = finished_verify_data(
-                KeySchedule(psk=psk).binder_key(),
+                KeySchedule(psk=state.psk).binder_key(),
                 _sha256(binder_transcript(raw, binder_count=len(binders))),
             )
             if binders[index] != expected:
                 raise TlsAlert(DECRYPT_ERROR, "PSK binder does not verify (§4.2.11.2)")
-            return index, psk
+            return index, state
         return None
 
     def _on_client_hello(self, hello: ClientHello, raw: bytes) -> None:
@@ -1465,10 +1559,22 @@ class TlsServer(_Handshake):
         self.resumed = selected is not None
         modes = _find_extension(hello.extensions, ExtensionType.PSK_KEY_EXCHANGE_MODES)
         self._client_supports_resumption = modes is not None and PSK_DHE_KE in modes[1:]
+        early_data = _find_extension(hello.extensions, ExtensionType.EARLY_DATA)
+        self.early_data_accepted = (
+            early_data is not None
+            and selected is not None
+            # §4.2.10: early data rides only on the first offered
+            # identity, and only if nothing the ticket remembers would
+            # change: same ALPN, and transport parameters this server
+            # still sends verbatim (RFC 9001 §7.4.1).
+            and selected[0] == 0
+            and selected[1].alpn == alpn
+            and selected[1].transport_parameters == self._config.transport_parameters
+        )
         if selected is not None:
             # §7.1: resuming extracts the PSK into the Early Secret, so
             # the schedule is rebuilt before it sees this ClientHello.
-            self.schedule = KeySchedule(psk=selected[1])
+            self.schedule = KeySchedule(psk=selected[1].psk)
         self.schedule.update_transcript(raw)
         server_hello = ServerHello(
             random=self._random,
@@ -1501,6 +1607,12 @@ class TlsServer(_Handshake):
                     Extension(
                         ExtensionType.QUIC_TRANSPORT_PARAMETERS,
                         self._config.transport_parameters,
+                    ),
+                    # §4.2.10: empty; its presence is the acceptance.
+                    *(
+                        [Extension(ExtensionType.EARLY_DATA, b"")]
+                        if self.early_data_accepted
+                        else []
                     ),
                 ]
             )
@@ -1564,12 +1676,23 @@ class TlsServer(_Handshake):
         if self._config.ticket_key is None or not self._client_supports_resumption:
             return
         nonce = os.urandom(TICKET_NONCE_LENGTH)
-        psk = resumption_psk(self.schedule.resumption_master_secret(), nonce)
+        age_add = int.from_bytes(os.urandom(4), "big")
+        state = TicketState(
+            psk=resumption_psk(self.schedule.resumption_master_secret(), nonce),
+            age_add=age_add,
+            alpn=self._alpn,
+            transport_parameters=self._config.transport_parameters,
+            issued_at=int(self._now),
+        )
         ticket = NewSessionTicket(
             lifetime=SESSION_TICKET_LIFETIME,
-            age_add=int.from_bytes(os.urandom(4), "big"),
+            age_add=age_add,
             nonce=nonce,
-            ticket=seal_ticket(self._config.ticket_key, psk, self._now),
-            extensions=[],
+            ticket=seal_ticket(self._config.ticket_key, state),
+            # RFC 9001 §4.6.1: 0-RTT is permitted with the only value
+            # QUIC allows; flow control, not TLS, limits the data.
+            extensions=[
+                Extension(ExtensionType.EARLY_DATA, MAX_EARLY_DATA_SIZE.to_bytes(4, "big"))
+            ],
         )
         self.events.append(SendData(EncryptionLevel.ONE_RTT, encode_new_session_ticket(ticket)))

@@ -23,6 +23,7 @@ from dsquic.tls import (
     HANDSHAKE_FAILURE,
     HELLO_RETRY_REQUEST_RANDOM,
     ILLEGAL_PARAMETER,
+    MAX_EARLY_DATA_SIZE,
     MESSAGE_HASH_TYPE,
     MISSING_EXTENSION,
     NO_APPLICATION_PROTOCOL,
@@ -31,6 +32,7 @@ from dsquic.tls import (
     TLS_1_3,
     TLS_AES_128_GCM_SHA256,
     UNEXPECTED_MESSAGE,
+    UNSUPPORTED_EXTENSION,
     X25519_GROUP,
     Certificate,
     CertificateVerify,
@@ -56,6 +58,7 @@ from dsquic.tls import (
     ServerState,
     SessionTicket,
     TicketError,
+    TicketState,
     TlsAlert,
     TlsClient,
     TlsEvent,
@@ -755,35 +758,39 @@ class TestSessionTickets:
     """RFC 8446 §4.6.1: a server keeps no state for a ticket it issues."""
 
     KEY = bytes(range(32))
-    PSK = bytes(range(32, 64))
+    STATE = TicketState(
+        psk=bytes(range(32, 64)),
+        age_add=0x01020304,
+        alpn="hq-interop",
+        transport_parameters=b"server-params",
+        issued_at=1000,
+    )
 
-    def test_a_ticket_returns_the_psk_it_sealed(self) -> None:
-        ticket = seal_ticket(self.KEY, self.PSK, now=1000.0)
-        assert open_ticket(self.KEY, ticket, now=1100.0, lifetime=3600.0) == self.PSK
+    def test_a_ticket_returns_the_state_it_sealed(self) -> None:
+        ticket = seal_ticket(self.KEY, self.STATE)
+        assert open_ticket(self.KEY, ticket, now=1100.0, lifetime=3600.0) == self.STATE
 
     def test_an_expired_ticket_is_refused(self) -> None:
-        ticket = seal_ticket(self.KEY, self.PSK, now=1000.0)
+        ticket = seal_ticket(self.KEY, self.STATE)
         with pytest.raises(TicketError, match="expired"):
             open_ticket(self.KEY, ticket, now=9000.0, lifetime=3600.0)
 
     def test_another_server_cannot_read_it(self) -> None:
         """Only the issuer holds the key, which is what lets the ticket
-        carry the PSK instead of an index into server state."""
-        ticket = seal_ticket(self.KEY, self.PSK, now=1000.0)
+        carry its state instead of an index into server storage."""
+        ticket = seal_ticket(self.KEY, self.STATE)
         with pytest.raises(TicketError, match="authenticate"):
             open_ticket(bytes(32), ticket, now=1000.0, lifetime=3600.0)
 
     def test_a_tampered_ticket_is_refused(self) -> None:
-        ticket = bytearray(seal_ticket(self.KEY, self.PSK, now=1000.0))
+        ticket = bytearray(seal_ticket(self.KEY, self.STATE))
         ticket[-1] ^= 0x01
         with pytest.raises(TicketError, match="authenticate"):
             open_ticket(self.KEY, bytes(ticket), now=1000.0, lifetime=3600.0)
 
-    def test_two_tickets_for_one_psk_differ(self) -> None:
+    def test_two_tickets_for_one_state_differ(self) -> None:
         """A fresh nonce per ticket, so two offers cannot be linked."""
-        first = seal_ticket(self.KEY, self.PSK, now=1000.0)
-        second = seal_ticket(self.KEY, self.PSK, now=1000.0)
-        assert first != second
+        assert seal_ticket(self.KEY, self.STATE) != seal_ticket(self.KEY, self.STATE)
 
 
 def test_a_ticket_travels_from_server_to_client(credentials: Credentials) -> None:
@@ -798,7 +805,7 @@ def test_a_ticket_travels_from_server_to_client(credentials: Credentials) -> Non
     pump(client, server)
     assert client.session_tickets, "the client kept no ticket"
     ticket = client.session_tickets[0]
-    assert open_ticket(key, ticket.identity, now=0.0, lifetime=7200.0) == ticket.psk
+    assert open_ticket(key, ticket.identity, now=0.0, lifetime=7200.0).psk == ticket.psk
 
 
 def test_no_ticket_without_a_ticket_key(credentials: Credentials) -> None:
@@ -874,14 +881,17 @@ def make_resuming_client(
     credentials: Credentials,
     ticket: SessionTicket,
     key: X25519PrivateKey | None = None,
+    alpn: list[str] | None = None,
+    early_data: bool = False,
 ) -> TlsClient:
     config = ClientConfig(
         server_name="localhost",
-        alpn=["hq-interop"],
+        alpn=alpn if alpn is not None else ["hq-interop"],
         transport_parameters=b"client-params",
         ca_certificates=credentials.ca,
         verification_time=VERIFICATION_TIME,
         session_ticket=ticket,
+        early_data=early_data,
     )
     return TlsClient(config, key=key)
 
@@ -1031,7 +1041,7 @@ def test_resumption_completes_without_a_certificate(credentials: Credentials) ->
     assert Certificate not in sent
     assert NewSessionTicket in sent
     chained = client.session_tickets[0]
-    assert open_ticket(key, chained.identity, now=0.0, lifetime=7200.0) == chained.psk
+    assert open_ticket(key, chained.identity, now=0.0, lifetime=7200.0).psk == chained.psk
     done = next(e for e in client_events if isinstance(e, HandshakeComplete))
     assert done.alpn == "hq-interop"
     assert done.peer_transport_parameters == b"server-params"
@@ -1139,3 +1149,158 @@ def test_a_selected_identity_out_of_range_aborts(credentials: Credentials) -> No
     with pytest.raises(TlsAlert, match="out of range") as excinfo:
         client.receive(EncryptionLevel.INITIAL, encode_server_hello(forged), 0.0)
     assert excinfo.value.alert == ILLEGAL_PARAMETER
+
+
+# --- RFC 8446 §4.2.10: early data signaling -----------------------------------
+
+
+def test_a_ticket_permits_early_data(credentials: Credentials) -> None:
+    """RFC 9001 §4.6.1: a QUIC ticket permits 0-RTT with the only value
+    the profile allows, and the client remembers what acceptance will
+    later be judged against: the ALPN and the server's parameters."""
+    ticket = obtain_ticket(credentials, bytes(range(32)))
+    assert ticket.max_early_data_size == MAX_EARLY_DATA_SIZE
+    assert ticket.alpn == "hq-interop"
+    assert ticket.transport_parameters == b"server-params"
+
+
+def test_early_data_is_accepted_end_to_end(credentials: Credentials) -> None:
+    """§4.2.10: the offer rides the ClientHello, the acceptance rides
+    EncryptedExtensions, and both machines record it."""
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    client = make_resuming_client(credentials, ticket, early_data=True)
+    server = make_server(credentials, ticket_key=key)
+    pump(client, server)
+    assert client.state is ClientState.CONNECTED
+    assert client.early_data_accepted
+    assert server.early_data_accepted
+
+
+def test_early_data_needs_the_config_flag(credentials: Credentials) -> None:
+    """Offering is the caller's choice: a resuming client with nothing
+    to send early offers no early_data."""
+    ticket = obtain_ticket(credentials, bytes(range(32)))
+    client = make_resuming_client(credentials, ticket)
+    client.start(0.0)
+    hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    message, _ = parse_handshake_message(hello)
+    assert isinstance(message, ClientHello)
+    assert ExtensionType.EARLY_DATA not in [e.type for e in message.extensions]
+
+
+def test_early_data_is_refused_across_an_alpn_change(credentials: Credentials) -> None:
+    """§4.2.10: acceptance requires the ALPN the ticket was issued
+    under. The PSK itself survives the change: the handshake still
+    resumes, only the early data is refused."""
+    key = bytes(range(32))
+    first = make_client(credentials, alpn=["h3"])
+    pump(first, make_server(credentials, alpn=["hq-interop", "h3"], ticket_key=key))
+    ticket = first.session_tickets[0]
+    assert ticket.alpn == "h3"
+
+    client = make_resuming_client(credentials, ticket, alpn=["hq-interop"], early_data=True)
+    server = make_server(credentials, alpn=["hq-interop", "h3"], ticket_key=key)
+    pump(client, server)
+    assert client.state is ClientState.CONNECTED
+    assert server.resumed
+    assert not server.early_data_accepted
+    assert not client.early_data_accepted
+
+
+def test_early_data_is_refused_when_transport_parameters_change(
+    credentials: Credentials,
+) -> None:
+    """RFC 9001 §7.4.1: 0-RTT is sent under remembered transport
+    parameters, so a server that would now send different ones refuses
+    it rather than let the client exceed limits it no longer offers."""
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    client = make_resuming_client(credentials, ticket, early_data=True)
+    server = TlsServer(
+        ServerConfig(
+            certificate_chain=credentials.chain,
+            signing_key=credentials.key,
+            alpn=["hq-interop"],
+            transport_parameters=b"raised-limits",
+            ticket_key=key,
+        )
+    )
+    pump(client, server)
+    assert server.resumed
+    assert not server.early_data_accepted
+    assert not client.early_data_accepted
+
+
+def test_a_ticket_with_any_other_early_data_limit_aborts(credentials: Credentials) -> None:
+    """RFC 9001 §4.6.1: 0xffffffff is the only legal value, since flow
+    control, not TLS, limits 0-RTT data in QUIC."""
+    client = make_client(credentials)
+    pump(client, make_server(credentials))
+    greedy = NewSessionTicket(
+        lifetime=100,
+        age_add=0,
+        nonce=b"\x00",
+        ticket=b"opaque",
+        extensions=[Extension(ExtensionType.EARLY_DATA, (4096).to_bytes(4, "big"))],
+    )
+    with pytest.raises(TlsAlert, match="9001") as excinfo:
+        client.receive(EncryptionLevel.ONE_RTT, encode_new_session_ticket(greedy), 0.0)
+    assert excinfo.value.alert == ILLEGAL_PARAMETER
+
+
+def test_a_second_hello_drops_the_early_data_offer(credentials: Credentials) -> None:
+    """§4.1.4: a HelloRetryRequest costs the round trip 0-RTT exists to
+    save, so the second hello must not offer early data."""
+    key = bytes(range(32))
+    ticket = obtain_ticket(credentials, key)
+    client = TlsClient(
+        ClientConfig(
+            server_name="localhost",
+            alpn=["hq-interop"],
+            transport_parameters=b"client-params",
+            ca_certificates=credentials.ca,
+            verification_time=VERIFICATION_TIME,
+            session_ticket=ticket,
+            early_data=True,
+            key_share_groups=[],
+        )
+    )
+    server = make_server(credentials, ticket_key=key)
+    client.start(0.0)
+    hello1 = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    message1, _ = parse_handshake_message(hello1)
+    assert isinstance(message1, ClientHello)
+    assert ExtensionType.EARLY_DATA in [e.type for e in message1.extensions]
+
+    server.receive(EncryptionLevel.INITIAL, hello1, 0.0)
+    retry = next(e for e in server.take_events() if isinstance(e, SendData)).data
+    client.receive(EncryptionLevel.INITIAL, retry, 0.0)
+    hello2 = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    message2, _ = parse_handshake_message(hello2)
+    assert isinstance(message2, ClientHello)
+    assert ExtensionType.EARLY_DATA not in [e.type for e in message2.extensions]
+
+
+def test_unsolicited_early_data_acceptance_aborts(credentials: Credentials) -> None:
+    """§4.2: a server may only accept what was offered."""
+    client = make_client(credentials)
+    server = make_server(credentials)
+    client.start(0.0)
+    hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
+    server.receive(EncryptionLevel.INITIAL, hello, 0.0)
+    sends = [e for e in server.take_events() if isinstance(e, SendData)]
+    client.receive(EncryptionLevel.INITIAL, sends[0].data, 0.0)
+    flight = parse_flight(sends[1].data)
+    encrypted_extensions = flight[0]
+    assert isinstance(encrypted_extensions, EncryptedExtensions)
+    forged = replace(
+        encrypted_extensions,
+        extensions=[
+            *encrypted_extensions.extensions,
+            Extension(ExtensionType.EARLY_DATA, b""),
+        ],
+    )
+    with pytest.raises(TlsAlert, match="offered") as excinfo:
+        client.receive(EncryptionLevel.HANDSHAKE, encode_encrypted_extensions(forged), 0.0)
+    assert excinfo.value.alert == UNSUPPORTED_EXTENSION
