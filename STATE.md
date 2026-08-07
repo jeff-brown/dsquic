@@ -21,7 +21,7 @@ the open item recorded below.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  364 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  389 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -231,22 +231,37 @@ not against our own output, in `tests/rfc8448_vectors.py`:
 - `TlsClient.session_tickets`, filled by `_store_session_ticket`.
 - `ClientConfig.session_ticket`, `_psk_extensions`, `_fill_psk_binder`:
   a client offers a stored ticket with a verifiable binder.
+- Server-side PSK selection, staged: `TlsServer._select_psk` opens the
+  first offered identity that unseals, verifies its binder from a
+  `KeySchedule(psk=...)` (mismatch is a DECRYPT_ERROR abort, §4.2.11.2),
+  enforces pre_shared_key-is-last (§4.2.11) and the psk_key_exchange_modes
+  requirement (§4.2.9), and declines to a full handshake when the ticket
+  cannot be used. On selection `_on_client_hello` rebuilds the schedule
+  with the PSK before the transcript sees the hello, answers with
+  `selected_identity`, and sends a flight with no Certificate or
+  CertificateVerify (§2.2), which is what the runner inspects.
+  `TestServerPskSelection` in tests/test_tls.py covers all of it.
 
-**Next, all server-side plus wiring**, in order:
+**Next, client-side accept plus wiring**, in order:
 
-1. `TlsServer._on_client_hello`: find `pre_shared_key`, `open_ticket` the
-   identity, build `KeySchedule(psk=...)`, then feed the transcript in
-   **two chunks**, the truncated hello and then the binders, so the
-   binder can be verified against a schedule that could not exist until
-   the ticket was opened. `binder_transcript()` already does the split.
-2. ServerHello carries `selected_identity`; skip Certificate and
-   CertificateVerify. This is what the runner inspects.
-3. Client: accept a Certificate-free flight. `CLIENT_EXPECTS` currently
-   requires Certificate after EncryptedExtensions.
-4. Endpoints: tickets surviving between connections in
+1. Client: accept a Certificate-free flight when the ServerHello carries
+   `selected_identity` (verify it is in the offered range, §4.2.11).
+   `CLIENT_EXPECTS` currently requires Certificate after
+   EncryptedExtensions. Two more client gaps found while writing the
+   server side, both needed for interop where the peer may decline or
+   retry: (a) on a ServerHello *without* `selected_identity` the client
+   must fall back to a zero-PSK schedule; today `TlsClient.__init__`
+   bakes the PSK into the Early Secret unconditionally, so a declining
+   server breaks the handshake at Finished. (b) `_on_hello_retry_request`
+   re-encodes the hello without re-running `_fill_psk_binder`, so a
+   resuming client that hits HRR sends the placeholder binder (and the
+   CH2 binder must cover CH1 and the HRR per §4.2.11.2). Our server
+   declines PSKs after its own HRR for the matching reason: it keeps no
+   message bytes to rebuild that transcript.
+2. Endpoints: tickets surviving between connections in
    `endpoints.client.fetch_each`; `--connection-per-request` for this
    case; add `resumption` to `SUPPORTED` in `interop/run_endpoint.sh`.
-5. Ladder: unit, loopback through the reference endpoints, then the
+3. Ladder: unit, loopback through the reference endpoints, then the
    runner in both directions.
 
 **Three traps already paid for, worth not repeating.**

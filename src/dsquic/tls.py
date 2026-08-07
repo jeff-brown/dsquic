@@ -30,9 +30,14 @@ HelloRetryRequest on both sides (§4.1.4) with the message_hash
 transcript substitution (§4.4.1); CertificateVerify signing and
 verification; certificate policy on the client (chain to configured
 anchors plus RFC 9525 hostname matching, delegated to cryptography's
-verifier, with an explicit insecure flag); and the NSS-format keylog
-callback. Unknown extensions are preserved on parse and ignored, never
-rejected (grease tolerance, RFC 8701).
+verifier, with an explicit insecure flag); session-ticket resumption
+(§4.6.1): sealed tickets issued by the server and stored by the client,
+the client's pre_shared_key offer with its binder (§4.2.11), and
+server-side PSK selection (§4.2.9, §4.2.11), which extracts the PSK
+into the Early Secret (§7.1) and omits certificate authentication
+(§2.2); and the NSS-format keylog callback. Unknown extensions are
+preserved on parse and ignored, never rejected (grease tolerance,
+RFC 8701).
 
 One key exchange group, x25519. That is enough to interoperate, because
 peers offering post-quantum groups also offer classical ones; when such a
@@ -1313,6 +1318,55 @@ class TlsServer(_Handshake):
         self.events.append(SendData(EncryptionLevel.INITIAL, retry))
         self.state = ServerState.WAIT_SECOND_CLIENT_HELLO
 
+    def _select_psk(self, hello: ClientHello, raw: bytes) -> tuple[int, bytes] | None:
+        """Pick an offered PSK this server can honour (§4.2.11).
+
+        Returns the selected identity's index and the PSK it stands for,
+        or None to proceed with a full handshake, which §4.2.11 always
+        permits. A selected identity's binder must verify or the
+        handshake aborts (§4.2.11.2); ticket ages are not checked, since
+        §4.2.11 reserves them for 0-RTT freshness.
+        """
+        offer = _find_extension(hello.extensions, ExtensionType.PRE_SHARED_KEY)
+        if offer is None:
+            return None
+        if hello.extensions[-1].type != ExtensionType.PRE_SHARED_KEY:
+            raise TlsAlert(ILLEGAL_PARAMETER, "pre_shared_key is not the last extension")
+        modes = _find_extension(hello.extensions, ExtensionType.PSK_KEY_EXCHANGE_MODES)
+        if modes is None:
+            raise TlsAlert(
+                MISSING_EXTENSION, "pre_shared_key without psk_key_exchange_modes (§4.2.9)"
+            )
+        if PSK_DHE_KE not in modes[1:]:
+            # Only resumption with an ECDHE exchange is supported.
+            return None
+        if self._config.ticket_key is None:
+            return None
+        if self._hello_retry_sent:
+            # A second ClientHello's binder covers ClientHello1 and the
+            # HelloRetryRequest (§4.2.11.2), a transcript this server no
+            # longer holds message bytes for.
+            return None
+        identities, binders = parse_offered_psks(offer)
+        for index, psk_identity in enumerate(identities):
+            try:
+                psk = open_ticket(
+                    self._config.ticket_key,
+                    psk_identity.identity,
+                    self._now,
+                    SESSION_TICKET_LIFETIME,
+                )
+            except TicketError:
+                continue
+            expected = finished_verify_data(
+                KeySchedule(psk=psk).binder_key(),
+                _sha256(binder_transcript(raw, binder_count=len(binders))),
+            )
+            if binders[index] != expected:
+                raise TlsAlert(DECRYPT_ERROR, "PSK binder does not verify (§4.2.11.2)")
+            return index, psk
+        return None
+
     def _on_client_hello(self, hello: ClientHello, raw: bytes) -> None:
         if TLS_AES_128_GCM_SHA256 not in hello.cipher_suites:
             raise TlsAlert(HANDSHAKE_FAILURE, "client did not offer TLS_AES_128_GCM_SHA256")
@@ -1342,6 +1396,11 @@ class TlsServer(_Handshake):
         alpn = self._negotiate_alpn(hello)
         self._client_random = hello.random
 
+        selected = self._select_psk(hello, raw)
+        if selected is not None:
+            # §7.1: resuming extracts the PSK into the Early Secret, so
+            # the schedule is rebuilt before it sees this ClientHello.
+            self.schedule = KeySchedule(psk=selected[1])
         self.schedule.update_transcript(raw)
         server_hello = ServerHello(
             random=self._random,
@@ -1352,6 +1411,12 @@ class TlsServer(_Handshake):
                 Extension(
                     ExtensionType.KEY_SHARE,
                     _key_share_entry(X25519_GROUP, self._key.public_key().public_bytes_raw()),
+                ),
+                # §4.2.11: which offered identity was selected.
+                *(
+                    [Extension(ExtensionType.PRE_SHARED_KEY, selected[0].to_bytes(2, "big"))]
+                    if selected is not None
+                    else []
                 ),
             ],
         )
@@ -1372,33 +1437,34 @@ class TlsServer(_Handshake):
                 ]
             )
         )
-        certificate = encode_certificate(
-            Certificate(
-                request_context=b"",
-                entries=[
-                    CertificateEntry(data=data, extensions=[])
-                    for data in self._config.certificate_chain
-                ],
-            )
-        )
         self.schedule.update_transcript(encrypted_extensions)
-        self.schedule.update_transcript(certificate)
-        algorithm, signature = _sign_certificate_verify(
-            self._config.signing_key, self.schedule.transcript_hash()
-        )
-        certificate_verify = encode_certificate_verify(
-            CertificateVerify(algorithm=algorithm, signature=signature)
-        )
-        self.schedule.update_transcript(certificate_verify)
+        if selected is None:
+            certificate = encode_certificate(
+                Certificate(
+                    request_context=b"",
+                    entries=[
+                        CertificateEntry(data=data, extensions=[])
+                        for data in self._config.certificate_chain
+                    ],
+                )
+            )
+            self.schedule.update_transcript(certificate)
+            algorithm, signature = _sign_certificate_verify(
+                self._config.signing_key, self.schedule.transcript_hash()
+            )
+            certificate_verify = encode_certificate_verify(
+                CertificateVerify(algorithm=algorithm, signature=signature)
+            )
+            self.schedule.update_transcript(certificate_verify)
+            flight = encrypted_extensions + certificate + certificate_verify
+        else:
+            # §2.2: a PSK authenticates the connection, so Certificate
+            # and CertificateVerify are not sent.
+            flight = encrypted_extensions
         verify = finished_verify_data(self.server_hs_secret, self.schedule.transcript_hash())
         finished = encode_finished(Finished(verify_data=verify))
         self.schedule.update_transcript(finished)
-        self.events.append(
-            SendData(
-                EncryptionLevel.HANDSHAKE,
-                encrypted_extensions + certificate + certificate_verify + finished,
-            )
-        )
+        self.events.append(SendData(EncryptionLevel.HANDSHAKE, flight + finished))
         self._emit_application_secrets()
         self._alpn = alpn
         self._client_transport_parameters = client_transport_parameters

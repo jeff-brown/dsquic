@@ -2,7 +2,7 @@
 
 import datetime
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 from cryptography import x509
@@ -23,6 +23,7 @@ from dsquic.tls import (
     HANDSHAKE_FAILURE,
     HELLO_RETRY_REQUEST_RANDOM,
     ILLEGAL_PARAMETER,
+    MISSING_EXTENSION,
     NO_APPLICATION_PROTOCOL,
     RSA_PSS_RSAE_SHA256,
     TLS_1_3,
@@ -41,6 +42,7 @@ from dsquic.tls import (
     ExtensionType,
     Finished,
     HandshakeComplete,
+    HandshakeMessage,
     HandshakeParseError,
     KeySchedule,
     NewSessionTicket,
@@ -50,6 +52,7 @@ from dsquic.tls import (
     ServerConfig,
     ServerHello,
     ServerState,
+    SessionTicket,
     TicketError,
     TlsAlert,
     TlsClient,
@@ -320,6 +323,7 @@ def make_server(
     alpn: list[str] | None = None,
     keylog: list[str] | None = None,
     ticket_key: bytes | None = None,
+    key: X25519PrivateKey | None = None,
 ) -> TlsServer:
     config = ServerConfig(
         certificate_chain=credentials.chain,
@@ -328,7 +332,7 @@ def make_server(
         transport_parameters=b"server-params",
         ticket_key=ticket_key,
     )
-    return TlsServer(config, keylog=keylog.append if keylog is not None else None)
+    return TlsServer(config, key=key, keylog=keylog.append if keylog is not None else None)
 
 
 def pump(client: TlsClient, server: TlsServer) -> tuple[list[TlsEvent], list[TlsEvent]]:
@@ -830,3 +834,148 @@ def test_a_client_offers_a_ticket_with_a_verifiable_binder(credentials: Credenti
         hashlib.sha256(binder_transcript(hello)).digest(),
     )
     assert binders == [expected]
+
+
+# --- RFC 8446 §4.2.11: server-side PSK selection ------------------------------
+
+
+def make_resuming_client(
+    credentials: Credentials,
+    ticket: SessionTicket,
+    key: X25519PrivateKey | None = None,
+) -> TlsClient:
+    config = ClientConfig(
+        server_name="localhost",
+        alpn=["hq-interop"],
+        transport_parameters=b"client-params",
+        ca_certificates=credentials.ca,
+        verification_time=VERIFICATION_TIME,
+        session_ticket=ticket,
+    )
+    return TlsClient(config, key=key)
+
+
+def obtain_ticket(credentials: Credentials, ticket_key: bytes) -> SessionTicket:
+    """Run a full handshake and return the ticket it produced."""
+    client = make_client(credentials)
+    pump(client, make_server(credentials, ticket_key=ticket_key))
+    return client.session_tickets[0]
+
+
+def resuming_hello(credentials: Credentials, ticket: SessionTicket) -> bytes:
+    client = make_resuming_client(credentials, ticket)
+    client.start()
+    return next(e for e in client.take_events() if isinstance(e, SendData)).data
+
+
+def parse_flight(data: bytes) -> list[HandshakeMessage]:
+    messages: list[HandshakeMessage] = []
+    while data:
+        message, consumed = parse_handshake_message(data)
+        messages.append(message)
+        data = data[consumed:]
+    return messages
+
+
+class TestServerPskSelection:
+    """RFC 8446 §4.2.11: the server side of a resumption offer."""
+
+    KEY = bytes(range(32))
+
+    def test_a_selected_psk_skips_the_certificate(self, credentials: Credentials) -> None:
+        """§2.2: the PSK authenticates the connection, so the server
+        answers with selected_identity and sends no Certificate."""
+        ticket = obtain_ticket(credentials, self.KEY)
+        server = make_server(credentials, ticket_key=self.KEY)
+        server.receive(EncryptionLevel.INITIAL, resuming_hello(credentials, ticket), 0.0)
+        sends = [e for e in server.take_events() if isinstance(e, SendData)]
+        server_hello = parse_flight(sends[0].data)[0]
+        assert isinstance(server_hello, ServerHello)
+        selected = next(
+            e.data for e in server_hello.extensions if e.type == ExtensionType.PRE_SHARED_KEY
+        )
+        assert int.from_bytes(selected, "big") == 0
+        assert [type(m) for m in parse_flight(sends[1].data)] == [EncryptedExtensions, Finished]
+        assert server.state is ServerState.WAIT_FINISHED
+
+    def test_the_psk_enters_the_early_secret(self, credentials: Credentials) -> None:
+        """§7.1: the server's handshake secrets extract the ticket's PSK,
+        checked against a schedule walked independently from the ticket."""
+        ticket = obtain_ticket(credentials, self.KEY)
+        client_key = X25519PrivateKey.generate()
+        server_key = X25519PrivateKey.generate()
+        client = make_resuming_client(credentials, ticket, key=client_key)
+        server = make_server(credentials, ticket_key=self.KEY, key=server_key)
+        client.start()
+        hello = next(e for e in client.take_events() if isinstance(e, SendData)).data
+        server.receive(EncryptionLevel.INITIAL, hello, 0.0)
+        events = server.take_events()
+        sends = [e for e in events if isinstance(e, SendData)]
+
+        schedule = KeySchedule(psk=ticket.psk)
+        schedule.update_transcript(hello)
+        schedule.update_transcript(sends[0].data)
+        schedule.add_ecdhe(server_key.exchange(client_key.public_key()))
+        secrets = secrets_of(events)
+        assert (
+            secrets[(EncryptionLevel.HANDSHAKE, Direction.CLIENT)]
+            == schedule.client_handshake_traffic_secret()
+        )
+
+    def test_an_unopenable_ticket_falls_back_to_a_full_handshake(
+        self, credentials: Credentials
+    ) -> None:
+        """§4.2.11: declining is always allowed. A ticket sealed under
+        another key draws an ordinary certificate handshake."""
+        ticket = obtain_ticket(credentials, self.KEY)
+        server = make_server(credentials, ticket_key=bytes(range(32, 64)))
+        server.receive(EncryptionLevel.INITIAL, resuming_hello(credentials, ticket), 0.0)
+        sends = [e for e in server.take_events() if isinstance(e, SendData)]
+        server_hello = parse_flight(sends[0].data)[0]
+        assert isinstance(server_hello, ServerHello)
+        assert all(e.type != ExtensionType.PRE_SHARED_KEY for e in server_hello.extensions)
+        assert [type(m) for m in parse_flight(sends[1].data)] == [
+            EncryptedExtensions,
+            Certificate,
+            CertificateVerify,
+            Finished,
+        ]
+
+    def test_a_bad_binder_aborts(self, credentials: Credentials) -> None:
+        """§4.2.11.2: a binder that does not verify is fatal rather than
+        a fallback, since it means the client does not hold the PSK."""
+        ticket = obtain_ticket(credentials, self.KEY)
+        forged = replace(ticket, psk=bytes(32))
+        server = make_server(credentials, ticket_key=self.KEY)
+        with pytest.raises(TlsAlert, match="binder") as excinfo:
+            server.receive(EncryptionLevel.INITIAL, resuming_hello(credentials, forged), 0.0)
+        assert excinfo.value.alert == DECRYPT_ERROR
+
+    def test_psk_without_modes_aborts(self, credentials: Credentials) -> None:
+        """§4.2.9: offering pre_shared_key without psk_key_exchange_modes
+        is a protocol violation, not a fallback."""
+        ticket = obtain_ticket(credentials, self.KEY)
+        message, _ = parse_handshake_message(resuming_hello(credentials, ticket))
+        assert isinstance(message, ClientHello)
+        stripped = replace(
+            message,
+            extensions=[
+                e for e in message.extensions if e.type != ExtensionType.PSK_KEY_EXCHANGE_MODES
+            ],
+        )
+        server = make_server(credentials, ticket_key=self.KEY)
+        with pytest.raises(TlsAlert, match="psk_key_exchange_modes") as excinfo:
+            server.receive(EncryptionLevel.INITIAL, encode_client_hello(stripped), 0.0)
+        assert excinfo.value.alert == MISSING_EXTENSION
+
+    def test_pre_shared_key_must_be_last(self, credentials: Credentials) -> None:
+        """§4.2.11: the binder covers everything before the extension, so
+        an offer that is not the last extension is rejected."""
+        ticket = obtain_ticket(credentials, self.KEY)
+        message, _ = parse_handshake_message(resuming_hello(credentials, ticket))
+        assert isinstance(message, ClientHello)
+        reordered = replace(message, extensions=[message.extensions[-1], *message.extensions[:-1]])
+        server = make_server(credentials, ticket_key=self.KEY)
+        with pytest.raises(TlsAlert, match="last") as excinfo:
+            server.receive(EncryptionLevel.INITIAL, encode_client_hello(reordered), 0.0)
+        assert excinfo.value.alert == ILLEGAL_PARAMETER
