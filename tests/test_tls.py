@@ -319,12 +319,14 @@ def make_server(
     credentials: Credentials,
     alpn: list[str] | None = None,
     keylog: list[str] | None = None,
+    ticket_key: bytes | None = None,
 ) -> TlsServer:
     config = ServerConfig(
         certificate_chain=credentials.chain,
         signing_key=credentials.key,
         alpn=alpn if alpn is not None else ["hq-interop"],
         transport_parameters=b"server-params",
+        ticket_key=ticket_key,
     )
     return TlsServer(config, keylog=keylog.append if keylog is not None else None)
 
@@ -339,12 +341,12 @@ def pump(client: TlsClient, server: TlsServer) -> tuple[list[TlsEvent], list[Tls
         for event in client.take_events():
             client_events.append(event)
             if isinstance(event, SendData):
-                server.receive(event.level, event.data)
+                server.receive(event.level, event.data, 0.0)
                 moved = True
         for event in server.take_events():
             server_events.append(event)
             if isinstance(event, SendData):
-                client.receive(event.level, event.data)
+                client.receive(event.level, event.data, 0.0)
                 moved = True
         if not moved:
             return client_events, server_events
@@ -399,7 +401,7 @@ def test_handshake_bytes_survive_fragmentation(credentials: Credentials) -> None
     for event in client.take_events():
         if isinstance(event, SendData):
             for i in range(len(event.data)):  # one byte at a time
-                server.receive(event.level, event.data[i : i + 1])
+                server.receive(event.level, event.data[i : i + 1], 0.0)
     assert server.state is ServerState.WAIT_FINISHED
 
 
@@ -483,7 +485,7 @@ def test_alpn_mismatch_raises(credentials: Credentials) -> None:
     client.start()
     send = next(e for e in client.take_events() if isinstance(e, SendData))
     with pytest.raises(TlsAlert) as excinfo:
-        server.receive(send.level, send.data)
+        server.receive(send.level, send.data, 0.0)
     assert excinfo.value.alert == NO_APPLICATION_PROTOCOL
 
 
@@ -493,13 +495,13 @@ def test_tampered_server_finished_raises(credentials: Credentials) -> None:
     client.start()
     for event in client.take_events():
         if isinstance(event, SendData):
-            server.receive(event.level, event.data)
+            server.receive(event.level, event.data, 0.0)
     with pytest.raises(TlsAlert) as excinfo:
         for event in server.take_events():
             if isinstance(event, SendData):
                 data = bytearray(event.data)
                 data[-1] ^= 0x01  # last byte of the server Finished verify_data
-                client.receive(event.level, bytes(data))
+                client.receive(event.level, bytes(data), 0.0)
     assert excinfo.value.alert == DECRYPT_ERROR
 
 
@@ -509,7 +511,7 @@ def test_message_at_wrong_level_raises(credentials: Credentials) -> None:
     client.start()
     send = next(e for e in client.take_events() if isinstance(e, SendData))
     with pytest.raises(TlsAlert) as excinfo:
-        server.receive(EncryptionLevel.HANDSHAKE, send.data)
+        server.receive(EncryptionLevel.HANDSHAKE, send.data, 0.0)
     assert excinfo.value.alert == UNEXPECTED_MESSAGE
 
 
@@ -556,7 +558,7 @@ class TestHelloRetryRequest:
         client.start()
         for event in client.take_events():
             if isinstance(event, SendData):
-                server.receive(event.level, event.data)
+                server.receive(event.level, event.data, 0.0)
         first = next(e for e in server.take_events() if isinstance(e, SendData))
         message, _ = parse_handshake_message(first.data)
         assert isinstance(message, ServerHello)
@@ -582,7 +584,7 @@ class TestHelloRetryRequest:
             ],
         )
         with pytest.raises(TlsAlert) as excinfo:
-            server.receive(EncryptionLevel.INITIAL, encode_client_hello(hello))
+            server.receive(EncryptionLevel.INITIAL, encode_client_hello(hello), 0.0)
         assert excinfo.value.alert == HANDSHAKE_FAILURE
 
     def test_second_retry_is_refused(self, credentials: Credentials) -> None:
@@ -592,10 +594,10 @@ class TestHelloRetryRequest:
         server = make_server(credentials)
         client.start()
         first = next(e for e in client.take_events() if isinstance(e, SendData))
-        server.receive(first.level, first.data)
+        server.receive(first.level, first.data, 0.0)
         server.take_events()
         with pytest.raises(TlsAlert) as excinfo:
-            server.receive(first.level, first.data)  # the same share-less hello again
+            server.receive(first.level, first.data, 0.0)  # the same share-less hello again
         assert excinfo.value.alert == HANDSHAKE_FAILURE
 
     def test_client_refuses_a_pointless_retry(self, credentials: Credentials) -> None:
@@ -615,7 +617,7 @@ class TestHelloRetryRequest:
             )
         )
         with pytest.raises(TlsAlert) as excinfo:
-            client.receive(EncryptionLevel.INITIAL, retry)
+            client.receive(EncryptionLevel.INITIAL, retry, 0.0)
         assert excinfo.value.alert == ILLEGAL_PARAMETER
 
     def test_client_refuses_an_unoffered_group(self, credentials: Credentials) -> None:
@@ -634,7 +636,7 @@ class TestHelloRetryRequest:
             )
         )
         with pytest.raises(TlsAlert) as excinfo:
-            client.receive(EncryptionLevel.INITIAL, retry)
+            client.receive(EncryptionLevel.INITIAL, retry, 0.0)
         assert excinfo.value.alert == ILLEGAL_PARAMETER
 
 
@@ -644,7 +646,7 @@ def test_unexpected_message_order_raises(credentials: Credentials) -> None:
     client.take_events()
     finished = encode_finished(Finished(verify_data=bytes(32)))
     with pytest.raises(TlsAlert) as excinfo:
-        client.receive(EncryptionLevel.INITIAL, finished)
+        client.receive(EncryptionLevel.INITIAL, finished, 0.0)
     assert excinfo.value.alert == UNEXPECTED_MESSAGE
 
 
@@ -765,3 +767,25 @@ class TestSessionTickets:
         first = seal_ticket(self.KEY, self.PSK, now=1000.0)
         second = seal_ticket(self.KEY, self.PSK, now=1000.0)
         assert first != second
+
+
+def test_a_ticket_travels_from_server_to_client(credentials: Credentials) -> None:
+    """RFC 8446 §4.6.1 end to end over a handshake: the server issues a
+    ticket once the client's Finished lands, and both sides arrive at the
+    same PSK, the server from the secret it sealed and the client from
+    the nonce it was sent.
+    """
+    key = bytes(range(32))
+    client = make_client(credentials)
+    server = make_server(credentials, ticket_key=key)
+    pump(client, server)
+    assert client.session_tickets, "the client kept no ticket"
+    ticket = client.session_tickets[0]
+    assert open_ticket(key, ticket.identity, now=0.0, lifetime=7200.0) == ticket.psk
+
+
+def test_no_ticket_without_a_ticket_key(credentials: Credentials) -> None:
+    """A server that cannot seal a ticket does not offer one."""
+    client = make_client(credentials)
+    pump(client, make_server(credentials))
+    assert client.session_tickets == []

@@ -955,7 +955,7 @@ class Connection:
         ordered = bytes(space.crypto_buffer[space.crypto_read_offset : readable_end])
         space.crypto_read_offset = readable_end
         try:
-            self.tls.receive(level, ordered)
+            self.tls.receive(level, ordered, now)
         except TlsAlert as exc:
             raise ConnectionError_(frames.CRYPTO_ERROR_BASE + exc.alert, str(exc)) from exc
         self._drain_tls_events(now)

@@ -71,6 +71,7 @@ ECDSA_SECP256R1_SHA256 = 0x0403
 
 TICKET_NONCE_LENGTH = 12  # AES-GCM nonce for a sealed ticket
 TICKET_KEY_LENGTH = 32
+SESSION_TICKET_LIFETIME = 7200  # seconds; §4.6.1 caps this at 7 days
 MESSAGE_HASH_TYPE = 254  # §4.4.1, the HelloRetryRequest transcript stand-in
 SUPPORTED_GROUPS = [X25519_GROUP]  # groups this implementation can key with
 
@@ -888,6 +889,8 @@ class _Handshake:
     def __init__(self, keylog: Callable[[str], None] | None) -> None:
         self.schedule = KeySchedule()
         self.events: list[TlsEvent] = []
+        # The caller's last clock reading, stamped into session tickets.
+        self._now = 0.0
         self._buffers: dict[EncryptionLevel, bytearray] = {
             level: bytearray() for level in EncryptionLevel
         }
@@ -905,8 +908,14 @@ class _Handshake:
         events, self.events = self.events, []
         return events
 
-    def receive(self, level: EncryptionLevel, data: bytes) -> None:
-        """Consume CRYPTO bytes received at an encryption level."""
+    def receive(self, level: EncryptionLevel, data: bytes, now: float) -> None:
+        """Consume CRYPTO bytes received at an encryption level.
+
+        ``now`` is the caller's clock reading, which a server stamps into
+        the session tickets it issues (§4.6.1). Nothing here reads a
+        clock of its own.
+        """
+        self._now = now
         header_length = 4  # one-byte type, three-byte length (RFC 8446 §4)
         buffer = self._buffers[level]
         buffer += data
@@ -976,6 +985,9 @@ class TlsClient(_Handshake):
     ) -> None:
         super().__init__(keylog)
         self._config = config
+        # §4.6.1: tickets arrive after the handshake, so a caller reads
+        # them once the connection is up and keeps them for next time.
+        self.session_tickets: list[SessionTicket] = []
         self._random = random if random is not None else os.urandom(32)
         self._client_random = self._random
         share_groups = (
@@ -1065,7 +1077,8 @@ class TlsClient(_Handshake):
     def _handle(self, level: EncryptionLevel, message: HandshakeMessage, raw: bytes) -> None:
         if self.state is ClientState.CONNECTED:
             if isinstance(message, NewSessionTicket):
-                return  # no resumption yet (RFC 8446 §4.6.1)
+                self._store_session_ticket(message)
+                return
             raise TlsAlert(UNEXPECTED_MESSAGE, "handshake message after completion")
         self._require(CLIENT_EXPECTS[self.state], level, message)
         if isinstance(message, ServerHello):
@@ -1153,6 +1166,23 @@ class TlsClient(_Handshake):
         self.schedule.update_transcript(raw)
         self.state = ClientState.WAIT_FINISHED
 
+    def _store_session_ticket(self, message: NewSessionTicket) -> None:
+        """§4.6.1: keep what a later handshake needs to resume.
+
+        The PSK is derived now rather than stored by the server, so the
+        ticket the client keeps is a secret in its own right and is held
+        for exactly as long as the server said it is good for.
+        """
+        self.session_tickets.append(
+            SessionTicket(
+                identity=message.ticket,
+                psk=resumption_psk(self.schedule.resumption_master_secret(), message.nonce),
+                age_add=message.age_add,
+                lifetime=message.lifetime,
+                received_at=self._now,
+            )
+        )
+
     def _on_finished(self, message: Finished, raw: bytes) -> None:
         expected = finished_verify_data(self.server_hs_secret, self.schedule.transcript_hash())
         if message.verify_data != expected:
@@ -1181,6 +1211,9 @@ class TlsServer(_Handshake):
     ) -> None:
         super().__init__(keylog)
         self._config = config
+        # §4.6.1: tickets arrive after the handshake, so a caller reads
+        # them once the connection is up and keeps them for next time.
+        self.session_tickets: list[SessionTicket] = []
         self._random = random if random is not None else os.urandom(32)
         self._key = key if key is not None else X25519PrivateKey.generate()
         self._hello_retry_sent = False
@@ -1331,3 +1364,25 @@ class TlsServer(_Handshake):
         self.schedule.update_transcript(raw)
         self.events.append(HandshakeComplete(self._alpn, self._client_transport_parameters))
         self.state = ServerState.CONNECTED
+        self._issue_session_ticket()
+
+    def _issue_session_ticket(self) -> None:
+        """§4.6.1: offer the client a ticket it can resume with.
+
+        Sent after the client's Finished because the resumption master
+        secret is derived over a transcript that ends there. The ticket
+        goes out at the application level, which RFC 9001 §4.5 requires
+        of any post-handshake message.
+        """
+        if self._config.ticket_key is None:
+            return
+        nonce = os.urandom(TICKET_NONCE_LENGTH)
+        psk = resumption_psk(self.schedule.resumption_master_secret(), nonce)
+        ticket = NewSessionTicket(
+            lifetime=SESSION_TICKET_LIFETIME,
+            age_add=int.from_bytes(os.urandom(4), "big"),
+            nonce=nonce,
+            ticket=seal_ticket(self._config.ticket_key, psk, self._now),
+            extensions=[],
+        )
+        self.events.append(SendData(EncryptionLevel.ONE_RTT, encode_new_session_ticket(ticket)))
