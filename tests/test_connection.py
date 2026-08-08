@@ -1138,3 +1138,48 @@ class TestVersionNegotiation:
         client.datagram_received(forged, now, source="server")
         assert not any(isinstance(e, VersionNegotiationReceived) for e in client.take_events())
         assert client.state is ConnectionState.CONNECTED
+
+
+class TestPathValidation:
+    """RFC 9000 §8.2: challenges and responses on the current path."""
+
+    def test_a_challenge_round_trip_validates_the_path(self, credentials: Credentials) -> None:
+        """The handshake validates the first path (§8.1); a fresh
+        challenge reopens the question and the peer's echoed bytes
+        settle it."""
+        client, server, now = handshake(credentials)
+        after_handshake = client.path_validated
+        assert after_handshake is True
+        client.validate_path()
+        challenged = client.path_validated
+        assert challenged is False
+        pump(client, server, now=now)
+        answered = client.path_validated
+        assert answered is True
+
+    def test_both_sides_answer_challenges(self, credentials: Credentials) -> None:
+        """§8.2.2: a challenge draws exactly one echoed response,
+        whichever side asks."""
+        client, server, now = handshake(credentials)
+        server.validate_path()
+        challenged = server.path_validated
+        assert challenged is False
+        pump(client, server, now=now)
+        answered = server.path_validated
+        assert answered is True
+
+    def test_an_unanswered_challenge_leaves_the_path_unvalidated(
+        self, credentials: Credentials
+    ) -> None:
+        """§8.2.3: nothing but a matching response settles validation;
+        sending the challenge proves nothing by itself."""
+        client, server, now = handshake(credentials)
+        client.validate_path()
+        # Deliver the challenge but none of the server's answers.
+        for datagram in client.datagrams_to_send(now):
+            server.datagram_received(datagram.data, now, source="client")
+        unanswered = client.path_validated
+        assert unanswered is False
+        pump(client, server, now=now)
+        answered = client.path_validated
+        assert answered is True

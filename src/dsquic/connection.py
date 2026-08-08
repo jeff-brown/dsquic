@@ -20,10 +20,12 @@ early stream data under its own keys (RFC 9001 §5.1) within the limits
 remembered from the ticket's connection (RFC 9001 §7.4.1), with
 rejected data resent in 1-RTT (RFC 9001 §4.6.2).
 
-Key update is implemented (RFC 9001 §6); Retry and the address
+Key update is implemented (RFC 9001 §6); path validation (§8.2)
+carries the challenges migration will ride on; Retry and the address
 validation tokens live in retry.py; Version Negotiation is answered
 statelessly in packet.py, before any connection exists. Not in this
-MVP: migration, stateless reset, and NEW_CONNECTION_ID issuance.
+MVP: stateless reset and NEW_CONNECTION_ID issuance, and migration
+itself is under construction atop §8.2.
 Received frames for those features are parsed and ignored where the
 spec permits.
 """
@@ -51,6 +53,7 @@ from dsquic.frames import (
     MaxStreamData,
     MaxStreams,
     NewToken,
+    PathChallenge,
     PathResponse,
     Ping,
     Stream,
@@ -390,6 +393,11 @@ class Connection:
         # Retry's source CID, and, for a server that sent a Retry, the
         # original destination CID recovered from the token (§8.1.2).
         # Set before the parameters are built, which reads them.
+        # §8.2: the current path counts as validated by the handshake
+        # itself (§8.1); validate_path() reopens the question, and the
+        # eight-byte payloads of unanswered challenges wait here.
+        self.path_validated = True
+        self._path_challenges: list[bytes] = []
         # §13.4.2: ECT(0) goes on every datagram until validation
         # fails, at which point marking stops for the connection.
         self._ecn_enabled = True
@@ -409,16 +417,7 @@ class Connection:
         # under, remembered from the connection that issued the ticket.
         self._remembered_parameters: TransportParameters | None = None
         if is_client:
-            if client_config is None:
-                raise ValueError("client_config is required for a client connection")
-            self.tls = TlsClient(
-                replace(client_config, transport_parameters=self._local_parameters.encode()),
-                keylog=self.config.keylog,
-            )
-            if client_config.early_data and client_config.session_ticket is not None:
-                self._remembered_parameters = decode_transport_parameters(
-                    client_config.session_ticket.transport_parameters
-                )
+            self._init_client_tls(client_config)
         elif server_config is None:
             raise ValueError("server_config is required for a server connection")
 
@@ -456,6 +455,21 @@ class Connection:
             self._install_initial_keys(self._initial_dcid)
 
     # --- key management (RFC 9001 §4.1, §4.9) --------------------------------
+
+    def _init_client_tls(self, client_config: ClientConfig | None) -> None:
+        """The client's TLS machine, plus what 0-RTT remembers
+        (RFC 9001 §7.4.1). A server's machine waits for the first
+        Initial, whose connection ID fixes its parameters (§7.3)."""
+        if client_config is None:
+            raise ValueError("client_config is required for a client connection")
+        self.tls = TlsClient(
+            replace(client_config, transport_parameters=self._local_parameters.encode()),
+            keylog=self.config.keylog,
+        )
+        if client_config.early_data and client_config.session_ticket is not None:
+            self._remembered_parameters = decode_transport_parameters(
+                client_config.session_ticket.transport_parameters
+            )
 
     def _install_initial_keys(self, dcid: bytes) -> None:
         secrets = derive_initial_secrets(dcid)
@@ -989,10 +1003,21 @@ class Connection:
             if not self.is_client:
                 raise ConnectionError_(frames.PROTOCOL_VIOLATION, "client sent NEW_TOKEN")
             self.new_tokens.append(frame.token)
+        elif isinstance(frame, PathChallenge):
+            # §8.2.2: every challenge draws exactly one response
+            # carrying the same eight bytes, on the path it arrived on.
+            self._queue_control(PathResponse(data=frame.data))
+        elif isinstance(frame, PathResponse):
+            # §8.2.3: only a response matching an outstanding challenge
+            # validates the path. Anything else is ignored rather than
+            # fatal: a response can outlive the path that asked for it.
+            if frame.data in self._path_challenges:
+                self._path_challenges.clear()
+                self.path_validated = True
         elif isinstance(frame, ConnectionClose):
             self._on_connection_close(frame, now)
-        # Frames for deferred features (NEW_CONNECTION_ID, PATH_CHALLENGE,
-        # DATAGRAM, blocked frames) are accepted and ignored.
+        # Frames for deferred features (NEW_CONNECTION_ID, DATAGRAM,
+        # blocked frames) are accepted and ignored.
 
     def _handle_limit(self, frame: MaxData | MaxStreamData | MaxStreams) -> None:
         """A peer raising one of our sending allowances (§4.1, §4.6)."""
@@ -1092,6 +1117,12 @@ class Connection:
                 self._handshake_done_pending = True
             elif isinstance(frame, NewToken):
                 # §13.3: resent verbatim until acknowledged.
+                self._queue_control(frame)
+            elif isinstance(frame, PathChallenge):
+                # §8.2.1: retransmitted with the same bytes, which the
+                # outstanding record still matches. A lost PATH_RESPONSE
+                # is deliberately not resent (§8.2.2): the peer sends a
+                # fresh challenge if it still cares.
                 self._queue_control(frame)
             elif isinstance(frame, MaxData) and self.streams is not None:
                 # §13.3: the current limit is sent, not the lost one.
@@ -1904,6 +1935,18 @@ class Connection:
                 peer=_flow_limits(self._remembered_parameters),
             )
         self._arm_idle_timer(now)
+
+    def validate_path(self) -> None:
+        """Challenge the current path (§8.2.1).
+
+        Sends a PATH_CHALLENGE with fresh random bytes and clears
+        ``path_validated`` until a matching PATH_RESPONSE arrives.
+        Callable at any time; migration is the caller that matters.
+        """
+        data = os.urandom(8)
+        self._path_challenges.append(data)
+        self.path_validated = False
+        self._queue_control(PathChallenge(data=data))
 
     def send_new_token(self, token: bytes) -> None:
         """Server: queue a NEW_TOKEN frame (§8.1.3).

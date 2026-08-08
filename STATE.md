@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  431 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  434 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -358,11 +358,16 @@ preferred_address is the centerpiece, recorded in design.md §7.
 
 **Order of work, each step gated on the one before:**
 
-1. Path validation (§8.2): answer PATH_CHALLENGE with PATH_RESPONSE
-   carrying the same 8 bytes, on the path the challenge arrived on;
-   issue challenges and match responses against outstanding data.
-   Frames exist in the §19 vocabulary; handlers replace the
-   parse-and-ignore arms.
+1. Done: path validation (§8.2). PATH_CHALLENGE is answered with the
+   same eight bytes (§8.2.2); `Connection.validate_path()` issues a
+   challenge and clears the public `path_validated` flag, which only
+   a matching response restores (§8.2.3); a stray response is
+   ignored, since one can outlive the path that asked. Lost
+   challenges are resent verbatim; lost responses deliberately are
+   not (§8.2.2, the peer re-challenges). The handshake path counts
+   as validated from the start (§8.1). Datagram expansion for
+   challenges (§8.2.1's SHOULD) is deferred to step 2, where the new
+   path's amplification limit makes the decision real.
 2. Server passive path change (§9.3): a higher-numbered packet from a
    new source moves the connection's destination, the first packet
    sent there carries PATH_CHALLENGE, and congestion and RTT reset
