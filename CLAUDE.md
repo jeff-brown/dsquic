@@ -190,7 +190,6 @@ it exists to teach QUIC.
 
 Check `docs/design.md` §7 before touching related areas. Still open: the
 asyncio transport layer, PyPI publication, the v1 MASQUE surface
-(CONNECT-UDP only vs. CONNECT-IP alongside), `preferred_address`
-(inside the migration phase), and SNI-selected certificate chains (in
-the MASQUE phase). Record newly settled decisions in the appendix of
+(CONNECT-UDP only vs. CONNECT-IP alongside) and SNI-selected
+certificate chains (in the MASQUE phase). Record newly settled decisions in the appendix of
 `docs/design.md`.

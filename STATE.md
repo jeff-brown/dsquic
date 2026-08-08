@@ -342,6 +342,47 @@ connection carrying many early requests.
    now 100. What remains is the human wire check: the latest three
    log directories in the VM hold the passing pcaps and keylogs.
 
+## Migration cluster, next (2026-08-08)
+
+**Criteria, read from the runner's source, which reshaped the plan.**
+`rebind-port` and `rebind-addr` are server-side: a 10MB transfer while
+the simulator rebinds the client's apparent port (and address) every 5
+seconds from t=1s; the checker requires the server's first packet on
+each new path to carry a PATH_CHALLENGE frame, and the transfer to
+finish. `connectionmigration` is the `preferred_address` case: the
+server container gets the testcase and must offer a preferred address
+(2MB transfer, host server46), while the client container is told
+plain "transfer" and is expected to migrate to the offered address and
+validate it. That settles yesterday's open question by evidence:
+preferred_address is the centerpiece, recorded in design.md §7.
+
+**Order of work, each step gated on the one before:**
+
+1. Path validation (§8.2): answer PATH_CHALLENGE with PATH_RESPONSE
+   carrying the same 8 bytes, on the path the challenge arrived on;
+   issue challenges and match responses against outstanding data.
+   Frames exist in the §19 vocabulary; handlers replace the
+   parse-and-ignore arms.
+2. Server passive path change (§9.3): a higher-numbered packet from a
+   new source moves the connection's destination, the first packet
+   sent there carries PATH_CHALLENGE, and congestion and RTT reset
+   unless the address was only a port rebinding is a §9.4 subtlety to
+   read closely. The endpoint already routes by connection ID, so the
+   change is core-side: the destination is opaque to the core but
+   comparable, which is what lets the core notice the change without
+   interpreting addresses. Rungs: a loopback test that rebinds a
+   client socket mid-transfer, then `rebind-port` and `rebind-addr`.
+3. NEW_CONNECTION_ID issuance (§5.1.1), the minimum migration needs:
+   preferred_address carries a CID with sequence 1 and a stateless
+   reset token, and §9.5 wants fresh CIDs on new paths. Issue a small
+   pool; handle RETIRE_CONNECTION_ID.
+4. preferred_address (§9.6): the TransportParameters field, server
+   config to populate it (the shim must learn which addresses the
+   container owns), and the client side: after handshake
+   confirmation, validate the preferred path and migrate, abandoning
+   it if validation fails (§9.6.2). Rungs: loopback with a
+   dual-socket server, then `connectionmigration` in both roles.
+
 ## Version negotiation, client side (2026-08-08)
 
 The client can now force and honour Version Negotiation: dialled with
@@ -589,8 +630,8 @@ Observed divergences worth keeping:
 
 See design.md §7. Still open: whether to add an asyncio transport over
 the sans-IO core, PyPI publication, the v1 MASQUE surface (CONNECT-UDP
-only vs. CONNECT-IP alongside), `preferred_address` (decide inside the
-migration phase), and SNI-selected certificate chains (decide in the
-MASQUE phase). 0-RTT was settled in scope
+only vs. CONNECT-IP alongside), and SNI-selected certificate chains
+(decide in the MASQUE phase). preferred_address was settled in scope
+on 2026-08-08 by the runner's own definition of connectionmigration. 0-RTT was settled in scope
 on 2026-08-07 with freshness-based anti-replay; everything settled so
 far is recorded in the design.md appendix.
