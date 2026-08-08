@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  418 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  419 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -341,6 +341,47 @@ connection carrying many early requests.
    resuming client's early burst at 16 requests, so the default is
    now 100. What remains is the human wire check: the latest three
    log directories in the VM hold the passing pcaps and keylogs.
+
+## ECN, next (2026-08-08)
+
+**Acceptance criterion**, read from the runner's `TestCaseECN`: a
+handshake plus one 100KB transfer; from the pcap, every QUIC packet
+each side sends is marked ECT(0) or ECT(1) consistently, none is CE
+(the simulator's path does not mark), and each side sends at least one
+ACK-ECN frame. SSLKEYLOGFILE is required or the case reports
+unsupported. frames.py already parses and encodes ACK-ECN
+(`Ack.ecn: EcnCounts`, type 0x03), so the work is counting, marking,
+validation, and the sockets.
+
+**Order of work, each step gated on the one before:**
+
+1. Done: `datagram_received` grew an `ecn` codepoint argument
+   (endpoint-supplied; the core never reads IP headers). Each space
+   counts ECT(0), ECT(1) and CE per successfully processed packet
+   (§13.4.1, coalesced packets each count under their datagram's
+   codepoint), `_build_ack` echoes nonzero counts through `Ack.ecn`,
+   and qlog flattens the counts onto ack frame details (events §8.5),
+   which is what the test observes.
+2. Core send: mark every `OutgoingDatagram` ECT(0) while ECN is
+   considered working; per-space bookkeeping of ECT(0)-marked sent
+   packets. Validation per §13.4.2 on each ACK: stop marking for the
+   connection when an ACK newly acknowledging a marked packet carries
+   no ECN counts, when counts regress, or when ect0 plus ce falls
+   short of the newly acked marked packets. A CE count increase is a
+   congestion event (RFC 9002 §7.1): cwnd reduction without loss or
+   retransmission.
+3. Endpoints: enable IP_RECVTOS / IPV6_RECVTCLASS and read the
+   codepoint out of recvmsg ancillary data into `datagram_received`;
+   honor `OutgoingDatagram.ecn` on send via IP_TOS / IPV6_TCLASS,
+   set at the socket when the value changes, since the core marks
+   uniformly; per-datagram cmsg only if a platform demands it.
+   Platform check early: TOS send and receive on macOS loopback for
+   both families, since rung 2 depends on it.
+4. Ladder: unit (counting and validation state machine), connection
+   pump with ecn threaded through, loopback over real UDP, shim claims
+   `ecn`, runner both roles. The wire criterion is IP-header bits, so
+   the pcap rung is again the only honest judge; the 0-RTT lesson in
+   docs/findings.md applies verbatim.
 
 ## Retry (2026-08-06)
 

@@ -10,6 +10,7 @@ import pytest
 from dsquic import frames, hq, qlog
 from dsquic.connection import (
     DEFAULT_MAX_DATAGRAM_SIZE,
+    ECT_0,
     PACING_BURST_DATAGRAMS,
     PROBE_PACKETS,
     Connection,
@@ -1033,3 +1034,31 @@ class TestNewToken:
         client.connect(0.0)
         header = parse_long_header(client.datagrams_to_send(0.0)[0].data)
         assert header.token == b"\x02stored-token"
+
+
+def test_ecn_counts_are_echoed_in_acks(credentials: Credentials) -> None:
+    """RFC 9000 §13.4.1: a receiver of ECT-marked packets reports the
+    counts in ACK-ECN frames, one tally per packet number space,
+    visible in the qlog trace as ect0 on the ack frames it sends."""
+    server_qlog: list[str] = []
+    client, server = make_pair(credentials, server_qlog=server_qlog)
+    client.connect(0.0)
+    now = 0.0
+    for _ in range(12):
+        for datagram in client.datagrams_to_send(now):
+            server.datagram_received(datagram.data, now, source="client", ecn=ECT_0)
+        now += 0.01
+        for datagram in server.datagrams_to_send(now):
+            client.datagram_received(datagram.data, now, source="server")
+        now += 0.01
+    acks = [
+        frame
+        for event in qlog_events(server_qlog)
+        if event["name"] == "quic:packet_sent"
+        for frame in event["data"]["frames"]
+        if frame["frame_type"] == "ack"
+    ]
+    assert acks
+    assert any(frame.get("ect0", 0) > 0 for frame in acks)
+    # The unmarked direction stays a plain ACK: no counts to report.
+    assert client.state is ConnectionState.CONNECTED

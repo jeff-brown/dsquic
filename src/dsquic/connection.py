@@ -43,6 +43,7 @@ from dsquic.frames import (
     Ack,
     ConnectionClose,
     Crypto,
+    EcnCounts,
     Frame,
     FrameParseError,
     HandshakeDone,
@@ -124,6 +125,11 @@ PROBE_PACKETS = 2  # §6.2.4: up to two datagrams per PTO
 # RFC 9002 §7.7: bursts are limited to the initial congestion window,
 # which is ten datagrams (B.1).
 PACING_BURST_DATAGRAMS = 10
+
+# IP header ECN codepoints (RFC 3168), as §13.4 counts them.
+ECT_1 = 0b01
+ECT_0 = 0b10
+ECN_CE = 0b11
 
 LEVEL_TO_PACKET_TYPE = {
     EncryptionLevel.INITIAL: PacketType.INITIAL,
@@ -238,6 +244,11 @@ class _Space:
     keys_recv_early: PacketKeys | None = None
     next_packet_number: int = 0
     largest_received: int = -1
+    # §13.4.1: counts of processed packets by the ECN codepoint their
+    # datagram arrived with, echoed to the peer in ACK-ECN frames.
+    ecn_ect0: int = 0
+    ecn_ect1: int = 0
+    ecn_ce: int = 0
     received: RangeSet = field(default_factory=RangeSet)
     ack_eliciting_pending: bool = False
     crypto_offset_sent: int = 0
@@ -591,7 +602,9 @@ class Connection:
 
     # --- receive path ---------------------------------------------------------
 
-    def datagram_received(self, data: bytes, now: float, source: object = None) -> None:
+    def datagram_received(
+        self, data: bytes, now: float, source: object = None, ecn: int = 0
+    ) -> None:
         """Process one received datagram (§12.2: coalesced packets).
 
         A transport error detected while processing does not propagate:
@@ -599,7 +612,7 @@ class Connection:
         ConnectionTerminated event to the application.
         """
         try:
-            self._datagram_received(data, now, source)
+            self._datagram_received(data, now, source, ecn)
         except ConnectionError_ as exc:
             self.close(error_code=exc.error_code, reason=exc.reason, frame_type=exc.frame_type)
             self._log(
@@ -609,7 +622,7 @@ class Connection:
             )
             self._events.append(ConnectionTerminated(error_code=exc.error_code, reason=exc.reason))
 
-    def _datagram_received(self, data: bytes, now: float, source: object) -> None:
+    def _datagram_received(self, data: bytes, now: float, source: object, ecn: int = 0) -> None:
         if self.state in (ConnectionState.TERMINATED, ConnectionState.DRAINING):
             return
         # §8.1: an Initial validates nothing by itself, but every received
@@ -620,7 +633,7 @@ class Connection:
             self.destination = source
         offset = 0
         while offset < len(data):
-            consumed = self._process_packet(data[offset:], now)
+            consumed = self._process_packet(data[offset:], now, ecn)
             if consumed <= 0:
                 break
             offset += consumed
@@ -753,7 +766,7 @@ class Connection:
             data["header"] = header
         self._qlog.log(now, qlog.PACKET_DROPPED, data)
 
-    def _process_packet(self, data: bytes, now: float) -> int:
+    def _process_packet(self, data: bytes, now: float, ecn: int = 0) -> int:
         """Unprotect and handle one packet; returns bytes consumed."""
         try:
             located = self._locate_packet(data, now)
@@ -807,6 +820,14 @@ class Connection:
             "raw": {"length": packet_end},
         }
         space.received.add(packet_number, packet_number + 1)
+        # §13.4.1: each coalesced packet counts under its datagram's
+        # codepoint, and only once processing has deemed it valid.
+        if ecn == ECT_0:
+            space.ecn_ect0 += 1
+        elif ecn == ECT_1:
+            space.ecn_ect1 += 1
+        elif ecn == ECN_CE:
+            space.ecn_ce += 1
         if packet_number > space.largest_received:
             space.largest_received = packet_number
             self._largest_time_received[level] = now
@@ -1608,7 +1629,12 @@ class Connection:
         ranges = [
             (start, end - 1) for start, end in reversed(space.received.ranges[-MAX_ACK_RANGES:])
         ]
-        return Ack(largest=space.largest_received, delay=0, ranges=ranges)
+        # §13.4.1: a receiver of ECN-marked packets reports the counts;
+        # a space that saw none sends the plain ACK type.
+        counts = None
+        if space.ecn_ect0 or space.ecn_ect1 or space.ecn_ce:
+            counts = EcnCounts(ect0=space.ecn_ect0, ect1=space.ecn_ect1, ce=space.ecn_ce)
+        return Ack(largest=space.largest_received, delay=0, ranges=ranges, ecn=counts)
 
     # --- termination (§10) ----------------------------------------------------
 

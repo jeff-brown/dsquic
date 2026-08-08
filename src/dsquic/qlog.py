@@ -94,6 +94,12 @@ def frame_detail(frame: object) -> dict[str, Any]:
         value = getattr(frame, name, None)
         if value is not None:
             detail[schema_name] = value
+    ecn = getattr(frame, "ecn", None)
+    if ecn is not None:
+        # events §8.5: the ACK-ECN counts, flattened as the schema has them.
+        detail["ect0"] = ecn.ect0
+        detail["ect1"] = ecn.ect1
+        detail["ce"] = ecn.ce
     return detail
 
 
