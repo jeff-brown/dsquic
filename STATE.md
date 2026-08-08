@@ -342,7 +342,7 @@ connection carrying many early requests.
    now 100. What remains is the human wire check: the latest three
    log directories in the VM hold the passing pcaps and keylogs.
 
-## ECN, next (2026-08-08)
+## ECN (2026-08-08)
 
 **Acceptance criterion**, read from the runner's `TestCaseECN`: a
 handshake plus one 100KB transfer; from the pcap, every QUIC packet
@@ -384,11 +384,14 @@ validation, and the sockets.
    dual-stack path sets them EAFP. The loopback test proves marks
    cross the kernel: ACK-ECN counts in the qlog traces of a real UDP
    fetch, which stay zero unless the marks arrived.
-4. Ladder: unit (counting and validation state machine), connection
-   pump with ecn threaded through, loopback over real UDP, shim claims
-   `ecn`, runner both roles. The wire criterion is IP-header bits, so
-   the pcap rung is again the only honest judge; the 0-RTT lesson in
-   docs/findings.md applies verbatim.
+4. Done: the shim claims `ecn`, and the runner passes it in both
+   roles against picoquic, `✓(E)` each way, the checker reading ECT
+   marks and ACK-ECN frames of both directions from the pcap. quic-go,
+   aioquic and quiche report `?(E)`: their interop images do not mark,
+   so the runner deems those pairings unsupported rather than failed,
+   matching the public matrix. The runner keeps no logs for
+   unsupported verdicts, so only the picoquic pcaps exist for the
+   wire check.
 
 ## Retry (2026-08-06)
 
@@ -491,11 +494,11 @@ server halves in `connection.py` and `endpoints/server.py`,
 ## Next steps
 
 1. **Finish the QUIC protocol work before starting HTTP/3.** Remaining
-   runner cases: `zerortt`, `ecn`, `chacha20`, `connectionmigration`,
-   and `versionnegotiation`, where dsquic sends VN but a client does
-   not react to receiving one by retrying with a supported version.
-   `zerortt` is underway: the decision is settled (design.md appendix)
-   and the plan is the "0-RTT, next" section above.
+   runner cases: `chacha20`, `connectionmigration`, and
+   `versionnegotiation`, where dsquic sends VN but a client does not
+   react to receiving one by retrying with a supported version. With
+   `resumption`, `zerortt` and `ecn` done, those three are what stand
+   between here and HTTP/3.
 2. **HTTP/3 after that** (design.md §6.1). The largest piece and the one
    that unblocks MASQUE, since `h3.py` is a stub and carries the last
    open MASQUE readiness constraint. `h3.py` is written against a

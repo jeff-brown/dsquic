@@ -36,8 +36,8 @@ recorded in `docs/design.md`.
 
 `handshake`, `transfer`, `multiconnect`, `transferloss`,
 `transfercorruption`, `blackhole`, `longrtt`, `amplificationlimit`,
-`ipv6`, `keyupdate`, `retry`, `resumption`, and `zerortt`. Everything
-else exits 127.
+`ipv6`, `keyupdate`, `retry`, `resumption`, `zerortt`, and `ecn`.
+Everything else exits 127.
 
 `multiplexing` is not in that list and does not need to be: the runner
 gives both containers the name `transfer` for it, and it is the request
@@ -173,7 +173,11 @@ exactly two handshakes, a Certificate in the first and none in the
 second. `zerortt` likewise passes in both roles against all four
 peers, verified from the pcap as two handshakes with nonzero client
 0-RTT payload and nearly all request bytes early; two defects it
-caught that no lower rung could are in docs/findings.md.
+caught that no lower rung could are in docs/findings.md. `ecn`
+passes in both roles against picoquic, the runner reading the ECT
+marks and ACK-ECN frames of both directions out of the pcap; quic-go,
+aioquic and quiche report it unsupported because their interop images
+do not mark, the same pattern the public matrix shows.
 
 As **client**, `handshake`, `transfer`, `multiplexing`, `handshakeloss`,
 `handshakecorruption`, `ipv6` and `keyupdate` pass against all four

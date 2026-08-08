@@ -24,7 +24,7 @@ set -e
 # and handshakecorruption cases: one connection per file rather than one
 # connection carrying every request.
 #
-SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate retry resumption zerortt"
+SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate retry resumption zerortt ecn"
 
 case " $SUPPORTED " in
     *" $TESTCASE "*) ;;
