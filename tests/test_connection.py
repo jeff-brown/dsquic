@@ -3,6 +3,7 @@
 import datetime
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -20,8 +21,15 @@ from dsquic.connection import (
     HandshakeCompleted,
     HandshakeConfirmed,
     StreamDataReceived,
+    VersionNegotiationReceived,
 )
-from dsquic.packet import PacketType, parse_long_header
+from dsquic.packet import (
+    QUIC_V1,
+    PacketType,
+    build_version_negotiation,
+    parse_long_header,
+    version_negotiation_response,
+)
 from dsquic.qlog import QlogTrace
 from dsquic.recovery import MAX_PTO
 from dsquic.tls import (
@@ -1084,3 +1092,49 @@ def test_datagrams_are_marked_ect0_until_validation_fails(credentials: Credentia
     later = client.datagrams_to_send(1.0)
     assert later
     assert all(datagram.ecn == 0 for datagram in later)
+
+
+class TestVersionNegotiation:
+    """RFC 9000 §6.2: the client side of Version Negotiation."""
+
+    def test_a_greased_dial_is_answered_and_acted_on(self, credentials: Credentials) -> None:
+        """A first flight in a reserved version draws the stateless
+        answer, and the client surfaces the server's versions and dies,
+        for the caller to dial again."""
+        client, _ = make_pair(credentials)
+        client.config = replace(client.config, version=0x1A2A3A4A)
+        client.connect(0.0)
+        flight = client.datagrams_to_send(0.0)
+        answer = version_negotiation_response(flight[0].data)
+        assert answer is not None
+        client.datagram_received(answer, 0.1, source="server")
+        events = client.take_events()
+        offers = [e for e in events if isinstance(e, VersionNegotiationReceived)]
+        assert offers
+        assert QUIC_V1 in offers[0].versions
+        assert client.state is ConnectionState.TERMINATED
+
+    def test_one_listing_our_own_version_is_ignored(self, credentials: Credentials) -> None:
+        """§6.2: a Version Negotiation naming the version in use is an
+        attack or a confusion, never an instruction."""
+        client, _ = make_pair(credentials)
+        client.connect(0.0)
+        flight = client.datagrams_to_send(0.0)
+        answer = version_negotiation_response(
+            (0x1A2A3A4A).to_bytes(4, "big").join([flight[0].data[:1], flight[0].data[5:]])
+        )
+        assert answer is not None  # built against a greased copy, lists v1
+        client.datagram_received(answer, 0.1, source="server")
+        assert not any(isinstance(e, VersionNegotiationReceived) for e in client.take_events())
+        assert client.state is ConnectionState.HANDSHAKING
+
+    def test_one_after_a_server_packet_is_ignored(self, credentials: Credentials) -> None:
+        """§6.2: once any packet from the server has been processed,
+        Version Negotiation can only be an injection."""
+        client, _, now = handshake(credentials)
+        forged = build_version_negotiation(
+            destination_cid=client.host_cid, source_cid=client.peer_cid
+        )
+        client.datagram_received(forged, now, source="server")
+        assert not any(isinstance(e, VersionNegotiationReceived) for e in client.take_events())
+        assert client.state is ConnectionState.CONNECTED

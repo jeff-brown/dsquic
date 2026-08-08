@@ -18,7 +18,13 @@ import pytest
 from conftest import PemCredentials
 from dsquic import hq
 from dsquic.endpoints import load_pem_certificates
-from dsquic.endpoints.client import ClientOptions, fetch, fetch_each, fetch_zero_rtt
+from dsquic.endpoints.client import (
+    ClientOptions,
+    fetch,
+    fetch_each,
+    fetch_negotiating,
+    fetch_zero_rtt,
+)
 from dsquic.endpoints.server import Server, ServerOptions, load_credentials
 from dsquic.tls import ServerConfig
 
@@ -350,6 +356,22 @@ def test_loopback_chacha20(credentials: PemCredentials, server: int) -> None:
             ca_certificates=load_pem_certificates(credentials.ca_pem),
             server_name="localhost",
             chacha20=True,
+        ),
+    )
+    assert bodies == {"/index.html": INDEX_BODY}
+
+
+def test_loopback_version_negotiation(credentials: PemCredentials, server: int) -> None:
+    """RFC 9000 §6.2 end to end: a dial in a reserved version draws the
+    server's Version Negotiation, and the client honours the answer by
+    dialling again with v1 and completing the fetch."""
+    bodies = fetch_negotiating(
+        host="127.0.0.1",
+        port=server,
+        paths=["/index.html"],
+        options=ClientOptions(
+            ca_certificates=load_pem_certificates(credentials.ca_pem),
+            server_name="localhost",
         ),
     )
     assert bodies == {"/index.html": INDEX_BODY}

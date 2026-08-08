@@ -31,8 +31,10 @@ from dsquic.connection import (
     HandshakeCompleted,
     HandshakeConfirmed,
     StreamDataReceived,
+    VersionNegotiationReceived,
 )
 from dsquic.endpoints import enable_ecn, keylog_writer, load_pem_certificates, pump, qlog_trace
+from dsquic.packet import QUIC_V1
 from dsquic.streams import StreamLimitReached
 from dsquic.tls import (
     SUPPORTED_CIPHER_SUITES,
@@ -43,6 +45,18 @@ from dsquic.tls import (
 )
 
 DEFAULT_TIMEOUT = 30.0  # a whole fetch, not a single response
+# RFC 9000 §15: a reserved version no implementation speaks, so a
+# first flight carrying it is guaranteed to elicit Version Negotiation.
+GREASE_VERSION = 0x1A2A3A4A
+
+
+class VersionNegotiationRequired(Exception):
+    """The server answered with Version Negotiation (§6.2); it speaks
+    none of what we dialled with, and ``versions`` is its counteroffer."""
+
+    def __init__(self, versions: list[int]) -> None:
+        super().__init__("server requires version negotiation")
+        self.versions = versions
 
 
 @dataclass(frozen=True)
@@ -63,6 +77,8 @@ class ClientOptions:
     early_data: bool = False
     # Offer only ChaCha20-Poly1305, which is the runner's chacha20 case.
     chacha20: bool = False
+    # §15: the version dialled with; a reserved one forces negotiation.
+    version: int = QUIC_V1
 
 
 @dataclass
@@ -110,6 +126,8 @@ def _apply_events(connection: Connection, bodies: dict[int, bytearray], finished
         match event:
             case ConnectionTerminated():
                 raise RuntimeError(f"connection closed: {event.reason or event.error_code}")
+            case VersionNegotiationReceived():
+                raise VersionNegotiationRequired(event.versions)
             case HandshakeCompleted():
                 connected = True
             case HandshakeConfirmed():
@@ -175,6 +193,7 @@ def fetch(
             qlog=qlog_trace,
             key_update_interval=options.key_update_interval,
             token=session.tokens.pop() if session is not None and session.tokens else b"",
+            version=options.version,
         ),
         destination=address,
     )
@@ -248,6 +267,25 @@ def fetch_each(
     return bodies
 
 
+def fetch_negotiating(
+    host: str,
+    port: int,
+    paths: list[str],
+    options: ClientOptions | None = None,
+) -> dict[str, bytes]:
+    """The runner's versionnegotiation case: dial with a reserved
+    version to force negotiation (§15), then honour the server's
+    counteroffer by dialling again with a version both sides speak
+    (§6.2)."""
+    options = options if options is not None else ClientOptions()
+    try:
+        return fetch(host, port, paths, replace(options, version=GREASE_VERSION))
+    except VersionNegotiationRequired as offer:
+        if QUIC_V1 not in offer.versions:
+            raise RuntimeError("no version in common with the server") from offer
+        return fetch(host, port, paths, options)
+
+
 def fetch_zero_rtt(
     host: str,
     port: int,
@@ -301,6 +339,11 @@ def main(argv: list[str] | None = None) -> int:
         help="resume each connection from the previous one's session ticket (RFC 8446 §2.2)",
     )
     parser.add_argument(
+        "--negotiate-version",
+        action="store_true",
+        help="force Version Negotiation with a reserved version, then retry (RFC 9000 §6.2)",
+    )
+    parser.add_argument(
         "--chacha20",
         action="store_true",
         help="offer only ChaCha20-Poly1305 (RFC 9001 §5.4.4)",
@@ -322,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.zero_rtt:
         run = fetch_zero_rtt
+    elif args.negotiate_version:
+        run = fetch_negotiating
     elif args.connection_per_request:
         run = fetch_each
     else:
@@ -341,7 +386,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     for path, body in bodies.items():
-        if args.output_dir is not None:
+        # The versionnegotiation case requests the bare path "/",
+        # which names no file to write.
+        if args.output_dir is not None and Path(path).name:
             args.output_dir.mkdir(parents=True, exist_ok=True)
             (args.output_dir / Path(path).name).write_bytes(body)
             print(f"{path}: {len(body)} bytes")

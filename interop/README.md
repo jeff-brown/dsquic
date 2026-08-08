@@ -36,8 +36,8 @@ recorded in `docs/design.md`.
 
 `handshake`, `transfer`, `multiconnect`, `transferloss`,
 `transfercorruption`, `blackhole`, `longrtt`, `amplificationlimit`,
-`ipv6`, `keyupdate`, `retry`, `resumption`, `zerortt`, `ecn`, and
-`chacha20`. Everything else exits 127.
+`ipv6`, `keyupdate`, `retry`, `resumption`, `zerortt`, `ecn`,
+`chacha20`, and `versionnegotiation`. Everything else exits 127.
 
 `multiplexing` is not in that list and does not need to be: the runner
 gives both containers the name `transfer` for it, and it is the request
@@ -50,6 +50,13 @@ each, so that what is being lost is handshake packets rather than data
 packets. `run_endpoint.sh` maps it to the client's
 `--connection-per-request`, and raises the timeout to 280 seconds because
 the runner allows those cases 300 rather than the usual 60.
+
+`versionnegotiation` is claimed but the current runner never sends it:
+upstream keeps the test class yet dropped it from the registered list,
+and the public matrix carries no such column. The client behaviour
+(RFC 9000 §6.2, forcing negotiation with a reserved version and
+redialling on the answer) is verified to the loopback rung instead,
+`test_loopback_version_negotiation`.
 
 This list is a declaration of what to *attempt*, not a result: the runner
 decides pass or fail. Every case listed has been run and passed; see
@@ -203,7 +210,6 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 | Case | Reason |
 |---|---|
 | `v2` | Only QUIC v1 is offered |
-| `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
 | `ecn` | No ECN codepoints on send, no ECN validation |
 | `http3` | `h3.py` and `qpack.py` are stubs |
 | `connectionmigration` | No path validation or migration |

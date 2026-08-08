@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  427 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  431 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -342,6 +342,27 @@ connection carrying many early requests.
    now 100. What remains is the human wire check: the latest three
    log directories in the VM hold the passing pcaps and keylogs.
 
+## Version negotiation, client side (2026-08-08)
+
+The client can now force and honour Version Negotiation: dialled with
+a reserved version (`ConnectionConfig.version`, §15), it validates the
+server's answer per §6.2 (ignored after any processed server packet,
+if it lists the version in use, or if the connection IDs do not
+mirror ours), surfaces `VersionNegotiationReceived`, and dies for the
+caller to redial; `fetch_negotiating` (CLI `--negotiate-version`)
+does the redial with v1. packet.py grew the parser beside the
+long-standing stateless responder.
+
+The runner rung is not applicable, established rather than assumed:
+upstream keeps `TestCaseVersionNegotiation` but dropped it from
+`TESTCASES_QUIC`, so no runner invocation can name it and the public
+matrix has no column for it. Verification therefore tops out at the
+loopback rung, the full force-and-redial flow over real UDP through
+both reference endpoints. The shim still claims the case for any
+runner that reinstates it. The same registry check surfaced two
+runner cases the plans here had not tracked: `rebind-port` and
+`rebind-addr`, which belong with `connectionmigration`.
+
 ## ChaCha20 (2026-08-08)
 
 `chacha20` passes in both roles against quic-go, aioquic and picoquic,
@@ -515,11 +536,11 @@ server halves in `connection.py` and `endpoints/server.py`,
 ## Next steps
 
 1. **Finish the QUIC protocol work before starting HTTP/3.** Remaining
-   runner cases: `connectionmigration`, and `versionnegotiation`,
-   where dsquic sends VN but a client does not react to receiving one
-   by retrying with a supported version. With `resumption`, `zerortt`,
-   `ecn` and `chacha20` done, those two are what stand between here
-   and HTTP/3.
+   runner cases: `connectionmigration`, plus the `rebind-port` and
+   `rebind-addr` pair that exercises the same path machinery from the
+   server side. Version negotiation's client side is done to its
+   applicable rung. That migration cluster is what stands between
+   here and HTTP/3.
 2. **HTTP/3 after that** (design.md §6.1). The largest piece and the one
    that unblocks MASQUE, since `h3.py` is a stub and carries the last
    open MASQUE readiness constraint. `h3.py` is written against a

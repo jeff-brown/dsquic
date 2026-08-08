@@ -68,8 +68,10 @@ from dsquic.packet import (
     UnsupportedVersion,
     build_long_header,
     encode_packet_number,
+    is_version_negotiation,
     parse_long_header,
     parse_short_header,
+    parse_version_negotiation,
 )
 from dsquic.protection import (
     AEAD_TAG_LENGTH,
@@ -219,13 +221,28 @@ class HandshakeConfirmed:
 
 
 @dataclass(frozen=True)
+class VersionNegotiationReceived:
+    """§6.2: the server does not speak our version and listed its own.
+
+    The connection is dead; the caller picks a common version and
+    dials again.
+    """
+
+    versions: list[int]
+
+
+@dataclass(frozen=True)
 class ConnectionTerminated:
     error_code: int
     reason: str
 
 
 ConnectionEvent = (
-    StreamDataReceived | HandshakeCompleted | HandshakeConfirmed | ConnectionTerminated
+    StreamDataReceived
+    | HandshakeCompleted
+    | HandshakeConfirmed
+    | ConnectionTerminated
+    | VersionNegotiationReceived
 )
 
 
@@ -324,6 +341,11 @@ class ConnectionConfig:
     # Set by a server that answered this connection's first Initial with
     # a Retry (§8.1.2); None on every other connection.
     retry: RetryContext | None = None
+    # §15: the version stamped on long headers. A client given a
+    # reserved version elicits Version Negotiation on purpose; the
+    # Initial keys stay v1 either way, since no such packet is ever
+    # decrypted.
+    version: int = QUIC_V1
     # §8.1.3: a token a NEW_TOKEN frame delivered on an earlier
     # connection to this server; the client carries it in its Initial
     # packets so the server can skip address validation. A Retry's
@@ -661,6 +683,9 @@ class Connection:
             # §17.3: a short header packet runs to the end of the datagram.
             pn_offset = parse_short_header(data, len(self.host_cid)).pn_offset
             return EncryptionLevel.ONE_RTT, pn_offset, data, len(data)
+        if self.is_client and is_version_negotiation(data):
+            self._handle_version_negotiation(data, now)
+            return None
         if self.is_client and is_retry(data):
             self._handle_retry(data, now)
             return None
@@ -686,6 +711,34 @@ class Connection:
             self._peer_cid_confirmed = True
         packet_end = long_header.pn_offset + long_header.length
         return level, long_header.pn_offset, data[:packet_end], packet_end
+
+    def _handle_version_negotiation(self, data: bytes, now: float) -> None:
+        """§6.2: the server listed the versions it speaks instead of
+        answering.
+
+        Ignored once any packet from the server has been processed, if
+        it lists the version in use, or if its connection IDs do not
+        mirror the ones we sent: each of those marks a packet an
+        off-path attacker could have injected, or a server confused
+        enough to disbelieve.
+        """
+        if self._peer_cid_confirmed:
+            self._drop(now, qlog.DROP_UNSUPPORTED, len(data))
+            return
+        try:
+            packet = parse_version_negotiation(data)
+        except BufferReadError:
+            self._drop(now, qlog.DROP_INVALID, len(data))
+            return
+        if self.config.version in packet.versions:
+            self._drop(now, qlog.DROP_INVALID, len(data))
+            return
+        if packet.destination_cid != self.host_cid or packet.source_cid != self.peer_cid:
+            self._drop(now, qlog.DROP_INVALID, len(data))
+            return
+        self._log(now, qlog.PACKET_RECEIVED, {"header": {"packet_type": "version_negotiation"}})
+        self._events.append(VersionNegotiationReceived(versions=packet.versions))
+        self.state = ConnectionState.TERMINATED
 
     def _handle_retry(self, data: bytes, now: float) -> None:
         """§17.2.5.2: start the handshake again with the server's token.
@@ -1617,7 +1670,7 @@ class Connection:
         else:
             template = LongHeaderTemplate(
                 packet_type=PacketType.ZERO_RTT if zero_rtt else LEVEL_TO_PACKET_TYPE[level],
-                version=QUIC_V1,
+                version=self.config.version,
                 destination_cid=self.peer_cid,
                 source_cid=self.host_cid,
                 token=(self._retry_token or self.config.token)
@@ -1744,7 +1797,7 @@ class Connection:
                 header = build_long_header(
                     LongHeaderTemplate(
                         packet_type=LEVEL_TO_PACKET_TYPE[level],
-                        version=QUIC_V1,
+                        version=self.config.version,
                         token=(self._retry_token or self.config.token)
                         if level is EncryptionLevel.INITIAL
                         else b"",

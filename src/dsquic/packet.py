@@ -33,6 +33,7 @@ MAX_CID_LENGTH = 20  # RFC 9000 §17.2
 MAX_PACKET_NUMBER = 2**62 - 1
 # §6.1: never answer a smaller datagram, so the reply cannot amplify.
 MIN_VERSION_NEGOTIATION_DATAGRAM = 1200
+VERSION_END = 5  # first byte plus the 32-bit version (§17.2)
 
 
 class PacketType(enum.Enum):
@@ -167,6 +168,40 @@ def build_version_negotiation(destination_cid: bytes, source_cid: bytes) -> byte
         + bytes([len(source_cid)])
         + source_cid
         + b"".join(version.to_bytes(4, "big") for version in SUPPORTED_VERSIONS)
+    )
+
+
+@dataclass(frozen=True)
+class VersionNegotiation:
+    """A parsed Version Negotiation packet (§17.2.1)."""
+
+    destination_cid: bytes
+    source_cid: bytes
+    versions: list[int]
+
+
+def is_version_negotiation(data: bytes) -> bool:
+    """Whether a datagram begins with a Version Negotiation packet.
+
+    Checked before ordinary header parsing, because the packet carries
+    no Length or Packet Number field and cannot be read as one
+    (§17.2.1).
+    """
+    if len(data) < VERSION_END or not data[0] & HEADER_FORM_LONG:
+        return False
+    return int.from_bytes(data[1:VERSION_END], "big") == VERSION_NEGOTIATION
+
+
+def parse_version_negotiation(data: bytes) -> VersionNegotiation:
+    """Parse a Version Negotiation packet (§17.2.1)."""
+    buf = Buffer(data[5:])
+    destination_cid = buf.pull_bytes(buf.pull_uint8())
+    source_cid = buf.pull_bytes(buf.pull_uint8())
+    versions: list[int] = []
+    while not buf.is_empty:
+        versions.append(buf.pull_uint32())
+    return VersionNegotiation(
+        destination_cid=destination_cid, source_cid=source_cid, versions=versions
     )
 
 
