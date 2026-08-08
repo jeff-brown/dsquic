@@ -315,3 +315,24 @@ def test_fetch_each_enforces_a_total_deadline(credentials: PemCredentials) -> No
                 timeout=0.0,
             ),
         )
+
+
+def test_loopback_ecn_counts_survive_the_kernel(
+    credentials: PemCredentials, server: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RFC 9000 §13.4 end to end: ECT(0) marks stamped by one endpoint
+    arrive at the other through the kernel's ancillary data, and the
+    resulting ACK-ECN counts show up in the qlog traces. The counts
+    cannot be nonzero unless the marks really crossed the sockets."""
+    monkeypatch.setenv("QLOGDIR", str(tmp_path))
+    fetch(
+        host="127.0.0.1",
+        port=server,
+        paths=["/index.html"],
+        options=ClientOptions(
+            ca_certificates=load_pem_certificates(credentials.ca_pem),
+            server_name="localhost",
+        ),
+    )
+    records = "".join(path.read_text() for path in tmp_path.glob("*.sqlog"))
+    assert '"ect0"' in records

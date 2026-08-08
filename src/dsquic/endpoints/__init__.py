@@ -10,6 +10,7 @@ import datetime
 import os
 import selectors
 import socket
+import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -93,6 +94,48 @@ def qlog_trace(group_id: bytes, is_client: bool, reference_time: float) -> QlogT
     )
 
 
+def enable_ecn(sock: socket.socket) -> None:
+    """Ask the kernel to deliver each datagram's ECN codepoint (§13.4).
+
+    A dual-stack socket also asks for the IPv4 option where the
+    platform allows it (Linux does, and needs it for v4-mapped peers;
+    macOS refuses it on an AF_INET6 socket).
+    """
+    if sock.family == socket.AF_INET:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
+        return
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_RECVTCLASS, 1)
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
+    except OSError:
+        pass
+
+
+def _set_ecn(sock: socket.socket, ecn: int) -> None:
+    """Stamp the codepoint the core chose for this datagram (§13.4)."""
+    if sock.family == socket.AF_INET:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, ecn)
+        return
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, ecn)
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, ecn)
+    except OSError:
+        pass
+
+
+def _ecn_of(ancdata: list[tuple[int, int, bytes]]) -> int:
+    """The ECN codepoint out of recvmsg ancillary data (§13.4).
+
+    IPv4 delivers one TOS byte; IPv6 a native-endian traffic class
+    int. The codepoint is the low two bits of either.
+    """
+    for level, _, data in ancdata:
+        if level in (socket.IPPROTO_IP, socket.IPPROTO_IPV6) and data:
+            value = data[0] if len(data) == 1 else int.from_bytes(data[:4], sys.byteorder)
+            return value & 0b11
+    return 0
+
+
 def send_pending(connection: Connection, sock: socket.socket) -> None:
     """Flush whatever the core says is due right now."""
     for datagram in connection.datagrams_to_send(time.monotonic()):
@@ -100,12 +143,13 @@ def send_pending(connection: Connection, sock: socket.socket) -> None:
         # tunnelled; a socket endpoint knows they are addresses.
         destination = cast("Address", datagram.destination)
         if destination is not None:
+            _set_ecn(sock, datagram.ecn)
             sock.sendto(datagram.data, destination)
 
 
 def wait_for_readable(
     selector: selectors.BaseSelector, deadlines: Sequence[float | None]
-) -> list[tuple[bytes, Address]]:
+) -> list[tuple[bytes, Address, int]]:
     """Sleep until a datagram arrives or the earliest deadline passes.
 
     Taking deadlines rather than a poll interval is what lets one loop
@@ -115,15 +159,15 @@ def wait_for_readable(
     wait = min(timeouts) - time.monotonic() if timeouts else None
     if wait is not None and wait < 0:
         wait = 0
-    received: list[tuple[bytes, Address]] = []
+    received: list[tuple[bytes, Address, int]] = []
     for key, _ in selector.select(timeout=wait):
         readable: socket.socket = key.fileobj  # type: ignore[assignment]
         while True:
             try:
-                data, source = readable.recvfrom(MAX_DATAGRAM_RECV)
+                data, ancdata, _, source = readable.recvmsg(MAX_DATAGRAM_RECV, 512)
             except BlockingIOError:
                 break
-            received.append((data, source))
+            received.append((data, cast("Address", source), _ecn_of(ancdata)))
     return received
 
 
@@ -139,6 +183,6 @@ def pump(
     *when* to wake up; this decides only how the bytes move.
     """
     send_pending(connection, sock)
-    for data, source in wait_for_readable(selector, [connection.next_timer(), deadline]):
-        connection.datagram_received(data, time.monotonic(), source=source)
+    for data, source, ecn in wait_for_readable(selector, [connection.next_timer(), deadline]):
+        connection.datagram_received(data, time.monotonic(), source=source, ecn=ecn)
     connection.handle_timer(time.monotonic())

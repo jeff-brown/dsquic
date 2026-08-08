@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  421 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  422 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -372,13 +372,18 @@ validation, and the sockets.
    comparison, which needs per-packet mark bookkeeping and defends
    against a peer inflating counts, not against bleaching; noted here
    so the omission is a decision rather than an accident.
-3. Endpoints: enable IP_RECVTOS / IPV6_RECVTCLASS and read the
-   codepoint out of recvmsg ancillary data into `datagram_received`;
-   honor `OutgoingDatagram.ecn` on send via IP_TOS / IPV6_TCLASS,
-   set at the socket when the value changes, since the core marks
-   uniformly; per-datagram cmsg only if a platform demands it.
-   Platform check early: TOS send and receive on macOS loopback for
-   both families, since rung 2 depends on it.
+3. Done: `enable_ecn` turns on IP_RECVTOS / IPV6_RECVTCLASS,
+   `wait_for_readable` reads the codepoint from recvmsg ancillary
+   data into `datagram_received`, and `send_pending` stamps each
+   datagram's `OutgoingDatagram.ecn` via IP_TOS / IPV6_TCLASS before
+   sendto. Platform findings, probed before writing: macOS loopback
+   carries TOS both ways in both families (IPv4 delivers one byte,
+   IPv6 a native-endian int, so `_ecn_of` handles both shapes), but
+   macOS refuses the IPv4 options on a dual-stack AF_INET6 socket
+   while Linux accepts and needs them for v4-mapped peers, so the
+   dual-stack path sets them EAFP. The loopback test proves marks
+   cross the kernel: ACK-ECN counts in the qlog traces of a real UDP
+   fetch, which stay zero unless the marks arrived.
 4. Ladder: unit (counting and validation state machine), connection
    pump with ecn threaded through, loopback over real UDP, shim claims
    `ecn`, runner both roles. The wire criterion is IP-header bits, so

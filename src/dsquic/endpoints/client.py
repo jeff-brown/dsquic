@@ -32,7 +32,7 @@ from dsquic.connection import (
     HandshakeConfirmed,
     StreamDataReceived,
 )
-from dsquic.endpoints import keylog_writer, load_pem_certificates, pump, qlog_trace
+from dsquic.endpoints import enable_ecn, keylog_writer, load_pem_certificates, pump, qlog_trace
 from dsquic.streams import StreamLimitReached
 from dsquic.tls import ClientConfig, SessionTicket, TlsClient
 
@@ -143,6 +143,7 @@ def fetch(
     family, _, _, _, address = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0]
     sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.setblocking(False)
+    enable_ecn(sock)
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
 

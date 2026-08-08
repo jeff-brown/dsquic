@@ -39,6 +39,7 @@ from dsquic.connection import (
 )
 from dsquic.endpoints import (
     Address,
+    enable_ecn,
     keylog_writer,
     load_pem_certificates,
     qlog_trace,
@@ -158,6 +159,7 @@ class Server:
         options: ServerOptions,
     ) -> None:
         self._sock = sock
+        enable_ecn(sock)
         self._selector = selector
         self._server_config = server_config
         if server_config.ticket_key is None:
@@ -199,8 +201,8 @@ class Server:
         deadlines += [session.deadline for session in self._sessions.values()]
         if not deadlines:
             deadlines = [time.monotonic() + self._idle_timeout]
-        for data, source in wait_for_readable(self._selector, deadlines):
-            self._route(data, source)
+        for data, source, ecn in wait_for_readable(self._selector, deadlines):
+            self._route(data, source, ecn)
 
         now = time.monotonic()
         for session in list(self._sessions.values()):
@@ -209,7 +211,7 @@ class Server:
             send_pending(session.connection, self._sock)
         self._reap(now)
 
-    def _route(self, data: bytes, source: Address) -> None:
+    def _route(self, data: bytes, source: Address, ecn: int = 0) -> None:
         """Deliver a datagram to its connection, or start a new one."""
         cid = destination_connection_id(data, CONNECTION_ID_LENGTH)
         if cid is None:
@@ -236,7 +238,7 @@ class Server:
                 if isinstance(validated, RetryContext):
                     context = validated
             session = self._accept(cid, context)
-        session.connection.datagram_received(data, time.monotonic(), source=source)
+        session.connection.datagram_received(data, time.monotonic(), source=source, ecn=ecn)
         session.deadline = time.monotonic() + self._idle_timeout
         # §7.2: the client will switch to the CID we chose, so index both.
         self._sessions.setdefault(session.connection.host_cid, session)
