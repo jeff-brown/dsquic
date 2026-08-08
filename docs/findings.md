@@ -7,6 +7,38 @@ is now, and this says what it cost to get there. Kept because the
 failures are the pedagogical payload, and because the methods that
 found them are worth reusing.
 
+## Two 0-RTT defects only the pcap could see (2026-08-07)
+
+The `zerortt` sweep failed in both roles on the first run, each side
+for a reason invisible to every lower rung, because both defects left
+the acceptance flags green and the files delivered.
+
+As client: "Client didn't send any 0-RTT data", 0 bytes early against
+all four peers, though the loopback test and the aioquic interop test
+had both passed. The endpoint's `fetch` issued requests only after its
+first `pump`, and pump blocks until the server answers, so by the time
+the requests were queued the handshake had completed and everything
+legitimately rode 1-RTT. TLS had offered and the server had accepted;
+there was simply nothing early in flight. The tests passed because
+they asserted acceptance flags and body delivery, not wire occupancy.
+The fix queues requests between `connect()` and the first flight.
+
+As server: "Client sent too much data in 1-RTT packets". The keylog
+showed acceptance, the qlog showed 0-RTT stream frames processed, no
+drops. Arithmetic found it: 4404 early bytes is about 17 of the 40
+requests, and 17 is what fits under our advertised
+`initial_max_streams_bidi=16`, which the resuming client obeys as its
+remembered limit (RFC 9001 §7.4.1). The rest of its burst had to wait
+for MAX_STREAMS after the handshake. quic-go and aioquic advertise
+around 100, which is why the client role passed against them with the
+same code. The default is now 100, still far under the 1999-file
+multiplexing case that exercises cumulative stream growth.
+
+The lesson is the same one twice: 0-RTT's correctness criterion is
+*when bytes are on the wire*, and only a capture measures that.
+Acceptance flags, counters, and delivered bodies all survive a 0-RTT
+implementation that never sends anything early.
+
 ## Three servers issued no tickets to a modes-less client (2026-08-07)
 
 The first `resumption` sweep as client passed only against quic-go;

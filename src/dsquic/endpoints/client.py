@@ -94,6 +94,27 @@ def issue_requests(
         connection.send_stream_data(stream_id, hq.encode_request(path), end_stream=True)
 
 
+def _apply_events(connection: Connection, bodies: dict[int, bytearray], finished: set[int]) -> bool:
+    """Apply one batch of connection events; True once the handshake
+    has completed."""
+    connected = False
+    for event in connection.take_events():
+        match event:
+            case ConnectionTerminated():
+                raise RuntimeError(f"connection closed: {event.reason or event.error_code}")
+            case HandshakeCompleted():
+                connected = True
+            case HandshakeConfirmed():
+                # RFC 9001 §4.1.2: not the gate for sending; the frame
+                # it waits on can be lost.
+                pass
+            case StreamDataReceived():
+                bodies.setdefault(event.stream_id, bytearray()).extend(event.data)
+                if event.end_stream:
+                    finished.add(event.stream_id)
+    return connected
+
+
 def fetch(
     host: str,
     port: int,
@@ -155,22 +176,14 @@ def fetch(
 
     try:
         connection.connect(time.monotonic())
+        if connection.streams is not None:
+            # Stream state at connect() means 0-RTT: the requests must
+            # be queued before the first flight leaves, or they ride
+            # 1-RTT after the handshake and save nothing.
+            issue_requests(connection, pending, stream_paths, bodies)
         while time.monotonic() < deadline:
             pump(connection, sock, selector, deadline)
-            for event in connection.take_events():
-                match event:
-                    case ConnectionTerminated():
-                        raise RuntimeError(f"connection closed: {event.reason or event.error_code}")
-                    case HandshakeCompleted():
-                        connected = True
-                    case HandshakeConfirmed():
-                        # RFC 9001 §4.1.2: not the gate for sending; the
-                        # frame it waits on can be lost.
-                        pass
-                    case StreamDataReceived():
-                        bodies.setdefault(event.stream_id, bytearray()).extend(event.data)
-                        if event.end_stream:
-                            finished.add(event.stream_id)
+            connected = _apply_events(connection, bodies, finished) or connected
             if connected or connection.streams is not None:
                 # Stream state before the handshake completes means
                 # 0-RTT: the requests are what the early packets carry.

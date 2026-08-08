@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  417 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  418 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -330,9 +330,17 @@ connection carrying many early requests.
    and counts `connections_early_data`. The shim claims `zerortt`.
    Known conservatism: a token-validated connection still waits for
    the first Handshake packet before lifting the §8.1 limit.
-8. Ladder: RFC 8448 vectors, an aioquic 0-RTT interop test in
-   `tests/interop/` (the harness's ticket store already enables it),
-   loopback, then the runner in both roles.
+8. Done. Unit (RFC 8448 vectors), loopback (`test_loopback_zero_rtt`),
+   aioquic interop (`test_zero_rtt`: aioquic reports our 0-RTT
+   accepted), and the runner: `zerortt` passes in both roles against
+   quic-go, aioquic, picoquic and quiche, `resumption` re-verified
+   after the change below. The runner's pcap check caught two defects
+   every lower rung missed, written up in docs/findings.md: `fetch`
+   queued requests after the first pump, so nothing actually rode
+   0-RTT; and the server's `initial_max_streams_bidi=16` capped a
+   resuming client's early burst at 16 requests, so the default is
+   now 100. What remains is the human wire check: the latest three
+   log directories in the VM hold the passing pcaps and keylogs.
 
 ## Retry (2026-08-06)
 

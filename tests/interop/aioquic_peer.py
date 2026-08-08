@@ -29,15 +29,24 @@ ALPN = ["hq-interop"]
 class HqServerProtocol(QuicConnectionProtocol):
     """Serves files from a document root over hq-interop."""
 
-    def __init__(self, *args: Any, document_root: Path, resumed: list[bool], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        document_root: Path,
+        resumed: list[bool],
+        early_data: list[bool],
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._document_root = document_root
         self._requests: dict[int, bytearray] = {}
         self._resumed = resumed
+        self._early_data = early_data
 
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, HandshakeCompleted):
             self._resumed.append(event.session_resumed)
+            self._early_data.append(event.early_data_accepted)
         if not isinstance(event, StreamDataReceived):
             return
         buffer = self._requests.setdefault(event.stream_id, bytearray())
@@ -69,8 +78,10 @@ class AioquicServer:
         self._ready = threading.Event()
         self._stop: asyncio.Event | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
-        # One entry per completed handshake: whether it resumed a session.
+        # One entry per completed handshake: whether it resumed a
+        # session, and whether it accepted 0-RTT data.
         self.resumed: list[bool] = []
+        self.early_data: list[bool] = []
         # RFC 8446 §4.6.1: aioquic issues session tickets only when given
         # somewhere to keep them, which is how its interop image runs.
         self._tickets: dict[bytes, SessionTicket] = {}
@@ -92,7 +103,11 @@ class AioquicServer:
 
         def create_protocol(*args: Any, **kwargs: Any) -> HqServerProtocol:
             return HqServerProtocol(
-                *args, document_root=self._document_root, resumed=self.resumed, **kwargs
+                *args,
+                document_root=self._document_root,
+                resumed=self.resumed,
+                early_data=self.early_data,
+                **kwargs,
             )
 
         await serve(

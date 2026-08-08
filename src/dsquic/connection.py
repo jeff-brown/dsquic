@@ -293,7 +293,11 @@ class ConnectionConfig:
             initial_max_stream_data_bidi_local=262_144,
             initial_max_stream_data_bidi_remote=262_144,
             initial_max_stream_data_uni=262_144,
-            initial_max_streams_bidi=16,
+            # Wide enough that a 0-RTT client can put its whole request
+            # burst in early packets under remembered limits (RFC 9001
+            # §7.4.1), while still far below the runner's 1999-file
+            # multiplexing case, which exercises §4.6 cumulative growth.
+            initial_max_streams_bidi=100,
             initial_max_streams_uni=16,
         )
     )

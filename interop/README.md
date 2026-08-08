@@ -170,7 +170,10 @@ unsupported because its client does not implement key update.
 `resumption`, claimed after that sweep, passes on its own in both
 roles against all four peers; the runner verifies it from the pcap as
 exactly two handshakes, a Certificate in the first and none in the
-second.
+second. `zerortt` likewise passes in both roles against all four
+peers, verified from the pcap as two handshakes with nonzero client
+0-RTT payload and nearly all request bytes early; two defects it
+caught that no lower rung could are in docs/findings.md.
 
 As **client**, `handshake`, `transfer`, `multiplexing`, `handshakeloss`,
 `handshakecorruption`, `ipv6` and `keyupdate` pass against all four
