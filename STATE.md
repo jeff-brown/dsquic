@@ -588,7 +588,9 @@ Observed divergences worth keeping:
 ## Open decisions
 
 See design.md §7. Still open: whether to add an asyncio transport over
-the sans-IO core, PyPI publication, and the v1 MASQUE surface
-(CONNECT-UDP only vs. CONNECT-IP alongside). 0-RTT was settled in scope
+the sans-IO core, PyPI publication, the v1 MASQUE surface (CONNECT-UDP
+only vs. CONNECT-IP alongside), `preferred_address` (decide inside the
+migration phase), and SNI-selected certificate chains (decide in the
+MASQUE phase). 0-RTT was settled in scope
 on 2026-08-07 with freshness-based anti-replay; everything settled so
 far is recorded in the design.md appendix.

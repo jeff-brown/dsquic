@@ -208,6 +208,8 @@ Each step is a gate: the next phase starts only after the previous phase passes 
 - [ ] PyPI distribution name: publish as `dsquic`, or stay git-install only for the academic phase?
 - [ ] Whether `h3.py` and `qpack.py` ever ship as separate artifacts usable with other QUIC implementations. Only the packaging is open: the dependency discipline that keeps it possible is settled and enforced (see appendix).
 - [ ] MASQUE surface for v1: CONNECT-UDP only, or CONNECT-IP alongside?
+- [ ] `preferred_address` (RFC 9000 §9.6): decide inside the migration phase, after path validation and NEW_CONNECTION_ID issuance land. It is server-initiated migration from the same parts, but no runner case, peer default, or MASQUE requirement demands it; `TransportParameters` does not model the field yet.
+- [ ] Multiple certificate chains, selected by SNI: an endpoints/ServerConfig feature, not handshake work. Becomes real when one server fronts several origins, so decide in the MASQUE phase. HTTP-layer secondary certificate authentication (RFC 9261 exported authenticators) stays out of scope unless CONNECT work demands multi-origin authority proofs.
 
 ---
 
