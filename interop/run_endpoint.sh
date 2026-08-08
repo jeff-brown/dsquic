@@ -24,7 +24,7 @@ set -e
 # and handshakecorruption cases: one connection per file rather than one
 # connection carrying every request.
 #
-SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate retry resumption"
+SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate retry resumption zerortt"
 
 case " $SUPPORTED " in
     *" $TESTCASE "*) ;;
@@ -79,6 +79,11 @@ if [ "$ROLE" == "client" ]; then
     # pays for 50 handshakes under heavy loss instead of one.
     if [ "$TESTCASE" == "multiconnect" ]; then
         MODE="--connection-per-request --timeout 280"
+    elif [ "$TESTCASE" == "zerortt" ]; then
+        # RFC 9001 §4.6: the first file over a full connection, the
+        # remaining 39 over one resumed connection whose requests ride
+        # 0-RTT packets, which the runner counts in the capture.
+        MODE="--zero-rtt --timeout 55"
     elif [ "$TESTCASE" == "resumption" ]; then
         # RFC 8446 §2.2: one connection per file, the second resuming
         # from the first one's session ticket, which the runner checks

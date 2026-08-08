@@ -18,7 +18,7 @@ import pytest
 from conftest import PemCredentials
 from dsquic import hq
 from dsquic.endpoints import load_pem_certificates
-from dsquic.endpoints.client import ClientOptions, fetch, fetch_each
+from dsquic.endpoints.client import ClientOptions, fetch, fetch_each, fetch_zero_rtt
 from dsquic.endpoints.server import Server, ServerOptions, load_credentials
 from dsquic.tls import ServerConfig
 
@@ -275,6 +275,29 @@ def test_loopback_resumption(credentials: PemCredentials, document_root: Path) -
             time.sleep(0.01)
     assert running.connections_served == 2
     assert running.connections_resumed == 1
+
+
+def test_loopback_zero_rtt(credentials: PemCredentials, document_root: Path) -> None:
+    """The runner's zerortt case over real UDP: the second connection
+    resumes and carries its requests as early data, which the server
+    counts as an accepted 0-RTT handshake (RFC 9001 §4.6)."""
+    with running_server(credentials, document_root, connection_limit=2) as (port, running):
+        bodies = fetch_zero_rtt(
+            host="127.0.0.1",
+            port=port,
+            paths=["/index.html", "/large.bin", "/index.html"],
+            options=ClientOptions(
+                ca_certificates=load_pem_certificates(credentials.ca_pem),
+                server_name="localhost",
+            ),
+        )
+        assert bodies == {"/index.html": INDEX_BODY, "/large.bin": LARGE_BODY}
+        deadline = time.monotonic() + 5.0
+        while running.connections_served < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert running.connections_served == 2
+    assert running.connections_resumed == 1
+    assert running.connections_early_data == 1
 
 
 def test_fetch_each_enforces_a_total_deadline(credentials: PemCredentials) -> None:

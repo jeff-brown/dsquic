@@ -36,8 +36,8 @@ recorded in `docs/design.md`.
 
 `handshake`, `transfer`, `multiconnect`, `transferloss`,
 `transfercorruption`, `blackhole`, `longrtt`, `amplificationlimit`,
-`ipv6`, `keyupdate`, `retry`, and `resumption`. Everything else exits
-127.
+`ipv6`, `keyupdate`, `retry`, `resumption`, and `zerortt`. Everything
+else exits 127.
 
 `multiplexing` is not in that list and does not need to be: the runner
 gives both containers the name `transfer` for it, and it is the request
@@ -191,7 +191,6 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 |---|---|
 | `v2` | Only QUIC v1 is offered |
 | `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
-| `zerortt` | No 0-RTT; `resumption` is claimed, 0-RTT data is not |
 | `chacha20` | AES-128-GCM only |
 | `ecn` | No ECN codepoints on send, no ECN validation |
 | `http3` | `h3.py` and `qpack.py` are stubs |

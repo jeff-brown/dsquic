@@ -34,6 +34,7 @@ from dsquic.connection import (
     Connection,
     ConnectionConfig,
     ConnectionState,
+    HandshakeCompleted,
     StreamDataReceived,
 )
 from dsquic.endpoints import (
@@ -55,19 +56,25 @@ from dsquic.packet import (
     version_negotiation_response,
 )
 from dsquic.retry import (
+    NEW_TOKEN,
     TOKEN_KEY_LENGTH,
     RetryContext,
     TokenError,
     build_retry,
+    mint_new_token,
     mint_token,
+    validate_new_token,
     validate_token,
 )
 from dsquic.tls import TICKET_KEY_LENGTH, ServerConfig, SigningKey, TlsServer
 
 TOKEN_LIFETIME = 60.0  # §8.1.4: how long a Retry token proves an address
+# §8.1.3: a NEW_TOKEN token is used on some later connection, so it
+# lives longer than a Retry token, which proves this very attempt.
+NEW_TOKEN_LIFETIME = 3600.0
 
 
-def _address_bytes(source: Address) -> bytes:
+def _address_bytes(source: object) -> bytes:
     """A socket address as the bytes a token binds itself to.
 
     The core never interprets an address, so choosing this encoding is
@@ -83,6 +90,17 @@ def load_credentials(certificate: Path, private_key: Path) -> tuple[list[bytes],
     if not isinstance(key, rsa.RSAPrivateKey | ec.EllipticCurvePrivateKey):
         raise ValueError("private key must be RSA or EC")
     return chain, key
+
+
+def _initial_header(data: bytes) -> LongHeader | None:
+    """The Initial long header at the front of a datagram, or None."""
+    if not data or not data[0] & HEADER_FORM_LONG:
+        return None
+    try:
+        header = parse_long_header(data)
+    except (HeaderParseError, UnsupportedVersion):
+        return None
+    return header if header.packet_type is PacketType.INITIAL else None
 
 
 def resolve(document_root: Path, path: str) -> bytes | None:
@@ -151,13 +169,17 @@ class Server:
         self._document_root = options.document_root
         self._idle_timeout = options.idle_timeout
         self._sessions: dict[bytes, _Session] = {}
-        # §8.1.2: the key that authenticates our own Retry tokens. It is
-        # ours alone and never leaves the process, so it is generated
-        # rather than configured. None means addresses are not validated.
-        self._retry_key = os.urandom(TOKEN_KEY_LENGTH) if options.retry else None
+        # §8.1.4: the key that authenticates our own tokens, Retry and
+        # NEW_TOKEN alike. It is ours alone and never leaves the
+        # process, so it is generated rather than configured.
+        self._token_key = os.urandom(TOKEN_KEY_LENGTH)
+        # §8.1.2: whether a new client's first Initial draws a Retry.
+        self._retry = options.retry
         self.connections_served = 0
-        # Of those, the handshakes that resumed a session via a PSK (§2.2).
+        # Of those, the handshakes that resumed a session via a PSK
+        # (§2.2), and those that accepted 0-RTT data (§4.2.10).
         self.connections_resumed = 0
+        self.connections_early_data = 0
 
     def serve(self, connection_limit: int | None = None) -> None:
         """Serve until ``connection_limit`` connections have finished.
@@ -206,39 +228,48 @@ class Server:
                 return
             if not data[0] & HEADER_FORM_LONG:
                 return  # no state for this CID, and nothing to build it from
-            accepted = None
-            if self._retry_key is not None:
-                accepted = self._validate_address(data, cid, source)
-                if accepted is None:
-                    return  # a Retry went out, or the token was no good
-            session = self._accept(cid, accepted)
+            context: RetryContext | None = None
+            if self._retry:
+                validated = self._validate_address(data, cid, source)
+                if validated is False:
+                    return  # a Retry went out, or the packet was unusable
+                if isinstance(validated, RetryContext):
+                    context = validated
+            session = self._accept(cid, context)
         session.connection.datagram_received(data, time.monotonic(), source=source)
         session.deadline = time.monotonic() + self._idle_timeout
         # §7.2: the client will switch to the CID we chose, so index both.
         self._sessions.setdefault(session.connection.host_cid, session)
 
-    def _validate_address(self, data: bytes, cid: bytes, source: Address) -> RetryContext | None:
+    def _validate_address(self, data: bytes, cid: bytes, source: Address) -> RetryContext | bool:
         """§8.1.2: answer an untokened Initial with a Retry, or check the
         token on one that carries it.
 
-        Returns the context for a validated client, or None when the
-        datagram produced a Retry instead of a connection.
+        Returns the context for a client validated by a Retry token,
+        True for one validated by a NEW_TOKEN token (no Retry happened,
+        so there is no context to echo in transport parameters), and
+        False when a Retry went out instead of a connection.
         """
-        assert self._retry_key is not None
-        if not data or not data[0] & HEADER_FORM_LONG:
-            return None
-        try:
-            header = parse_long_header(data)
-        except (HeaderParseError, UnsupportedVersion):
-            return None
-        if header.packet_type is not PacketType.INITIAL:
-            return None
+        header = _initial_header(data)
+        if header is None:
+            return False
         if not header.token:
             self._send_retry(header, source)
-            return None
+            return False
         try:
+            if header.token.startswith(NEW_TOKEN):
+                # §8.1.3: a stored token validates the address without
+                # the Retry round trip, which is what it is for.
+                validate_new_token(
+                    self._token_key,
+                    header.token,
+                    client_address=_address_bytes(source),
+                    now=time.time(),
+                    lifetime=NEW_TOKEN_LIFETIME,
+                )
+                return True
             original = validate_token(
-                self._retry_key,
+                self._token_key,
                 header.token,
                 client_address=_address_bytes(source),
                 now=time.time(),
@@ -252,16 +283,15 @@ class Server:
             # NEW_TOKEN frame, or one issued before a restart, since the
             # key that authenticates them lives only in this process.
             self._send_retry(header, source)
-            return None
+            return False
         return RetryContext(original_destination_cid=original, source_cid=cid)
 
     def _send_retry(self, header: LongHeader, source: Address) -> None:
         """§8.1.2: send a Retry naming a fresh connection ID, and keep no
         state; the token carries what the retried Initial will need."""
-        assert self._retry_key is not None
         retry_cid = os.urandom(CONNECTION_ID_LENGTH)
         token = mint_token(
-            self._retry_key,
+            self._token_key,
             original_destination_cid=header.destination_cid,
             client_address=_address_bytes(source),
             now=time.time(),
@@ -287,6 +317,18 @@ class Server:
 
     def _serve_requests(self, session: _Session) -> None:
         for event in session.connection.take_events():
+            if isinstance(event, HandshakeCompleted):
+                # §8.1.3: hand the client a token so its next connection
+                # skips address validation. Minted here because only the
+                # endpoint holds the address the token binds.
+                session.connection.send_new_token(
+                    mint_new_token(
+                        self._token_key,
+                        client_address=_address_bytes(session.connection.destination),
+                        now=time.time(),
+                    )
+                )
+                continue
             if not isinstance(event, StreamDataReceived):
                 continue
             session.deadline = time.monotonic() + self._idle_timeout
@@ -323,6 +365,8 @@ class Server:
             tls = session.connection.tls
             if isinstance(tls, TlsServer) and tls.resumed:
                 self.connections_resumed += 1
+            if isinstance(tls, TlsServer) and tls.early_data_accepted:
+                self.connections_early_data += 1
 
 
 def serve_one(

@@ -52,6 +52,24 @@ class ClientOptions:
     # connections of fetch_each, each resuming from the newest ticket
     # the ones before it produced.
     resume: bool = False
+    # RFC 9001 §4.6: send the requests as 0-RTT early data when the
+    # offered ticket permits it.
+    early_data: bool = False
+
+
+@dataclass
+class SessionStore:
+    """What one server hands a client to speed up later connections.
+
+    Session tickets (RFC 8446 §4.6.1) resume the TLS session; address
+    validation tokens (RFC 9000 §8.1.3) spare the next connection a
+    Retry round trip. ``fetch`` offers the newest of each and appends
+    what it receives; a token is spent when offered, since clients
+    should not reuse one (§8.1.3).
+    """
+
+    tickets: list[SessionTicket] = field(default_factory=list[SessionTicket])
+    tokens: list[bytes] = field(default_factory=list[bytes])
 
 
 def issue_requests(
@@ -81,7 +99,7 @@ def fetch(
     port: int,
     paths: list[str],
     options: ClientOptions | None = None,
-    session_tickets: list[SessionTicket] | None = None,
+    session: SessionStore | None = None,
 ) -> dict[str, bytes]:
     """Fetch paths over one connection; returns path to body bytes.
 
@@ -89,9 +107,12 @@ def fetch(
     issued as stream credit allows: the peer's initial limit may be
     smaller than the number of paths, and rises as streams close (§4.6).
 
-    ``session_tickets`` is the caller's ticket store (RFC 8446 §4.6.1):
-    the newest entry is offered for resumption, and tickets received on
-    this connection are appended. None disables both.
+    ``session`` is the caller's per-server store: the newest ticket is
+    offered for resumption, a stored token rides the Initial packets,
+    and whatever this connection receives is appended. None disables
+    all of it. With ``options.early_data`` the requests are issued
+    before the handshake completes, riding 0-RTT packets when the
+    ticket permits (RFC 9001 §4.6).
     """
     options = options if options is not None else ClientOptions()
     server_name = options.server_name
@@ -113,12 +134,14 @@ def fetch(
             ca_certificates=[] if options.insecure else options.ca_certificates,
             insecure_skip_verify=options.insecure,
             verification_time=datetime.datetime.now(datetime.UTC),
-            session_ticket=session_tickets[-1] if session_tickets else None,
+            session_ticket=session.tickets[-1] if session is not None and session.tickets else None,
+            early_data=options.early_data,
         ),
         config=ConnectionConfig(
             keylog=keylog_writer(),
             qlog=qlog_trace,
             key_update_interval=options.key_update_interval,
+            token=session.tokens.pop() if session is not None and session.tokens else b"",
         ),
         destination=address,
     )
@@ -148,15 +171,18 @@ def fetch(
                         bodies.setdefault(event.stream_id, bytearray()).extend(event.data)
                         if event.end_stream:
                             finished.add(event.stream_id)
-            if connected:
+            if connected or connection.streams is not None:
+                # Stream state before the handshake completes means
+                # 0-RTT: the requests are what the early packets carry.
                 issue_requests(connection, pending, stream_paths, bodies)
             if connected and not pending and len(finished) == len(paths):
                 break
         else:
             raise TimeoutError(f"no response within {timeout}s")
 
-        if session_tickets is not None and isinstance(connection.tls, TlsClient):
-            session_tickets.extend(connection.tls.session_tickets)
+        if session is not None and isinstance(connection.tls, TlsClient):
+            session.tickets.extend(connection.tls.session_tickets)
+            session.tokens.extend(connection.new_tokens)
         connection.close()
         pump(connection, sock, selector, time.monotonic())
         return {stream_paths[stream_id]: bytes(body) for stream_id, body in bodies.items()}
@@ -185,7 +211,7 @@ def fetch_each(
     """
     options = options if options is not None else ClientOptions()
     deadline = time.monotonic() + options.timeout
-    session_tickets: list[SessionTicket] | None = [] if options.resume else None
+    session = SessionStore() if options.resume else None
     bodies: dict[str, bytes] = {}
     for path in paths:
         remaining = deadline - time.monotonic()
@@ -193,9 +219,32 @@ def fetch_each(
             raise TimeoutError(
                 f"fetched {len(bodies)} of {len(paths)} paths within {options.timeout}s"
             )
-        bodies.update(
-            fetch(host, port, [path], replace(options, timeout=remaining), session_tickets)
-        )
+        bodies.update(fetch(host, port, [path], replace(options, timeout=remaining), session))
+    return bodies
+
+
+def fetch_zero_rtt(
+    host: str,
+    port: int,
+    paths: list[str],
+    options: ClientOptions | None = None,
+) -> dict[str, bytes]:
+    """The runner's zerortt case: the first path over a full
+    connection, every remaining path over one resumed connection whose
+    requests ride 0-RTT (RFC 9001 §4.6). ``options.timeout`` bounds the
+    whole run, like fetch_each.
+    """
+    options = options if options is not None else ClientOptions()
+    deadline = time.monotonic() + options.timeout
+    session = SessionStore()
+    bodies = fetch(host, port, paths[:1], options, session)
+    if not session.tickets:
+        raise RuntimeError("the first connection produced no session ticket")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        raise TimeoutError(f"only the first of {len(paths)} paths within {options.timeout}s")
+    early = replace(options, early_data=True, timeout=remaining)
+    bodies.update(fetch(host, port, paths[1:], early, session))
     return bodies
 
 
@@ -226,15 +275,28 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="resume each connection from the previous one's session ticket (RFC 8446 §2.2)",
     )
+    parser.add_argument(
+        "--zero-rtt",
+        action="store_true",
+        help="first path on a full connection, the rest as 0-RTT early data (RFC 9001 §4.6)",
+    )
     args = parser.parse_args(argv)
 
     if not args.insecure and args.ca is None:
         parser.error("--ca is required unless --insecure is given")
     if args.resume and not args.connection_per_request:
         parser.error("--resume requires --connection-per-request")
+    if args.zero_rtt and args.connection_per_request:
+        parser.error("--zero-rtt and --connection-per-request are different splits")
     ca_certificates = load_pem_certificates(args.ca) if args.ca is not None else []
 
-    bodies = (fetch_each if args.connection_per_request else fetch)(
+    if args.zero_rtt:
+        run = fetch_zero_rtt
+    elif args.connection_per_request:
+        run = fetch_each
+    else:
+        run = fetch
+    bodies = run(
         host=args.host,
         port=args.port,
         paths=args.paths,

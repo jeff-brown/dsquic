@@ -12,8 +12,7 @@ from bodies import INDEX_BODY, LARGE_BODY
 from credentials import PemCredentials
 
 from dsquic.endpoints import load_pem_certificates
-from dsquic.endpoints.client import ClientOptions, fetch
-from dsquic.tls import SessionTicket
+from dsquic.endpoints.client import ClientOptions, SessionStore, fetch
 
 
 class TestDsquicClientToAioquicServer:
@@ -69,7 +68,7 @@ class TestDsquicClientToAioquicServer:
             ca_certificates=load_pem_certificates(credentials.ca_pem),
             server_name="localhost",
         )
-        tickets: list[SessionTicket] = []
+        session = SessionStore()
         with AioquicServer(
             "127.0.0.1",
             free_port,
@@ -77,9 +76,9 @@ class TestDsquicClientToAioquicServer:
             credentials.private_key_pem,
             document_root,
         ) as server:
-            first = fetch("127.0.0.1", free_port, ["/index.html"], options, tickets)
-            assert tickets, "no ticket arrived on the first connection"
-            second = fetch("127.0.0.1", free_port, ["/large.bin"], options, tickets)
+            first = fetch("127.0.0.1", free_port, ["/index.html"], options, session)
+            assert session.tickets, "no ticket arrived on the first connection"
+            second = fetch("127.0.0.1", free_port, ["/large.bin"], options, session)
             assert first == {"/index.html": INDEX_BODY}
             assert second == {"/large.bin": LARGE_BODY}
             assert server.resumed == [False, True]

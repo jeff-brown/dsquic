@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  416 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  417 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -316,8 +316,20 @@ connection carrying many early requests.
    HandshakeCompleted, validation in `Server._validate_address`
    (accept either kind as validating; per-process token key decoupled
    from `--retry`), and the client-side store belong to step 7.
-7. Endpoints and shim: an early-data mode on `fetch`, and the zerortt
-   split (first URL full, rest resumed) in `run_endpoint.sh`.
+7. Done: `SessionStore` in endpoints/client.py holds tickets and
+   tokens per server; `fetch` offers the newest ticket, spends a
+   stored token into `ConnectionConfig.token`, harvests both, and
+   with `ClientOptions.early_data` issues requests as soon as stream
+   state exists, which before completion means 0-RTT. `fetch_zero_rtt`
+   (CLI `--zero-rtt`) does the runner split: first path full, the rest
+   on one resumed early-data connection. The server endpoint always
+   holds a token key now (Retry stays opt-in via `--retry`), mints a
+   NEW_TOKEN on every HandshakeCompleted, accepts either token kind in
+   `_validate_address` (a NEW_TOKEN one validates without a
+   RetryContext, since no Retry happened and §7.3 must not echo one),
+   and counts `connections_early_data`. The shim claims `zerortt`.
+   Known conservatism: a token-validated connection still waits for
+   the first Handshake packet before lifting the §8.1 limit.
 8. Ladder: RFC 8448 vectors, an aioquic 0-RTT interop test in
    `tests/interop/` (the harness's ticket store already enables it),
    loopback, then the runner in both roles.
