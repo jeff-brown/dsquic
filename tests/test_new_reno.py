@@ -111,3 +111,14 @@ def test_pacing_rate_spreads_the_window_over_the_rtt() -> None:
 
 def test_no_pacing_rate_without_an_rtt() -> None:
     assert NewReno(MDS).pacing_rate(0.0) is None
+
+
+def test_ecn_ce_reduces_the_window_once_per_period() -> None:
+    """RFC 9002 §7.1: a CE increase halves the window like loss, and
+    B.6 limits the reduction to once per recovery period."""
+    reno = NewReno(MDS)
+    before = reno.congestion_window
+    reno.on_ecn_ce(sent_time=1.0, now=2.0)
+    assert reno.congestion_window == before // 2
+    reno.on_ecn_ce(sent_time=1.5, now=2.1)  # sent inside the period
+    assert reno.congestion_window == before // 2

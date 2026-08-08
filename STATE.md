@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  419 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  421 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -362,14 +362,16 @@ validation, and the sockets.
    codepoint), `_build_ack` echoes nonzero counts through `Ack.ecn`,
    and qlog flattens the counts onto ack frame details (events §8.5),
    which is what the test observes.
-2. Core send: mark every `OutgoingDatagram` ECT(0) while ECN is
-   considered working; per-space bookkeeping of ECT(0)-marked sent
-   packets. Validation per §13.4.2 on each ACK: stop marking for the
-   connection when an ACK newly acknowledging a marked packet carries
-   no ECN counts, when counts regress, or when ect0 plus ce falls
-   short of the newly acked marked packets. A CE count increase is a
-   congestion event (RFC 9002 §7.1): cwnd reduction without loss or
-   retransmission.
+2. Done: every `OutgoingDatagram` carries ECT(0) until validation
+   fails (`_ecn_enabled`, per connection). `_validate_ecn` on each
+   ACK: marking stops when a new acknowledgement carries no counts,
+   when reported counts regress, or when ECT(1) appears, which
+   nothing here sends; a CE increase calls the controller's new
+   `on_ecn_ce` (RFC 9002 §7.1, once per recovery period per B.6).
+   Deliberately not implemented: the ect0-plus-ce-versus-newly-acked
+   comparison, which needs per-packet mark bookkeeping and defends
+   against a peer inflating counts, not against bleaching; noted here
+   so the omission is a decision rather than an accident.
 3. Endpoints: enable IP_RECVTOS / IPV6_RECVTCLASS and read the
    codepoint out of recvmsg ancillary data into `datagram_received`;
    honor `OutgoingDatagram.ecn` on send via IP_TOS / IPV6_TCLASS,

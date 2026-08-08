@@ -1062,3 +1062,25 @@ def test_ecn_counts_are_echoed_in_acks(credentials: Credentials) -> None:
     assert any(frame.get("ect0", 0) > 0 for frame in acks)
     # The unmarked direction stays a plain ACK: no counts to report.
     assert client.state is ConnectionState.CONNECTED
+
+
+def test_datagrams_are_marked_ect0_until_validation_fails(credentials: Credentials) -> None:
+    """RFC 9000 §13.4.2: every datagram carries ECT(0) from the first
+    flight; a peer whose ACKs never report counts proves the marks are
+    not surviving, and marking stops."""
+    client, server = make_pair(credentials)
+    client.connect(0.0)
+    flight = client.datagrams_to_send(0.0)
+    assert flight
+    assert all(datagram.ecn == ECT_0 for datagram in flight)
+
+    # Deliver everything with ecn=0: a mark-bleaching path.
+    for datagram in flight:
+        server.datagram_received(datagram.data, 0.0, source="client")
+    pump(client, server)
+    assert client.state is ConnectionState.CONNECTED
+    stream = client.open_stream()
+    client.send_stream_data(stream, b"GET /after\r\n", end_stream=True)
+    later = client.datagrams_to_send(1.0)
+    assert later
+    assert all(datagram.ecn == 0 for datagram in later)

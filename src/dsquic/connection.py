@@ -249,6 +249,11 @@ class _Space:
     ecn_ect0: int = 0
     ecn_ect1: int = 0
     ecn_ce: int = 0
+    # §13.4.2: the largest counts the peer has reported back, which
+    # may only ever grow.
+    ecn_acked_ect0: int = 0
+    ecn_acked_ect1: int = 0
+    ecn_acked_ce: int = 0
     received: RangeSet = field(default_factory=RangeSet)
     ack_eliciting_pending: bool = False
     crypto_offset_sent: int = 0
@@ -363,6 +368,9 @@ class Connection:
         # Retry's source CID, and, for a server that sent a Retry, the
         # original destination CID recovered from the token (§8.1.2).
         # Set before the parameters are built, which reads them.
+        # §13.4.2: ECT(0) goes on every datagram until validation
+        # fails, at which point marking stops for the connection.
+        self._ecn_enabled = True
         self._retry_token = b""
         # §8.1.3: tokens the peer sent in NEW_TOKEN frames, for the
         # caller to keep for later connections, like session tickets.
@@ -958,6 +966,7 @@ class Connection:
             outcome = self.recovery.on_ack_received(level, frame, ack_delay, now)
         except AckOfUnsentPacket as exc:
             raise ConnectionError_(frames.PROTOCOL_VIOLATION, str(exc)) from exc
+        self._validate_ecn(level, frame, outcome.acked, now)
         for packet in outcome.acked:
             for acked_frame in packet.frames:
                 if isinstance(acked_frame, Stream) and self.streams is not None:
@@ -979,6 +988,41 @@ class Connection:
             # §4.9.1: the client discards Initial keys once it sends a
             # Handshake packet; acknowledgment proves it did.
             self._discard_space(EncryptionLevel.INITIAL, now)
+
+    def _validate_ecn(
+        self, level: EncryptionLevel, frame: Ack, acked: list[SentPacket], now: float
+    ) -> None:
+        """§13.4.2: believe the path carries ECN only while the peer's
+        counts prove it.
+
+        Every datagram is marked ECT(0) from the start, so an ACK that
+        newly acknowledges packets while carrying no counts means the
+        marks were bleached and marking stops. Counts may never
+        regress, and ECT(1) can never appear, since nothing here sends
+        it. A CE increase is the network asking for the same response
+        as loss (RFC 9002 §7.1).
+        """
+        if not acked:
+            return
+        space = self._spaces[level]
+        if frame.ecn is None:
+            if self._ecn_enabled:
+                self._ecn_enabled = False
+            return
+        counts = frame.ecn
+        if (
+            counts.ect0 < space.ecn_acked_ect0
+            or counts.ect1 < space.ecn_acked_ect1
+            or counts.ce < space.ecn_acked_ce
+            or counts.ect1 > 0
+        ):
+            self._ecn_enabled = False
+            return
+        if counts.ce > space.ecn_acked_ce:
+            self.recovery.controller.on_ecn_ce(max(packet.time_sent for packet in acked), now)
+        space.ecn_acked_ect0 = counts.ect0
+        space.ecn_acked_ect1 = counts.ect1
+        space.ecn_acked_ce = counts.ce
 
     def _requeue_lost(self, packet: SentPacket) -> None:
         """§13.3: resend the frames of a lost packet, not the packet."""
@@ -1411,7 +1455,12 @@ class Connection:
         if not payload:
             return None
         self._bytes_sent += len(payload)
-        return OutgoingDatagram(data=bytes(payload), destination=self.destination)
+        return OutgoingDatagram(
+            data=bytes(payload),
+            destination=self.destination,
+            # §13.4.2: ECT(0) while ECN validation has not failed.
+            ecn=ECT_0 if self._ecn_enabled else 0,
+        )
 
     def _pending_frames(
         self, level: EncryptionLevel, room: int, ack_only: bool = False

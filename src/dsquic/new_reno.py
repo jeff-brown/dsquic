@@ -79,6 +79,18 @@ class NewReno:
         self._congestion_window = max(reduced, minimum)
         self._slow_start_threshold = self._congestion_window
 
+    def on_ecn_ce(self, sent_time: float, now: float) -> None:
+        """RFC 9002 §7.1: an increased ECN-CE count is a congestion
+        signal: the window comes down as for loss, but nothing is
+        retransmitted, and B.6 still limits it to once per period."""
+        if self._in_recovery(sent_time):
+            return
+        self._recovery_start_time = now
+        reduced = int(self._congestion_window * LOSS_REDUCTION_FACTOR)
+        minimum = MINIMUM_WINDOW_DATAGRAMS * self._max_datagram_size
+        self._congestion_window = max(reduced, minimum)
+        self._slow_start_threshold = self._congestion_window
+
     def on_packets_discarded(self, packets: list[SentPacket]) -> None:
         """§6.4: keys discarded; bytes leave flight with no congestion signal."""
         for packet in packets:
