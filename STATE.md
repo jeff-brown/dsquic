@@ -17,7 +17,7 @@ against quic-go, aioquic, picoquic and quiche.
 
 - Tooling: uv, hatchling build, ruff (E/F/I/UP/B/PL/RUF), strict mypy,
   strict pyright (the Pylance engine; `pyrightconfig.json`), pytest.
-  422 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
+  427 tests pass. Gates: `uv run pytest -q`, `uv run ruff check`,
   `uv run ruff format --check .`, `uv run mypy`, `uv run pyright`.
 - Implemented in `src/dsquic/`: buffer, packet, frames, streams,
   connection, transport_parameters, tls, protection, recovery,
@@ -342,6 +342,27 @@ connection carrying many early requests.
    now 100. What remains is the human wire check: the latest three
    log directories in the VM hold the passing pcaps and keylogs.
 
+## ChaCha20 (2026-08-08)
+
+`chacha20` passes in both roles against quic-go, aioquic and picoquic,
+`✓(C20)` each way. The quiche server pairing fails only in this VM:
+its BoringSSL ChaCha20 misbehaves under qemu emulation (the
+investigation and the diagnostic order worth reusing are in
+docs/findings.md), and quiche's client does not attempt the case,
+matching the public matrix.
+
+How it is built: TLS_CHACHA20_POLY1305_SHA256 negotiation in tls.py
+(both suites hash SHA-256, so one KeySchedule serves and tickets
+resume across suites), suite-carrying `PacketKeys` in protection.py
+with ChaCha20-Poly1305 AEAD and the §5.4.4 header protection mask
+(sample as little-endian counter plus nonce), pinned to the RFC 9001
+A.5 vectors including the key update secret. Initials stay AES
+(§5.2). Tickets seal their suite, and early data is offered and
+accepted only under it (§4.2.10). `ClientConfig.cipher_suites` is the
+offer in preference order; the server takes the client's first suite
+it speaks. `--chacha20` restricts the reference client, which is what
+the shim passes for the case.
+
 ## ECN (2026-08-08)
 
 **Acceptance criterion**, read from the runner's `TestCaseECN`: a
@@ -494,11 +515,11 @@ server halves in `connection.py` and `endpoints/server.py`,
 ## Next steps
 
 1. **Finish the QUIC protocol work before starting HTTP/3.** Remaining
-   runner cases: `chacha20`, `connectionmigration`, and
-   `versionnegotiation`, where dsquic sends VN but a client does not
-   react to receiving one by retrying with a supported version. With
-   `resumption`, `zerortt` and `ecn` done, those three are what stand
-   between here and HTTP/3.
+   runner cases: `connectionmigration`, and `versionnegotiation`,
+   where dsquic sends VN but a client does not react to receiving one
+   by retrying with a supported version. With `resumption`, `zerortt`,
+   `ecn` and `chacha20` done, those two are what stand between here
+   and HTTP/3.
 2. **HTTP/3 after that** (design.md §6.1). The largest piece and the one
    that unblocks MASQUE, since `h3.py` is a stub and carries the last
    open MASQUE readiness constraint. `h3.py` is written against a

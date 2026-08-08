@@ -31,6 +31,7 @@ from dsquic.tls import (
     RSA_PSS_RSAE_SHA256,
     TLS_1_3,
     TLS_AES_128_GCM_SHA256,
+    TLS_CHACHA20_POLY1305_SHA256,
     UNEXPECTED_MESSAGE,
     UNSUPPORTED_EXTENSION,
     X25519_GROUP,
@@ -775,6 +776,7 @@ class TestSessionTickets:
         alpn="hq-interop",
         transport_parameters=SERVER_PARAMETERS,
         issued_at=1000,
+        cipher_suite=TLS_AES_128_GCM_SHA256,
     )
 
     def test_a_ticket_returns_the_state_it_sealed(self) -> None:
@@ -1351,3 +1353,25 @@ def test_unsolicited_early_data_acceptance_aborts(credentials: Credentials) -> N
     with pytest.raises(TlsAlert, match="offered") as excinfo:
         client.receive(EncryptionLevel.HANDSHAKE, encode_encrypted_extensions(forged), 0.0)
     assert excinfo.value.alert == UNSUPPORTED_EXTENSION
+
+
+def test_chacha20_negotiates_and_completes(credentials: Credentials) -> None:
+    """A client offering only ChaCha20-Poly1305 (the runner's chacha20
+    case) negotiates it, and both machines record the suite that
+    packet protection must now use (RFC 9001 §5.4.4)."""
+    client = TlsClient(
+        ClientConfig(
+            server_name="localhost",
+            alpn=["hq-interop"],
+            transport_parameters=CLIENT_PARAMETERS,
+            ca_certificates=credentials.ca,
+            verification_time=VERIFICATION_TIME,
+            cipher_suites=[TLS_CHACHA20_POLY1305_SHA256],
+        )
+    )
+    server = make_server(credentials)
+    pump(client, server)
+    assert client.state is ClientState.CONNECTED
+    assert server.state is ServerState.CONNECTED
+    assert client.cipher_suite == TLS_CHACHA20_POLY1305_SHA256
+    assert server.cipher_suite == TLS_CHACHA20_POLY1305_SHA256

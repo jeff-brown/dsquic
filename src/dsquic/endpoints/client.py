@@ -34,7 +34,13 @@ from dsquic.connection import (
 )
 from dsquic.endpoints import enable_ecn, keylog_writer, load_pem_certificates, pump, qlog_trace
 from dsquic.streams import StreamLimitReached
-from dsquic.tls import ClientConfig, SessionTicket, TlsClient
+from dsquic.tls import (
+    SUPPORTED_CIPHER_SUITES,
+    TLS_CHACHA20_POLY1305_SHA256,
+    ClientConfig,
+    SessionTicket,
+    TlsClient,
+)
 
 DEFAULT_TIMEOUT = 30.0  # a whole fetch, not a single response
 
@@ -55,6 +61,8 @@ class ClientOptions:
     # RFC 9001 §4.6: send the requests as 0-RTT early data when the
     # offered ticket permits it.
     early_data: bool = False
+    # Offer only ChaCha20-Poly1305, which is the runner's chacha20 case.
+    chacha20: bool = False
 
 
 @dataclass
@@ -158,6 +166,9 @@ def fetch(
             verification_time=datetime.datetime.now(datetime.UTC),
             session_ticket=session.tickets[-1] if session is not None and session.tickets else None,
             early_data=options.early_data,
+            cipher_suites=(
+                [TLS_CHACHA20_POLY1305_SHA256] if options.chacha20 else SUPPORTED_CIPHER_SUITES
+            ),
         ),
         config=ConnectionConfig(
             keylog=keylog_writer(),
@@ -290,6 +301,11 @@ def main(argv: list[str] | None = None) -> int:
         help="resume each connection from the previous one's session ticket (RFC 8446 §2.2)",
     )
     parser.add_argument(
+        "--chacha20",
+        action="store_true",
+        help="offer only ChaCha20-Poly1305 (RFC 9001 §5.4.4)",
+    )
+    parser.add_argument(
         "--zero-rtt",
         action="store_true",
         help="first path on a full connection, the rest as 0-RTT early data (RFC 9001 §4.6)",
@@ -321,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             key_update_interval=args.key_update_interval,
             resume=args.resume,
+            chacha20=args.chacha20,
         ),
     )
     for path, body in bodies.items():

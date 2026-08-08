@@ -24,7 +24,7 @@ set -e
 # and handshakecorruption cases: one connection per file rather than one
 # connection carrying every request.
 #
-SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate retry resumption zerortt ecn"
+SUPPORTED="handshake transfer multiconnect transferloss transfercorruption blackhole longrtt amplificationlimit ipv6 keyupdate retry resumption zerortt ecn chacha20"
 
 case " $SUPPORTED " in
     *" $TESTCASE "*) ;;
@@ -79,6 +79,10 @@ if [ "$ROLE" == "client" ]; then
     # pays for 50 handshakes under heavy loss instead of one.
     if [ "$TESTCASE" == "multiconnect" ]; then
         MODE="--connection-per-request --timeout 280"
+    elif [ "$TESTCASE" == "chacha20" ]; then
+        # RFC 9001 §5.4.4: the runner checks from the capture that the
+        # handshake used TLS_CHACHA20_POLY1305_SHA256.
+        MODE="--chacha20 --timeout 55"
     elif [ "$TESTCASE" == "zerortt" ]; then
         # RFC 9001 §4.6: the first file over a full connection, the
         # remaining 39 over one resumed connection whose requests ride

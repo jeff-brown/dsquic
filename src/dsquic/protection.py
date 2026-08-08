@@ -21,10 +21,16 @@ also what Initial packets always use (§5.2).
 from dataclasses import dataclass, replace
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
 from dsquic.packet import HEADER_FORM_LONG, decode_packet_number
-from dsquic.tls import SHA256_LENGTH, hkdf_expand_label, hkdf_extract
+from dsquic.tls import (
+    SHA256_LENGTH,
+    TLS_AES_128_GCM_SHA256,
+    TLS_CHACHA20_POLY1305_SHA256,
+    hkdf_expand_label,
+    hkdf_extract,
+)
 
 INITIAL_SALT_V1 = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")  # §5.2
 
@@ -45,11 +51,17 @@ KEY_PHASE_BIT = 0x04  # §17.3.1, short headers only
 
 @dataclass(frozen=True)
 class PacketKeys:
-    """AEAD key and IV plus the header protection key for one direction."""
+    """AEAD key and IV plus the header protection key for one direction.
+
+    ``cipher_suite`` selects the AEAD and the header protection cipher;
+    Initial keys are always AES (§5.2), whatever the handshake later
+    negotiates.
+    """
 
     key: bytes
     iv: bytes
     hp: bytes
+    cipher_suite: int = TLS_AES_128_GCM_SHA256
 
 
 @dataclass(frozen=True)
@@ -74,13 +86,25 @@ def derive_initial_secrets(client_dcid: bytes) -> InitialSecrets:
     )
 
 
-def derive_packet_keys(secret: bytes) -> PacketKeys:
-    """Derive the packet protection keys from a traffic secret (§5.1)."""
+def derive_packet_keys(secret: bytes, cipher_suite: int = TLS_AES_128_GCM_SHA256) -> PacketKeys:
+    """Derive the packet protection keys from a traffic secret (§5.1).
+
+    The labels are fixed; only the key sizes follow the suite, 16-byte
+    AES-128 or 32-byte ChaCha20 (§5.4.4).
+    """
+    key_length = 32 if cipher_suite == TLS_CHACHA20_POLY1305_SHA256 else 16
     return PacketKeys(
-        key=hkdf_expand_label(secret, b"quic key", b"", 16),
+        key=hkdf_expand_label(secret, b"quic key", b"", key_length),
         iv=hkdf_expand_label(secret, b"quic iv", b"", 12),
-        hp=hkdf_expand_label(secret, b"quic hp", b"", 16),
+        hp=hkdf_expand_label(secret, b"quic hp", b"", key_length),
+        cipher_suite=cipher_suite,
     )
+
+
+def _aead(keys: PacketKeys) -> AESGCM | ChaCha20Poly1305:
+    if keys.cipher_suite == TLS_CHACHA20_POLY1305_SHA256:
+        return ChaCha20Poly1305(keys.key)
+    return AESGCM(keys.key)
 
 
 def next_generation(secret: bytes, keys: PacketKeys) -> tuple[bytes, PacketKeys]:
@@ -91,12 +115,20 @@ def next_generation(secret: bytes, keys: PacketKeys) -> tuple[bytes, PacketKeys]
     update, so it carries forward from ``keys`` unchanged (§6).
     """
     updated = hkdf_expand_label(secret, b"quic ku", b"", SHA256_LENGTH)
-    return updated, replace(derive_packet_keys(updated), hp=keys.hp)
+    return updated, replace(derive_packet_keys(updated, keys.cipher_suite), hp=keys.hp)
 
 
-def header_protection_mask(hp_key: bytes, sample: bytes) -> bytes:
-    """Compute the 5-byte header protection mask (§5.4.3, AES-based)."""
-    encryptor = Cipher(algorithms.AES(hp_key), modes.ECB()).encryptor()
+def header_protection_mask(keys: PacketKeys, sample: bytes) -> bytes:
+    """Compute the 5-byte header protection mask.
+
+    AES encrypts the sample (§5.4.3); ChaCha20 reads the sample as a
+    little-endian block counter and a nonce, and the mask is its
+    keystream over five zero bytes (§5.4.4).
+    """
+    if keys.cipher_suite == TLS_CHACHA20_POLY1305_SHA256:
+        cipher = Cipher(algorithms.ChaCha20(keys.hp, sample), mode=None)
+        return cipher.encryptor().update(bytes(5))
+    encryptor = Cipher(algorithms.AES(keys.hp), modes.ECB()).encryptor()
     return (encryptor.update(sample) + encryptor.finalize())[:5]
 
 
@@ -113,11 +145,11 @@ def protect(keys: PacketKeys, header: bytes, payload: bytes, packet_number: int)
     ``packet_number`` feeds the nonce. Returns the complete wire packet.
     """
     pn_length = (header[0] & PN_LENGTH_BITS) + 1
-    ciphertext = AESGCM(keys.key).encrypt(_nonce(keys.iv, packet_number), payload, header)
+    ciphertext = _aead(keys).encrypt(_nonce(keys.iv, packet_number), payload, header)
     # §5.4.2: sample as though the packet number were 4 bytes long.
     sample_offset = MAX_PN_LENGTH - pn_length
     sample = ciphertext[sample_offset : sample_offset + SAMPLE_LENGTH]
-    mask = header_protection_mask(keys.hp, sample)
+    mask = header_protection_mask(keys, sample)
     protected = bytearray(header + ciphertext)
     first_byte_bits = LONG_PROTECTED_BITS if header[0] & HEADER_FORM_LONG else SHORT_PROTECTED_BITS
     protected[0] ^= mask[0] & first_byte_bits
@@ -143,7 +175,7 @@ class UnprotectedHeader:
 
 
 def remove_header_protection(
-    hp_key: bytes, packet: bytes, pn_offset: int, largest_pn: int
+    keys: PacketKeys, packet: bytes, pn_offset: int, largest_pn: int
 ) -> UnprotectedHeader:
     """Remove header protection and recover the packet number (§5.4.1).
 
@@ -158,7 +190,7 @@ def remove_header_protection(
     sample = packet[sample_start : sample_start + SAMPLE_LENGTH]
     if len(sample) < SAMPLE_LENGTH:
         raise ValueError("packet too short to sample for header protection")
-    mask = header_protection_mask(hp_key, sample)
+    mask = header_protection_mask(keys, sample)
     first_byte_bits = LONG_PROTECTED_BITS if packet[0] & HEADER_FORM_LONG else SHORT_PROTECTED_BITS
     first = packet[0] ^ (mask[0] & first_byte_bits)
     pn_length = (first & PN_LENGTH_BITS) + 1
@@ -178,7 +210,7 @@ def decrypt_payload(keys: PacketKeys, unprotected: UnprotectedHeader) -> bytes:
 
     Raises cryptography's InvalidTag if authentication fails.
     """
-    return AESGCM(keys.key).decrypt(
+    return _aead(keys).decrypt(
         _nonce(keys.iv, unprotected.packet_number), unprotected.ciphertext, unprotected.header
     )
 
@@ -191,7 +223,7 @@ def unprotect(
     For levels whose keys never rotate, where one key set answers both
     steps. Returns the full packet number and decrypted payload.
     """
-    unprotected = remove_header_protection(keys.hp, packet, pn_offset, largest_pn)
+    unprotected = remove_header_protection(keys, packet, pn_offset, largest_pn)
     return unprotected.packet_number, decrypt_payload(keys, unprotected)
 
 

@@ -73,6 +73,10 @@ from dsquic.buffer import Buffer
 from dsquic.transport_parameters import decode_transport_parameters, reduces_zero_rtt_limits
 
 TLS_AES_128_GCM_SHA256 = 0x1301
+TLS_CHACHA20_POLY1305_SHA256 = 0x1303
+# Both suites hash with SHA-256, which is what keeps one KeySchedule
+# sufficient and lets a ticket from either suite resume (§4.6.1).
+SUPPORTED_CIPHER_SUITES = [TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256]
 TLS_LEGACY_VERSION = 0x0303  # frozen at "TLS 1.2" (RFC 8446 §4.1.2)
 TLS_1_3 = 0x0304
 X25519_GROUP = 0x001D
@@ -275,6 +279,7 @@ class SessionTicket:
     max_early_data_size: int
     alpn: str
     transport_parameters: bytes
+    cipher_suite: int
 
 
 @dataclass(frozen=True)
@@ -295,6 +300,7 @@ class TicketState:
     alpn: str
     transport_parameters: bytes
     issued_at: int
+    cipher_suite: int
 
 
 def seal_ticket(key: bytes, state: TicketState) -> bytes:
@@ -302,6 +308,7 @@ def seal_ticket(key: bytes, state: TicketState) -> bytes:
     plaintext = (
         state.issued_at.to_bytes(8, "big")
         + state.age_add.to_bytes(4, "big")
+        + state.cipher_suite.to_bytes(2, "big")
         + _vec(1, state.alpn.encode("ascii"))
         + _vec(2, state.transport_parameters)
         + state.psk
@@ -322,6 +329,7 @@ def open_ticket(key: bytes, ticket: bytes, now: float, lifetime: float) -> Ticke
     if now - issued > lifetime:
         raise TicketError("ticket has expired")
     age_add = buf.pull_uint32()
+    cipher_suite = buf.pull_uint16()
     alpn = buf.pull_bytes(buf.pull_uint8()).decode("ascii")
     transport_parameters = buf.pull_bytes(buf.pull_uint16())
     return TicketState(
@@ -330,6 +338,7 @@ def open_ticket(key: bytes, ticket: bytes, now: float, lifetime: float) -> Ticke
         alpn=alpn,
         transport_parameters=transport_parameters,
         issued_at=issued,
+        cipher_suite=cipher_suite,
     )
 
 
@@ -718,6 +727,7 @@ class SecretAvailable:
     level: EncryptionLevel
     direction: Direction
     secret: bytes
+    cipher_suite: int
 
 
 @dataclass(frozen=True)
@@ -787,6 +797,10 @@ class ClientConfig:
     # §4.6.1: a ticket kept from an earlier connection to this server.
     # None means offer no PSK, which is an ordinary full handshake.
     session_ticket: "SessionTicket | None" = None
+    # §4.1.2: the suites to offer, in preference order.
+    cipher_suites: list[int] = field(
+        default_factory=lambda: [TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256]
+    )
     # §4.2.10: offer 0-RTT alongside the ticket. The caller is
     # responsible for sending the early data itself; QUIC signals its
     # end without EndOfEarlyData (RFC 9001 §8.3).
@@ -976,6 +990,9 @@ class _Handshake:
         self.server_hs_secret = b""
         self._keylog_callback = keylog
         self._client_random = b""
+        # The negotiated suite; AES until the hellos say otherwise.
+        # Initial packet protection ignores it (RFC 9001 §5.2).
+        self.cipher_suite = TLS_AES_128_GCM_SHA256
 
     def _keylog(self, label: str, secret: bytes) -> None:
         """Emit one NSS Key Log Format line; endpoints write SSLKEYLOGFILE."""
@@ -1030,10 +1047,20 @@ class _Handshake:
         self._keylog("CLIENT_HANDSHAKE_TRAFFIC_SECRET", self.client_hs_secret)
         self._keylog("SERVER_HANDSHAKE_TRAFFIC_SECRET", self.server_hs_secret)
         self.events.append(
-            SecretAvailable(EncryptionLevel.HANDSHAKE, Direction.CLIENT, self.client_hs_secret)
+            SecretAvailable(
+                EncryptionLevel.HANDSHAKE,
+                Direction.CLIENT,
+                self.client_hs_secret,
+                self.cipher_suite,
+            )
         )
         self.events.append(
-            SecretAvailable(EncryptionLevel.HANDSHAKE, Direction.SERVER, self.server_hs_secret)
+            SecretAvailable(
+                EncryptionLevel.HANDSHAKE,
+                Direction.SERVER,
+                self.server_hs_secret,
+                self.cipher_suite,
+            )
         )
 
     def _emit_application_secrets(self) -> None:
@@ -1044,10 +1071,14 @@ class _Handshake:
         self._keylog("CLIENT_TRAFFIC_SECRET_0", client_secret)
         self._keylog("SERVER_TRAFFIC_SECRET_0", server_secret)
         self.events.append(
-            SecretAvailable(EncryptionLevel.ONE_RTT, Direction.CLIENT, client_secret)
+            SecretAvailable(
+                EncryptionLevel.ONE_RTT, Direction.CLIENT, client_secret, self.cipher_suite
+            )
         )
         self.events.append(
-            SecretAvailable(EncryptionLevel.ONE_RTT, Direction.SERVER, server_secret)
+            SecretAvailable(
+                EncryptionLevel.ONE_RTT, Direction.SERVER, server_secret, self.cipher_suite
+            )
         )
 
 
@@ -1111,8 +1142,15 @@ class TlsClient(_Handshake):
             self._config.early_data
             and self._config.session_ticket is not None
             and self._config.session_ticket.max_early_data_size == MAX_EARLY_DATA_SIZE
+            # §4.2.10: early data is bound to the ticket's cipher suite.
+            and self._config.session_ticket.cipher_suite in self._config.cipher_suites
             and not self._hello_retried
         )
+        if self._early_data_offered and self._config.session_ticket is not None:
+            # Provisional until the ServerHello: acceptance requires the
+            # server select this very suite, and early packet protection
+            # uses it (§4.2.10).
+            self.cipher_suite = self._config.session_ticket.cipher_suite
         shares = b"".join(
             _key_share_entry(group, key.public_key().public_bytes_raw())
             for group, key in self._keys.items()
@@ -1121,7 +1159,7 @@ class TlsClient(_Handshake):
         return ClientHello(
             random=self._random,
             legacy_session_id=b"",  # QUIC has no middlebox compatibility mode (RFC 9001 §8.4)
-            cipher_suites=[TLS_AES_128_GCM_SHA256],
+            cipher_suites=list(self._config.cipher_suites),
             extensions=[
                 Extension(
                     ExtensionType.SERVER_NAME,
@@ -1283,8 +1321,9 @@ class TlsClient(_Handshake):
             return
         if hello.legacy_session_id_echo != b"":
             raise TlsAlert(ILLEGAL_PARAMETER, "session id echo is not empty")
-        if hello.cipher_suite != TLS_AES_128_GCM_SHA256:
+        if hello.cipher_suite not in self._config.cipher_suites:
             raise TlsAlert(ILLEGAL_PARAMETER, "server selected an unoffered cipher suite")
+        self.cipher_suite = hello.cipher_suite
         versions = _find_extension(hello.extensions, ExtensionType.SUPPORTED_VERSIONS)
         if versions != TLS_1_3.to_bytes(2, "big"):
             raise TlsAlert(PROTOCOL_VERSION, "server did not select TLS 1.3")
@@ -1339,6 +1378,8 @@ class TlsClient(_Handshake):
             ticket = self._config.session_ticket
             if ticket is not None and selected[0] != ticket.alpn:
                 raise TlsAlert(ILLEGAL_PARAMETER, "early_data accepted across an ALPN change")
+            if ticket is not None and self.cipher_suite != ticket.cipher_suite:
+                raise TlsAlert(ILLEGAL_PARAMETER, "early_data accepted across a suite change")
             self.early_data_accepted = True
         self._alpn = selected[0]
         self._peer_transport_parameters = transport_parameters
@@ -1405,6 +1446,7 @@ class TlsClient(_Handshake):
                 max_early_data_size=max_early_data_size,
                 alpn=self._alpn,
                 transport_parameters=self._peer_transport_parameters,
+                cipher_suite=self.cipher_suite,
             )
         )
 
@@ -1487,7 +1529,7 @@ class TlsServer(_Handshake):
             ServerHello(
                 random=HELLO_RETRY_REQUEST_RANDOM,
                 legacy_session_id_echo=hello.legacy_session_id,
-                cipher_suite=TLS_AES_128_GCM_SHA256,
+                cipher_suite=self.cipher_suite,
                 extensions=[
                     Extension(ExtensionType.SUPPORTED_VERSIONS, TLS_1_3.to_bytes(2, "big")),
                     Extension(ExtensionType.KEY_SHARE, group.to_bytes(2, "big")),
@@ -1573,6 +1615,7 @@ class TlsServer(_Handshake):
             # connection, which is why this is not byte equality.
             and selected[0] == 0
             and selected[1].alpn == alpn
+            and selected[1].cipher_suite == self.cipher_suite
             and not reduces_zero_rtt_limits(
                 decode_transport_parameters(selected[1].transport_parameters),
                 decode_transport_parameters(self._config.transport_parameters),
@@ -1612,8 +1655,11 @@ class TlsServer(_Handshake):
         return abs(actual_ms - claimed_ms) <= TICKET_AGE_TOLERANCE_MS
 
     def _on_client_hello(self, hello: ClientHello, raw: bytes) -> None:
-        if TLS_AES_128_GCM_SHA256 not in hello.cipher_suites:
-            raise TlsAlert(HANDSHAKE_FAILURE, "client did not offer TLS_AES_128_GCM_SHA256")
+        offered = [s for s in hello.cipher_suites if s in SUPPORTED_CIPHER_SUITES]
+        if not offered:
+            raise TlsAlert(HANDSHAKE_FAILURE, "no cipher suite in common")
+        # The client's preference order decides among what both sides speak.
+        self.cipher_suite = offered[0]
         versions = _find_extension(hello.extensions, ExtensionType.SUPPORTED_VERSIONS)
         if versions is None or TLS_1_3.to_bytes(2, "big") not in versions:
             raise TlsAlert(PROTOCOL_VERSION, "client did not offer TLS 1.3")
@@ -1644,7 +1690,7 @@ class TlsServer(_Handshake):
         server_hello = ServerHello(
             random=self._random,
             legacy_session_id_echo=hello.legacy_session_id,
-            cipher_suite=TLS_AES_128_GCM_SHA256,
+            cipher_suite=self.cipher_suite,
             extensions=[
                 Extension(ExtensionType.SUPPORTED_VERSIONS, TLS_1_3.to_bytes(2, "big")),
                 Extension(
@@ -1748,6 +1794,7 @@ class TlsServer(_Handshake):
             alpn=self._alpn,
             transport_parameters=self._config.transport_parameters,
             issued_at=int(self._now),
+            cipher_suite=self.cipher_suite,
         )
         ticket = NewSessionTicket(
             lifetime=SESSION_TICKET_LIFETIME,

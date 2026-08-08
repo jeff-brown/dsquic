@@ -336,3 +336,20 @@ def test_loopback_ecn_counts_survive_the_kernel(
     )
     records = "".join(path.read_text() for path in tmp_path.glob("*.sqlog"))
     assert '"ect0"' in records
+
+
+def test_loopback_chacha20(credentials: PemCredentials, server: int) -> None:
+    """RFC 9001 §5.4.4 over real UDP: a ChaCha20-only client completes
+    the handshake and transfers, which exercises the ChaCha AEAD and
+    header protection on every packet past the Initials."""
+    bodies = fetch(
+        host="127.0.0.1",
+        port=server,
+        paths=["/index.html"],
+        options=ClientOptions(
+            ca_certificates=load_pem_certificates(credentials.ca_pem),
+            server_name="localhost",
+            chacha20=True,
+        ),
+    )
+    assert bodies == {"/index.html": INDEX_BODY}

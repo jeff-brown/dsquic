@@ -445,7 +445,7 @@ class Connection:
 
     def _on_secret(self, event: SecretAvailable) -> None:
         space = self._spaces[event.level]
-        keys = derive_packet_keys(event.secret)
+        keys = derive_packet_keys(event.secret, event.cipher_suite)
         ours = Direction.CLIENT if self.is_client else Direction.SERVER
         if event.direction is ours:
             space.keys_send = keys
@@ -476,7 +476,7 @@ class Connection:
             assert space.keys_recv_early is not None
             try:
                 unprotected = remove_header_protection(
-                    space.keys_recv_early.hp, packet, pn_offset, space.largest_received
+                    space.keys_recv_early, packet, pn_offset, space.largest_received
                 )
                 payload = decrypt_payload(space.keys_recv_early, unprotected)
             except (InvalidTag, ValueError):
@@ -485,7 +485,7 @@ class Connection:
         assert space.keys_recv is not None
         try:
             unprotected = remove_header_protection(
-                space.keys_recv.hp, packet, pn_offset, space.largest_received
+                space.keys_recv, packet, pn_offset, space.largest_received
             )
             keys, updating = self._receive_keys(space, level, unprotected, now)
             payload = decrypt_payload(keys, unprotected)
@@ -1202,9 +1202,10 @@ class Connection:
             return
         if self.is_client:
             if space.keys_send_early is None:
-                space.keys_send_early = derive_packet_keys(secret)
+                # §4.2.10: early packet protection uses the ticket's suite.
+                space.keys_send_early = derive_packet_keys(secret, self.tls.cipher_suite)
         elif space.keys_recv_early is None:
-            space.keys_recv_early = derive_packet_keys(secret)
+            space.keys_recv_early = derive_packet_keys(secret, self.tls.cipher_suite)
             assert isinstance(self.tls, TlsServer)
             if self.streams is None:
                 self.peer_parameters = decode_transport_parameters(

@@ -36,8 +36,8 @@ recorded in `docs/design.md`.
 
 `handshake`, `transfer`, `multiconnect`, `transferloss`,
 `transfercorruption`, `blackhole`, `longrtt`, `amplificationlimit`,
-`ipv6`, `keyupdate`, `retry`, `resumption`, `zerortt`, and `ecn`.
-Everything else exits 127.
+`ipv6`, `keyupdate`, `retry`, `resumption`, `zerortt`, `ecn`, and
+`chacha20`. Everything else exits 127.
 
 `multiplexing` is not in that list and does not need to be: the runner
 gives both containers the name `transfer` for it, and it is the request
@@ -177,7 +177,13 @@ caught that no lower rung could are in docs/findings.md. `ecn`
 passes in both roles against picoquic, the runner reading the ECT
 marks and ACK-ECN frames of both directions out of the pcap; quic-go,
 aioquic and quiche report it unsupported because their interop images
-do not mark, the same pattern the public matrix shows.
+do not mark, the same pattern the public matrix shows. `chacha20`
+passes in both roles against quic-go, aioquic and picoquic. The
+quiche pairing is environmental: its BoringSSL ChaCha20 emits garbage
+under qemu emulation on this aarch64 VM (established by keylog and
+Wireshark, and by quic-go failing identically here while the same
+pairing passes on the hosted amd64 runner; docs/findings.md), and
+quiche's own client does not attempt the case.
 
 As **client**, `handshake`, `transfer`, `multiplexing`, `handshakeloss`,
 `handshakecorruption`, `ipv6` and `keyupdate` pass against all four
@@ -198,7 +204,6 @@ Apple silicon needs `--platform linux/amd64`, or a multi-arch push.
 |---|---|
 | `v2` | Only QUIC v1 is offered |
 | `versionnegotiation` | dsquic *sends* Version Negotiation, which is what unblocked every other case, but the client does not react to receiving one by retrying with a supported version |
-| `chacha20` | AES-128-GCM only |
 | `ecn` | No ECN codepoints on send, no ECN validation |
 | `http3` | `h3.py` and `qpack.py` are stubs |
 | `connectionmigration` | No path validation or migration |

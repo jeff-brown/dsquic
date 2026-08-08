@@ -7,6 +7,26 @@ is now, and this says what it cost to get there. Kept because the
 failures are the pedagogical payload, and because the methods that
 found them are worth reusing.
 
+## quiche's ChaCha20 fails under emulation, not upstream (2026-08-08)
+
+The chacha20 sweep as client failed only against quiche: our client
+completed the handshake, then every quiche 1-RTT packet failed AEAD.
+The chain that assigned blame, in order: both sides' SSLKEYLOGFILEs
+agreed byte for byte, so TLS was fine; Wireshark, given that keylog,
+also failed checktag on the same packets, so the bytes on the wire
+were wrong rather than our reading of them; quic-go's client failed
+identically against quiche's server in our VM; and the public matrix
+showed the same quic-go-to-quiche pairing succeeding the same day on
+the hosted runner, same image digest. Same images, different host:
+the difference is that our VM emulates the amd64 quiche image on
+Apple silicon, and BoringSSL's ChaCha20 assembly under qemu produces
+wrong output where AES (and Go's and Python's ChaCha) do not.
+
+Recorded as environment, not protocol, beside the tshark and file
+descriptor precedents: when a cipher fails against exactly one peer,
+decrypt the capture with the peer's own keylog before touching the
+code, and check the hosted matrix before blaming the peer.
+
 ## Two 0-RTT defects only the pcap could see (2026-08-07)
 
 The `zerortt` sweep failed in both roles on the first run, each side

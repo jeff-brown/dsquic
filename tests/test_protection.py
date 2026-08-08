@@ -14,6 +14,7 @@ from dsquic.protection import (
     remove_header_protection,
     unprotect,
 )
+from dsquic.tls import TLS_CHACHA20_POLY1305_SHA256
 
 CLIENT_DCID = bytes.fromhex("8394c8f03e515708")
 
@@ -204,7 +205,43 @@ def test_key_phase_bit_survives_header_protection(key_phase: bool) -> None:
     first = 0x40 | (KEY_PHASE_BIT if key_phase else 0)
     header = bytes([first]) + b"\x01"
     packet = protect(SERVER_KEYS, header, b"\x01" * 32, packet_number=1)
-    unprotected = remove_header_protection(SERVER_KEYS.hp, packet, 1, largest_pn=-1)
+    unprotected = remove_header_protection(SERVER_KEYS, packet, 1, largest_pn=-1)
     assert unprotected.key_phase is key_phase
     assert unprotected.packet_number == 1
     assert decrypt_payload(SERVER_KEYS, unprotected) == b"\x01" * 32
+
+
+class TestChaCha20Vectors:
+    """RFC 9001 A.5: the ChaCha20-Poly1305 short header packet."""
+
+    SECRET = bytes.fromhex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
+
+    def test_key_derivation(self) -> None:
+        keys = derive_packet_keys(self.SECRET, TLS_CHACHA20_POLY1305_SHA256)
+        assert keys.key == bytes.fromhex(
+            "c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8"
+        )
+        assert keys.iv == bytes.fromhex("e0459b3474bdd0e44a41c144")
+        assert keys.hp == bytes.fromhex(
+            "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4"
+        )
+
+    def test_key_update_secret(self) -> None:
+        keys = derive_packet_keys(self.SECRET, TLS_CHACHA20_POLY1305_SHA256)
+        updated, next_keys = next_generation(self.SECRET, keys)
+        assert updated == bytes.fromhex(
+            "1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9"
+        )
+        # §6: header protection survives the update, suite and all.
+        assert next_keys.hp == keys.hp
+        assert next_keys.cipher_suite == TLS_CHACHA20_POLY1305_SHA256
+
+    def test_protect_matches_the_vector_and_round_trips(self) -> None:
+        """The complete 21-byte packet of A.5: PING, packet number
+        654360564, empty connection ID."""
+        keys = derive_packet_keys(self.SECRET, TLS_CHACHA20_POLY1305_SHA256)
+        packet = protect(keys, bytes.fromhex("4200bff4"), b"\x01", 654360564)
+        assert packet == bytes.fromhex("4cfe4189655e5cd55c41f69080575d7999c25a5bfb")
+        packet_number, payload = unprotect(keys, packet, pn_offset=1, largest_pn=654360563)
+        assert packet_number == 654360564
+        assert payload == b"\x01"
